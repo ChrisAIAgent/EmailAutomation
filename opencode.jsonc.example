@@ -1,0 +1,32 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "enabled_providers": [
+    "tacwork-custom"
+  ],
+  "instructions": [
+    "AGENTS.md",
+    "docs/AGENT_CAPABILITIES.md"
+  ],
+  "provider": {
+    "tacwork-custom": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Custom Provider",
+      "options": {
+        "baseURL": "https://your-llm-endpoint.example.com/v1",
+        "apiKey": "REPLACE_WITH_YOUR_API_KEY"
+      },
+      "models": {
+        "your-model-name": {
+          "name": "your-model-name"
+        }
+      }
+    }
+  },
+  "mcp": {
+    "email_automation": {
+      "type": "local",
+      "enabled": true,
+      "command": ["python", "scripts/mcp_server.py"]
+    }
+  }
+}

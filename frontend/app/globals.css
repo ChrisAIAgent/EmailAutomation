@@ -1,0 +1,42 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body {
+  background: #0a0d13;
+  color: #e6ebf2;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+body {
+  background-image: radial-gradient(circle at 85% 0%, rgba(239, 27, 45, 0.09), transparent 28rem);
+}
+
+button:focus-visible, a:focus-visible { outline: 2px solid #ef1b2d; outline-offset: 2px; }
+
+.card {
+  @apply bg-panel border border-border rounded-xl p-4;
+  box-shadow: 0 12px 32px rgba(0,0,0,.12);
+}
+
+.btn {
+  @apply px-3 py-1.5 rounded-lg text-sm font-medium border border-border bg-panel2 hover:bg-border transition;
+}
+
+.btn-primary {
+  @apply px-3 py-1.5 rounded-lg text-sm font-medium bg-accent text-white hover:opacity-90 transition;
+  box-shadow: 0 5px 16px rgba(239, 27, 45, .22);
+}
+
+.btn-danger {
+  @apply px-3 py-1.5 rounded-lg text-sm font-medium bg-danger text-white hover:opacity-90 transition;
+}
+
+.badge {
+  @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs border border-border;
+}

@@ -1,0 +1,96 @@
+# ===========================================================================
+# Email Automation — open-source .gitignore  (pure library form)
+# ---------------------------------------------------------------------------
+# This repository ships SOURCE ONLY. Everything below is a local runtime
+# artifact, a bundled binary, real customer data, or a secret — none of it
+# belongs in a public git history.
+# ===========================================================================
+
+# ---------------- Python ----------------
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------------- Node / Next.js ----------------
+node_modules/
+node_modules.broken-e-drive/
+.next/
+.next-dev/
+.next-prod/
+out/
+coverage/
+*.tsbuildinfo
+
+# ---------------- Secrets / local config (NEVER commit) -------------------
+.env
+.env.*
+!.env.example
+*.env.bak*
+opencode.jsonc
+opencode.jsonc.*
+!opencode.jsonc.example
+config/secrets/
+
+# ---------------- Database & runtime data (REAL PII + customer email) -----
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.bak*
+backend/data/
+backend/app.db*
+
+# ---------------- Bundled runtimes / binaries (~1.9 GB, NOT source) -------
+offline-cache/
+tools/
+tacwork-runtime/
+installer/
+dist/
+.portable_stage/
+
+# ---------------- Logs / reports / build output ---------------------------
+*.log
+stage-audit*.log
+syntax-check.log
+build-installer-*.log
+logs/
+
+# ---------------- QA artifacts (may contain real email screenshots) -------
+qa_scripts/
+qa-e2e/
+
+# ---------------- Operational backups (real data) --------------------------
+Email-Automation-Reset-Backup/
+TACWork-Reset-Backup/
+audit/
+
+# ---------------- Agent workspace memory (private) -------------------------
+.workbuddy/
+
+# ---------------- Misc -----------------------------------------------------
+*.docx
+TACWork-Logo-*.PNG
+nul
+.DS_Store
+Thumbs.db
+
+# ---------------- Portable packaging chain (excluded in library form) ------
+portable-bootstrap.bat
+portable-start.bat
+portable-start-unified.ps1
+portable-diagnose.ps1
+scripts/build-installer.ps1
+scripts/portable-package.ps1
+scripts/portable-*.ps1
+scripts/prepare-tacwork-runtime.ps1
+
+# ---------------- Pytest / coverage temp artifacts -------------------------
+.pytest_cache/
+.pytest-tmp/
+.pytest-final-all/
+backend/.pytest-tmp/

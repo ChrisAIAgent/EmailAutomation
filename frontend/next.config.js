@@ -1,0 +1,22 @@
+/** @type {import('next').NextConfig} */
+const BACKEND_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+
+// WB-001: isolate dev and build output so `next build` can never corrupt the
+// running `next dev` cache (mixed .next artifacts broke hydration -> permanent
+// "Loading dashboard..."). The npm scripts set NEXT_DIST_DIR explicitly via
+// cross-env (.next-dev for dev, .next-prod for build/start). An explicit value
+// is required because Next.js resets NODE_ENV during its internal build phases
+// (e.g. static generation), which would otherwise write into the dev directory.
+const distDir = process.env.NEXT_DIST_DIR || ".next";
+
+const nextConfig = {
+  reactStrictMode: true,
+  distDir,
+  async rewrites() {
+    return [
+      { source: "/api/:path*", destination: `${BACKEND_URL}/api/:path*` },
+    ];
+  },
+};
+
+module.exports = nextConfig;
