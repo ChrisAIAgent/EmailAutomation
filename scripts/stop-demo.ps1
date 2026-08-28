@@ -5,6 +5,7 @@ param(
 $ErrorActionPreference = "Continue"
 $rootPath = (Resolve-Path $Root).Path
 . (Join-Path $PSScriptRoot "data-dir.ps1")
+. (Join-Path $PSScriptRoot "runtime-ports.ps1")
 . (Join-Path $PSScriptRoot "tacwork-runtime.ps1")
 $pidPath = Join-Path $global:DataLogs "run\services.json"
 
@@ -30,7 +31,7 @@ if (Test-Path $pidPath) {
 $remaining = netstat -ano | ForEach-Object {
     $parts = ($_.Trim() -split "\s+")
     if ($parts.Count -ge 5 -and
-        ($parts[1] -match ":8000$" -or $parts[1] -match ":3000$" -or
+        ($parts[1] -match ":$script:BackendPort$" -or $parts[1] -match ":$script:FrontendPort$" -or
          $parts[1] -match ":$($script:TacWorkServerPort)$" -or $parts[1] -match ":$($script:TacWorkWebPort)$") -and
         $parts[-2] -eq "LISTENING") {
         "$($parts[1]) pid=$($parts[-1])"

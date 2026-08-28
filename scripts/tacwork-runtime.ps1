@@ -108,7 +108,7 @@ function Start-TacWorkRuntime(
     $env:OPENWORK_SERVER_CONFIG = Join-Path $RunPath "tacwork-server.json"
     $env:OPENWORK_TOKEN_STORE = Join-Path $RunPath "tacwork-tokens.json"
     try {
-        $serverArgs = "--workspace `"$WorkspaceRoot`" --host 127.0.0.1 --port $script:TacWorkServerPort --token $script:TacWorkClientToken --host-token $hostToken --approval auto --cors http://127.0.0.1:$script:TacWorkWebPort,http://localhost:$script:TacWorkWebPort,http://127.0.0.1:3000,http://localhost:3000"
+        $serverArgs = "--workspace `"$WorkspaceRoot`" --host 127.0.0.1 --port $script:TacWorkServerPort --token $script:TacWorkClientToken --host-token $hostToken --approval auto --cors http://127.0.0.1:$script:TacWorkWebPort,http://localhost:$script:TacWorkWebPort,http://127.0.0.1:$script:FrontendPort,http://localhost:$script:FrontendPort,app://email-automation"
         $server = Start-Process -FilePath $runtime.server -ArgumentList $serverArgs -WorkingDirectory $runtime.root `
             -RedirectStandardOutput (Join-Path $LogsPath "tacwork-server.log") `
             -RedirectStandardError (Join-Path $LogsPath "tacwork-server-error.log") -WindowStyle Hidden -PassThru

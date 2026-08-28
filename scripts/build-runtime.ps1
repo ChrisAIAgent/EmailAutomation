@@ -21,11 +21,14 @@ $npm = Join-Path $root "tools\node\npm.cmd"
 $runtime = Join-Path $root "runtime"
 $pythonTarget = Join-Path $runtime "python-packages"
 $frontendTarget = Join-Path $runtime "frontend"
+$frontendStaticTarget = Join-Path $runtime "frontend-static"
 $frontendStage = Join-Path $runtime ".frontend-runtime-next"
 $wheels = Join-Path $root "offline-cache\python-wheels"
 $npmCache = Join-Path $root "offline-cache\npm-cache"
 $frontend = Join-Path $root "frontend"
 $frontendBuild = Join-Path $runtime ".frontend-build"
+$electronSource = Join-Path $root "desktop\node_modules\electron\dist"
+$electronTarget = Join-Path $runtime "electron"
 
 # Generated rollback/repair trees are never part of an immutable runtime.
 # Remove only known renewable names before hashing the manifest.
@@ -48,6 +51,15 @@ if ($Clean -and (Test-Path $runtime)) {
     Remove-Item -LiteralPath $resolvedRuntime -Recurse -Force
 }
 New-Item -ItemType Directory -Force -Path $pythonTarget, $frontendTarget | Out-Null
+if (-not (Test-Path (Join-Path $electronSource "electron.exe"))) { throw "runtime_electron_missing: run npm ci in desktop and install the Electron runtime" }
+if (Test-Path $electronTarget) { Remove-Item -LiteralPath $electronTarget -Recurse -Force }
+Copy-Item -LiteralPath $electronSource -Destination $electronTarget -Recurse -Force
+Move-Item -LiteralPath (Join-Path $electronTarget "electron.exe") -Destination (Join-Path $electronTarget "Email Automation.exe") -Force
+$desktopAppTarget = Join-Path (Join-Path $electronTarget "resources") "app"
+New-Item -ItemType Directory -Force -Path $desktopAppTarget | Out-Null
+Copy-Item -LiteralPath (Join-Path $root "desktop\main.cjs") -Destination $desktopAppTarget -Force
+Copy-Item -LiteralPath (Join-Path $root "desktop\preload.cjs") -Destination $desktopAppTarget -Force
+Copy-Item -LiteralPath (Join-Path $root "desktop\package.json") -Destination $desktopAppTarget -Force
 
 if (Test-Path (Join-Path $pythonTarget "fastapi")) {
     Write-Output "Reusing existing relocatable Python package runtime."
@@ -66,14 +78,17 @@ $oldTacWorkServer = $env:NEXT_PUBLIC_TACWORK_SERVER_URL
 try {
     $env:npm_config_cache = $npmCache
     $env:NEXT_DIST_DIR = ".next-prod"
-    $env:NEXT_PUBLIC_API_URL = "http://127.0.0.1:8000"
-    $env:NEXT_PUBLIC_TACWORK_URL = "http://127.0.0.1:5173"
-    $env:NEXT_PUBLIC_TACWORK_SERVER_URL = "http://127.0.0.1:8787"
+    $env:NEXT_PUBLIC_API_URL = "http://127.0.0.1:18000"
+    $env:NEXT_PUBLIC_TACWORK_URL = "http://127.0.0.1:18003"
+    $env:NEXT_PUBLIC_TACWORK_SERVER_URL = "http://127.0.0.1:18002"
     # Build in a disposable copy so an operator's running dev server cannot
     # lock SWC/node_modules and make an installer build nondeterministic.
     if (Test-Path $frontendBuild) { Remove-Item -LiteralPath $frontendBuild -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $frontendBuild | Out-Null
     $copyExcludes = @(".next", ".next-dev", ".next-prod")
+    $copyExcludes += Get-ChildItem $frontend -Directory -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like ".next*" -or $_.Name -like "*.bak*" } |
+        ForEach-Object { $_.Name }
     # Broken/stale dependency folders (for example node_modules.broken-*) may
     # contain dangling junctions. Exclude all source dependency trees, then
     # install a clean build-only node_modules in the copy.
@@ -93,6 +108,11 @@ try {
         }
         & $npm run build
         if ($LASTEXITCODE -ne 0) { throw "runtime_frontend_build_failed" }
+        $env:DESKTOP_STATIC_EXPORT = "1"
+        $env:NEXT_DIST_DIR = ".next-desktop"
+        & $nextBinary build
+        if ($LASTEXITCODE -ne 0) { throw "runtime_frontend_static_build_failed" }
+        $env:DESKTOP_STATIC_EXPORT = $null
     } finally {
         Pop-Location
     }
@@ -107,6 +127,10 @@ try {
 $standalone = Join-Path $frontendBuild ".next-prod\standalone"
 $static = Join-Path $frontendBuild ".next-prod\static"
 if (-not (Test-Path (Join-Path $standalone "server.js"))) { throw "runtime_frontend_standalone_missing" }
+$staticExport = Join-Path $frontendBuild ".next-desktop"
+if (-not (Test-Path (Join-Path $staticExport "index.html"))) { throw "runtime_frontend_static_missing" }
+if (Test-Path $frontendStaticTarget) { Remove-Item -LiteralPath $frontendStaticTarget -Recurse -Force }
+Copy-Item -LiteralPath $staticExport -Destination $frontendStaticTarget -Recurse -Force
 
 # A Next standalone server and its .next/static assets are one indivisible build.
 # Stage and validate a complete runtime before replacing the old one, so stale
@@ -119,6 +143,14 @@ New-Item -ItemType Directory -Force -Path $stageDist | Out-Null
 Copy-Item -LiteralPath $static -Destination (Join-Path $stageDist "static") -Recurse -Force
 if (Test-Path (Join-Path $frontendBuild "public")) {
     Copy-Item -LiteralPath (Join-Path $frontendBuild "public") -Destination (Join-Path $frontendStage "public") -Recurse -Force
+}
+
+# google-api-python-client bundles discovery documents for hundreds of unrelated
+# Google products. Email Automation only builds Gmail/OAuth services; keep those
+# two offline documents and remove the rest from the renewable runtime payload.
+$discoveryDocs = Join-Path $pythonTarget "googleapiclient\discovery_cache\documents"
+if (Test-Path $discoveryDocs) {
+    Get-ChildItem -LiteralPath $discoveryDocs -File | Where-Object { $_.Name -notin @("gmail.v1.json", "oauth2.v2.json") } | Remove-Item -Force
 }
 
 $missingAssets = @()
@@ -142,12 +174,16 @@ Move-Item -LiteralPath $frontendStage -Destination $frontendTarget
 # preserves the operator's original frontend tree only; it never preserves this copy.
 Remove-Item -LiteralPath $frontendBuild -Recurse -Force -ErrorAction SilentlyContinue
 
+$manifestPath = Join-Path $runtime "runtime-manifest.json"
+if (Test-Path $manifestPath) { Remove-Item -LiteralPath $manifestPath -Force }
 $manifest = [ordered]@{
     version = (Get-Content -Raw (Join-Path $root "VERSION")).Trim()
     built_at = [DateTime]::UtcNow.ToString("o")
     python = "tools/python/python.exe"
     python_packages = "runtime/python-packages"
     frontend_server = "runtime/frontend/server.js"
+    frontend_static = "runtime/frontend-static/index.html"
+    desktop_executable = "runtime/electron/Email Automation.exe"
     files = @(
         Get-ChildItem $runtime -Recurse -File | ForEach-Object {
             [ordered]@{
@@ -162,6 +198,6 @@ $manifest = [ordered]@{
         }
     )
 }
-$manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 (Join-Path $runtime "runtime-manifest.json")
+$manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding UTF8 $manifestPath
 
 Write-Output "Runtime ready: $runtime"

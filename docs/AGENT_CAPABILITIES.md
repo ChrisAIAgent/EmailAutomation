@@ -20,7 +20,7 @@ Approve / Reject / Agent Decide.
 | User intent | MCP tool | REST API | Boundary |
 |---|---|---|---|
 | Check services | `ea_health` | `GET /api/health` | Read-only |
-| Check Gmail account | `ea_gmail_status` | `GET /api/gmail/status` | Read-only; no tokens |
+| Check Gmail account | `ea_gmail_status` | `GET /api/gmail/status` | Read-only; interpret the explicit OAuth state; no tokens |
 | Check global pause | `ea_system_pause` | `GET /api/system/pause` | Read-only |
 | Review Contacts | `ea_list_contacts` | `GET /api/contacts` | Read-only |
 | Review Campaigns | `ea_list_campaigns` | `GET /api/campaigns` | Read-only |
@@ -67,8 +67,9 @@ Approve / Reject / Agent Decide.
   missing facts. Only the current Workspace's published documents are customer
   knowledge; built-in entries are operational/safety fallback.
 
-OpenCode starts `scripts/mcp_server.py` with bundled Python. The default API is
-`http://127.0.0.1:8000`; `EMAIL_AUTOMATION_API_URL` is an optional local override.
+OpenCode starts `scripts/mcp_server.py` with bundled Python. The transition default
+API is `http://127.0.0.1:18000`; Electron/launchers always provide the selected
+loopback address through `EMAIL_AUTOMATION_API_URL`.
 For scheduled Agent Takeover, the bridge accepts the short-lived takeover grant
 only for Gmail sync, Inbox sort, the owner's Global Inbox Run, and its Run poll;
 it does not authorize Campaign/Profile/Knowledge writes, deletion, Contact

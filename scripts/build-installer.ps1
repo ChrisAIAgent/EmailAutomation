@@ -32,13 +32,15 @@
 #>
 param(
     [string]$Version = "",
-    [string]$InnoCompiler = ""
+    [string]$InnoCompiler = "",
+    [switch]$AllowUncommitted
 )
 
 $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $root       = Split-Path -Parent $scriptDir
+function Fail($msg) { throw ("[BUILD ABORTED] " + $msg) }
 
 # --- Version source of truth & cross-check ---------------------------------
 # The root VERSION file is the single source of product version. The build must
@@ -62,6 +64,20 @@ if (Test-Path $pkgJsonPath) {
         Fail ("frontend/package.json version '" + $Matches['v'] + "' does not match root VERSION '" + $expectedVersion + "'. Sync them before building.")
     }
 }
+$desktopPkgPath = Join-Path $root "desktop\package.json"
+if (-not (Test-Path $desktopPkgPath)) { Fail "desktop/package.json is missing." }
+$desktopPkgText = [IO.File]::ReadAllText($desktopPkgPath)
+if ($desktopPkgText -notmatch '"version"\s*:\s*"(?<v>[^"]+)"' -or $Matches['v'] -ne $expectedVersion) {
+    Fail "desktop/package.json version does not match root VERSION."
+}
+foreach ($lockPath in @((Join-Path $root "frontend\package-lock.json"), (Join-Path $root "desktop\package-lock.json"))) {
+    if (-not (Test-Path $lockPath)) { Fail ("Missing npm lockfile: " + $lockPath) }
+    $lockText = [IO.File]::ReadAllText($lockPath)
+    $lockVersions = [regex]::Matches($lockText, '"version"\s*:\s*"(?<v>[^"]+)"')
+    if ($lockVersions.Count -lt 2 -or $lockVersions[0].Groups['v'].Value -ne $expectedVersion -or $lockVersions[1].Groups['v'].Value -ne $expectedVersion) {
+        Fail ((Split-Path $lockPath -Leaf) + " version does not match root VERSION.")
+    }
+}
 
 $mcpPath = Join-Path $root "scripts\mcp_server.py"
 if (Test-Path $mcpPath) {
@@ -70,6 +86,12 @@ if (Test-Path $mcpPath) {
     if ($Matches['v'] -ne $expectedVersion) {
         Fail ("scripts/mcp_server.py SERVER_INFO version '" + $Matches['v'] + "' does not match root VERSION '" + $expectedVersion + "'. Sync them before building.")
     }
+}
+$buildGitCommit = (& git -C $root rev-parse HEAD 2>$null | Select-Object -First 1)
+$buildGitTag = (& git -C $root tag --points-at HEAD 2>$null | Where-Object { $_ -eq ("v" + $expectedVersion) } | Select-Object -First 1)
+$buildGitDirty = [bool](& git -C $root status --porcelain 2>$null)
+if (-not $AllowUncommitted -and ($buildGitDirty -or $buildGitTag -ne ("v" + $expectedVersion))) {
+    Fail ("Formal release builds require a clean exact tag v" + $expectedVersion + ". Commit/review/tag first, or use -AllowUncommitted for a non-release development build.")
 }
 $installerDir = Join-Path $root "installer"
 $payloadDir   = Join-Path $installerDir "payload"
@@ -83,8 +105,6 @@ $webLogo      = Join-Path $root "frontend\public\tac-logo.png"
 $icoPath      = Join-Path $assetsDir "EmailAutomation.ico"
 $exeName      = "Email-Automation-Setup-$Version.exe"
 $exePath      = Join-Path $distDir $exeName
-
-function Fail($msg) { throw ("[BUILD ABORTED] " + $msg) }
 
 Write-Output "=================================================================="
 Write-Output " Email Automation - Windows installer build"
@@ -150,6 +170,8 @@ Write-Output "Building prebuilt runtime (customer startup will not use pip/npm).
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $root "runtime\runtime-manifest.json"))) {
     Fail "Prebuilt runtime build failed."
 }
+& (Join-Path $root "scripts\verify-runtime.ps1") -Root $root
+if (-not $?) { Fail "Runtime SHA-256 verification failed." }
 
 # --- 4. Stage payload (reuse portable-package.ps1) -----------------------
 Write-Output "Staging payload via portable-package.ps1 (reusing exclude/integrity/safety rules)..."
@@ -171,6 +193,9 @@ $mustExist = @(
     "tools\node\node.exe",
     "runtime\python-packages",
     "runtime\frontend\server.js",
+    "runtime\frontend-static\index.html",
+    "runtime\electron\Email Automation.exe",
+    "runtime\electron\resources\app\main.cjs",
     "runtime\runtime-manifest.json",
     "tacwork-runtime\server\openwork-server.exe",
     "tacwork-runtime\engine\opencode.exe",
@@ -252,7 +277,7 @@ Write-Output ("Version injected into .iss and payload/version.txt: " + $Version)
 
 # --- 9. Compile ----------------------------------------------------------
 Write-Output "Compiling installer with Inno Setup..."
-& $ISCC $iss
+& $ISCC /Q $iss
 if ($LASTEXITCODE -ne 0) { Fail ("ISCC compilation failed (exit " + $LASTEXITCODE + ").") }
 if (-not (Test-Path $exePath)) { Fail ("ISCC did not produce " + $exePath + ".") }
 
@@ -269,6 +294,25 @@ $exeSizeMB = [math]::Round($installerBytes / 1MB, 1)
 $payloadFiles = (Get-ChildItem $payloadDir -Recurse -Force -File -ErrorAction SilentlyContinue).Count
 $pyVer = & (Join-Path $payloadDir "tools\python\python.exe") --version 2>&1
 $nodeVer = & (Join-Path $payloadDir "tools\node\node.exe") --version 2>&1
+$installerSha256 = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash
+$gitCommit = $buildGitCommit
+$gitTag = $buildGitTag
+if (-not $gitTag -or $gitTag -ne ("v" + $Version)) { $gitTag = "unreleased" }
+$gitDirty = $buildGitDirty
+$largestFiles = @(Get-ChildItem $payloadDir -Recurse -Force -File | Sort-Object Length -Descending | Select-Object -First 20 | ForEach-Object {
+    [ordered]@{ path=$_.FullName.Substring($payloadDir.Length + 1).Replace("\", "/"); bytes=$_.Length }
+})
+$report = [ordered]@{
+    version=$Version; git_commit=($gitCommit | Select-Object -First 1); git_tag=($gitTag | Select-Object -First 1); git_dirty=$gitDirty
+    build_time_utc=[DateTime]::UtcNow.ToString("o"); installer=$exeName; installer_sha256=$installerSha256
+    installer_bytes=$installerBytes; payload_files=$payloadFiles; payload_bytes=$payloadBytes
+    python_runtime=($pyVer -join " "); node_runtime=($nodeVer -join " "); runtime_manifest_valid=$true; secret_scan="clean"
+    largest_payload_files=$largestFiles
+}
+$reportJson = Join-Path $distDir ("build-report-" + $Version + ".json")
+$reportMd = Join-Path $distDir ("build-report-" + $Version + ".md")
+$report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $reportJson -Encoding UTF8
+@("# Email Automation $Version build report", "", "- Git commit: ``$($report.git_commit)``", "- Git tag: ``$($report.git_tag)``", "- Working tree dirty: ``$gitDirty``", "- Installer: ``$exeName``", "- Installer SHA-256: ``$installerSha256``", "- Installer bytes: ``$installerBytes``", "- Payload files: ``$payloadFiles``", "- Runtime manifest: valid", "- Secret scan: clean") | Set-Content -LiteralPath $reportMd -Encoding UTF8
 Write-Output ""
 Write-Output "==================== BUILD REPORT ===================="
 Write-Output ("Build time     : " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
@@ -278,6 +322,9 @@ Write-Output ("Installer size : " + $exeSizeMB + " MB")
 Write-Output ("Payload files  : " + $payloadFiles)
 Write-Output ("Python runtime : " + $pyVer)
 Write-Output ("Node runtime   : " + $nodeVer)
+Write-Output ("Installer SHA  : " + $installerSha256)
+Write-Output ("Git commit/tag : " + $report.git_commit + " / " + $report.git_tag + " (dirty=" + $gitDirty + ")")
+Write-Output ("Reports         : " + $reportJson + ", " + $reportMd)
 Write-Output ("Secrets scanned: clean (name + content, first-party)")
 Write-Output ("Validation     : staged OK, integrity OK, icon OK, compile OK")
 Write-Output "======================================================"

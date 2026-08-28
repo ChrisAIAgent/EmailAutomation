@@ -2,35 +2,35 @@
 from __future__ import annotations
 
 import logging
-import os
-import subprocess
-import tempfile
-import threading
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import RedirectResponse
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..config import _BACKEND_DIR, get_settings, is_gmail_configured
+from ..config import _DATA, get_settings, is_gmail_configured
 from ..errors import ApiError
 from ..events import publish
 from ..gmail import auth
 from ..security import Cipher, redact_for_log
 from ..services import sync as sync_svc
+from .. import oauth_config as oauth_config_svc
 from ..services.accounts import resolve_sending_account
 from .deps import get_db, ensure_owner
 
 logger = logging.getLogger("api.gmail")
 router = APIRouter(prefix="/api/gmail", tags=["gmail"])
 
-# .env write lock: the Gmail OAuth config PUT below mutates backend/.env.
-_env_write_lock = threading.Lock()
-
 
 @router.get("/status")
 def gmail_status(db: Session = Depends(get_db)):
+    try:
+        oauth_configured = bool(oauth_config_svc.load(_DATA.config))
+        oauth_state = "oauth_not_connected" if oauth_configured else "oauth_not_configured"
+    except RuntimeError:
+        oauth_configured = False
+        oauth_state = "credential_key_unavailable"
     account, _oauth = resolve_sending_account(
         db, owner_id=ensure_owner(db), provision=False
     )
@@ -41,7 +41,8 @@ def gmail_status(db: Session = Depends(get_db)):
             "granted_scopes": None,
             "history_id": None,
             "is_demo": not is_gmail_configured(),
-            "configured": is_gmail_configured(),
+            "configured": oauth_configured,
+            "oauth_state": oauth_state,
         }
     cipher = Cipher()
     access = cipher.decrypt(account.oauth.access_token_enc)
@@ -52,7 +53,8 @@ def gmail_status(db: Session = Depends(get_db)):
         "granted_scopes": (account.granted_scopes or "").split(",") if account.granted_scopes else [],
         "history_id": account.history_id,
         "is_demo": not is_gmail_configured(),
-        "configured": is_gmail_configured(),
+        "configured": oauth_configured,
+        "oauth_state": "oauth_connected" if connected else oauth_state,
     }
 
 
@@ -60,87 +62,58 @@ def gmail_status(db: Session = Depends(get_db)):
 def oauth_start(db: Session = Depends(get_db)):
     settings = get_settings()
     if not is_gmail_configured(settings):
-        raise HTTPException(status_code=400, detail="Google OAuth not configured (set GOOGLE_CLIENT_ID/SECRET in Settings).")
+        raise HTTPException(status_code=400, detail="Google Desktop OAuth is not configured. Import credentials.json in Agent Settings.")
     state = auth.generate_state()
     url = auth.build_authorization_url(state, settings)
     return {"url": url, "state": state}
 
 
-class GmailOAuthConfig(BaseModel):
-    client_id: str
-    client_secret: str
-    redirect_uri: str | None = None
+class DesktopOAuthImport(BaseModel):
+    credentials: dict
 
 
 @router.get("/oauth-config")
 def oauth_config():
-    """Return Gmail OAuth configuration status WITHOUT secrets.
-
-    Used by the Web UI to show whether Google OAuth is configured and which
-    redirect URI must be registered in Google Cloud Console. Never returns the
-    client secret.
-    """
-    settings = get_settings()
-    configured = is_gmail_configured(settings)
-    cid = settings.GOOGLE_CLIENT_ID or ""
+    """Return non-sensitive customer Desktop OAuth configuration state."""
+    try:
+        item = oauth_config_svc.load(_DATA.config)
+    except RuntimeError:
+        return {
+            "configured": False,
+            "oauth_state": "credential_key_unavailable",
+            "client_id_hint": "",
+            "redirect_uri": oauth_config_svc.redirect_uri(get_settings().API_URL),
+            "client_type": "installed",
+        }
+    client_id = (item or {}).get("client_id", "")
+    configured = bool(item)
     return {
         "configured": configured,
-        "client_id_hint": (cid[-4:] if len(cid) >= 4 else "") if cid else "",
-        "redirect_uri": settings.GOOGLE_REDIRECT_URI,
+        "oauth_state": "oauth_not_connected" if configured else "oauth_not_configured",
+        "client_id_hint": client_id[-4:] if client_id else "",
+        "redirect_uri": oauth_config_svc.redirect_uri(get_settings().API_URL),
+        "client_type": "installed",
     }
 
 
 @router.put("/oauth-config")
-def oauth_config_update(body: GmailOAuthConfig):
-    """Persist Google OAuth credentials to backend/.env and hot-reload config.
-
-    Runs only on the target machine at runtime (the packaged installer never
-    ships a .env). After writing, the cached Settings is cleared so the connect
-    flow picks up the new credentials immediately.
-    """
-    client_id = (body.client_id or "").strip()
-    client_secret = (body.client_secret or "").strip()
-    redirect_uri = (body.redirect_uri or "").strip() or "http://127.0.0.1:8000/api/gmail/oauth/callback"
-    if not client_id or not client_secret:
-        raise HTTPException(status_code=400, detail="client_id and client_secret are required.")
-    if len(client_id) < 10 or len(client_secret) < 10:
-        raise HTTPException(status_code=400, detail="client_id/client_secret look malformed.")
-
-    env_path = os.path.join(_BACKEND_DIR, ".env")
-    with _env_write_lock:
-        existing: dict[str, str] = {}
-        if os.path.exists(env_path):
-            with open(env_path, "r", encoding="utf-8") as fh:
-                for raw in fh:
-                    line = raw.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    k, _, v = line.partition("=")
-                    existing[k.strip()] = v.strip().strip('"').strip("'")
-        existing["GOOGLE_CLIENT_ID"] = client_id
-        existing["GOOGLE_CLIENT_SECRET"] = client_secret
-        existing["GOOGLE_REDIRECT_URI"] = redirect_uri
-        # Preserve ordering with the three OAuth keys last.
-        ordered_keys = [k for k in existing if k not in (
-            "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REDIRECT_URI")]
-        ordered_keys += ["GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REDIRECT_URI"]
-        tmp_path = env_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as fh:
-            for k in ordered_keys:
-                fh.write(f"{k}={existing[k]}\n")
-        os.replace(tmp_path, env_path)
-        # Lock the file so only the current Windows user can read it.
-        try:
-            subprocess.run(
-                ["icacls", env_path, "/inheritance:r", "/grant:r", f"{os.environ.get('USERNAME', '*')}:R"],
-                check=False, capture_output=True,
-            )
-        except Exception:  # noqa: BLE001 - best-effort hardening
-            pass
-    # Hot-reload: drop the cached Settings so subsequent reads see the new .env.
+def oauth_config_update(body: DesktopOAuthImport):
+    """Validate and DPAPI-protect a customer-owned Google Desktop OAuth JSON."""
+    try:
+        saved = oauth_config_svc.save(_DATA.config, body.credentials)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail="credential_key_unavailable") from exc
     get_settings.cache_clear()
-    return {"ok": True, "configured": True, "redirect_uri": redirect_uri}
-
+    return {
+        "ok": True,
+        "configured": True,
+        "oauth_state": "oauth_not_connected",
+        "client_type": "installed",
+        "client_id_hint": saved["client_id"][-4:],
+        "redirect_uri": oauth_config_svc.redirect_uri(get_settings().API_URL),
+    }
 
 @router.get("/oauth/callback")
 def oauth_callback(code: str = Query(...), state: str = Query(...), db: Session = Depends(get_db)):
@@ -153,7 +126,6 @@ def oauth_callback(code: str = Query(...), state: str = Query(...), db: Session 
         raise HTTPException(status_code=400, detail=str(e))
     # Build a real transport to fetch the profile
     cipher = Cipher()
-    from ..gmail.transport import InMemoryGmailTransport
     # We need the real transport; build one from the credentials directly.
     from google.oauth2.credentials import Credentials
     from googleapiclient.discovery import build
@@ -168,7 +140,7 @@ def oauth_callback(code: str = Query(...), state: str = Query(...), db: Session 
     email = profile["emailAddress"]
 
     owner_id = ensure_owner(db)
-    account = db.query(models.GmailAccount).filter_by(email=email).first()
+    account = db.query(models.GmailAccount).filter_by(user_id=owner_id, email=email).first()
     if account is None:
         account = models.GmailAccount(user_id=owner_id, email=email, is_connected=True,
                                        granted_scopes=",".join(result.scopes),
@@ -192,7 +164,11 @@ def oauth_callback(code: str = Query(...), state: str = Query(...), db: Session 
     oauth.token_expiry = datetime.fromtimestamp(result.token_expiry, tz=timezone.utc) if result.token_expiry else None
     db.commit()
     logger.info("Gmail connected: %s (access %s)", email, redact_for_log(result.access_token))
-    return RedirectResponse(f"{settings.APP_URL}/?gmail=connected")
+    return HTMLResponse(
+        "<!doctype html><meta charset='utf-8'><title>Gmail connected</title>"
+        "<style>body{font:16px system-ui;padding:48px;background:#080d16;color:#e8edf7}</style>"
+        "<h1>Gmail authorization completed</h1><p>You can close this browser tab and return to Email Automation.</p>"
+    )
 
 
 @router.post("/sync")

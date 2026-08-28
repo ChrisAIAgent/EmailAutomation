@@ -4,6 +4,7 @@ import os
 os.environ.setdefault("DATABASE_URL", "sqlite:///./test.db")
 os.environ["APP_ENCRYPTION_KEY"] = "test-encryption-key"
 os.environ["ENABLE_REAL_SEND"] = "false"
+os.environ["ALLOW_INMEMORY_GMAIL"] = "true"
 os.environ["ENABLE_SCHEDULER"] = "false"
 os.environ["RESTRICTED_RECIPIENT_ALLOWLIST"] = ""
 os.environ.pop("TEST_RECIPIENT_ALLOWLIST", None)
@@ -24,6 +25,7 @@ def _reset_db():
     from app.config import get_settings
     from app.gmail import clear_transport_cache
     os.environ["ENABLE_REAL_SEND"] = "false"
+    os.environ["ALLOW_INMEMORY_GMAIL"] = "true"
     os.environ["RESTRICTED_RECIPIENT_ALLOWLIST"] = ""
     os.environ.pop("TEST_RECIPIENT_ALLOWLIST", None)
     get_settings.cache_clear()

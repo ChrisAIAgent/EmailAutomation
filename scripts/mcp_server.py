@@ -19,9 +19,9 @@ from pathlib import Path
 from typing import Any
 
 
-API_BASE = os.environ.get("EMAIL_AUTOMATION_API_URL", "http://127.0.0.1:8000").rstrip("/")
+API_BASE = os.environ.get("EMAIL_AUTOMATION_API_URL", "http://127.0.0.1:18000").rstrip("/")
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
-SERVER_INFO = {"name": "email-automation", "version": "1.1.3"}
+SERVER_INFO = {"name": "email-automation", "version": "1.2.0"}
 MCP_DIAGNOSTIC_LOG = WORKSPACE_ROOT / "logs" / "mcp-server.log"
 
 

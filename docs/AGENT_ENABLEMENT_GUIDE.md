@@ -234,12 +234,17 @@ caches, but it must not include live secrets, OAuth tokens, business databases, 
 logs by default. The expected operator flow is:
 
 ```text
-unzip -> portable-bootstrap.bat -> provide backend/.env -> portable-start.bat
--> open http://127.0.0.1:3000 -> use the embedded TACWork panel for guided setup
+install -> launch Email Automation.exe -> wait for the app readiness gate
+-> import customer-owned Google Desktop OAuth credentials.json in Web Setup
+-> complete authorization in the system browser -> use the embedded TACWork panel
 ```
 
 The embedded Agent may guide the user through model configuration and Gmail OAuth,
 but it must not invent credentials, print secrets, or bypass the Web OAuth flow.
+Only an `installed` Desktop OAuth JSON is accepted. Google login must open in the
+system browser, never inside Electron or TACWork. `oauth_not_configured`,
+`oauth_not_connected`, `oauth_connected`, and `credential_key_unavailable` are
+distinct states; saving a file is not proof that Gmail is connected.
 
 ## Operational computer migration
 

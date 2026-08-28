@@ -1,10 +1,10 @@
-; Email Automation - Windows installer (Inno Setup 6)
+﻿; Email Automation - Windows installer (Inno Setup 6)
 ; Build:  powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1 -Version "1.0.0"
 ;         (which stages the payload, generates the icon, injects the version
 ;          and calls ISCC on this file)
 
 #define MyAppName "Email Automation"
-#define MyAppVersion "1.1.3"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "TAC AISolution"
 #define MyAppId "B8C9D0F2-2E6D-4C89-9A1D-EMAILAUTOMATION"
 
@@ -61,20 +61,31 @@ Source: "assets\EmailAutomation.ico"; DestDir: "{app}\branding"; Flags: ignoreve
 
 [Icons]
 ; Start-menu group
-Name: "{group}\{#MyAppName}"; Filename: "{app}\start-stack.bat"; WorkingDir: "{app}"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\runtime\electron\Email Automation.exe"; WorkingDir: "{app}"
 Name: "{group}\停止 {#MyAppName}"; Filename: "{app}\stop-stack.bat"; WorkingDir: "{app}"
-Name: "{group}\打开 {#MyAppName}"; Filename: "{win}\explorer.exe"; Parameters: "http://127.0.0.1:3000"; WorkingDir: "{app}"
 Name: "{group}\健康检查"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\scripts\agent-health.ps1"""; WorkingDir: "{app}"
 ; Desktop (optional task)
-Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\start-stack.bat"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\runtime\electron\Email Automation.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
 ; Optional launch after install. start-stack.bat starts only the prebuilt
 ; runtime and opens Web Setup/Dashboard after every service is healthy.
 ; The installer never triggers Gmail sync / drafts / approvals / sends / automations.
-Filename: "{app}\start-stack.bat"; Description: "启动 {#MyAppName}"; Flags: postinstall nowait skipifsilent
+Filename: "{app}\runtime\electron\Email Automation.exe"; Description: "Launch {#MyAppName}"; Flags: postinstall nowait skipifsilent
 
 [Code]
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  RepairDir, RepairExe: string;
+begin
+  if CurStep = ssPostInstall then begin
+    RepairDir := ExpandConstant('{app}\repair');
+    RepairExe := RepairDir + '\Email-Automation-Repair.exe';
+    ForceDirectories(RepairDir);
+    CopyFile(ExpandConstant('{srcexe}'), RepairExe, False);
+  end;
+end;
+
 function InitializeSetup(): Boolean;
 var
   UninstallKey, UninstallString: string;
@@ -128,3 +139,5 @@ begin
     end;
   end;
 end;
+
+

@@ -23,7 +23,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
 ]
 
-# In-memory OAuth transaction store (demo). Each state keeps its PKCE verifier
+# In-memory OAuth transaction store. Each state keeps its PKCE verifier
 # and expires after 10 minutes.
 _STATE_STORE: dict[str, tuple[float, Optional[str]]] = {}
 
@@ -38,7 +38,7 @@ class OAuthResult:
 
 def _client_config(settings: Settings) -> dict:
     return {
-        "web": {
+        "installed": {
             "client_id": settings.GOOGLE_CLIENT_ID,
             "client_secret": settings.GOOGLE_CLIENT_SECRET,
             "redirect_uris": [settings.GOOGLE_REDIRECT_URI],

@@ -98,7 +98,10 @@ export default function Dashboard() {
     setGmailError(null);
     try {
       const result = await api.gmailStart();
-      if (result?.url) window.location.href = result.url;
+      if (result?.url) {
+        if (window.emailAutomation) await window.emailAutomation.openExternal(result.url);
+        else window.location.href = result.url;
+      }
     } catch (e: any) {
       setGmailError(e?.message || (lang === "zh" ? "连接 Gmail 失败：请先在「全局 Agent Profile / 设置」中填写 Google OAuth 凭证" : "Gmail connect failed: configure Google OAuth credentials in Settings first"));
     }

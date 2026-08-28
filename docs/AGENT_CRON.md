@@ -3,7 +3,7 @@
 > `AGENTS.md` is authoritative for execution modes and safety. This document
 > covers scheduler operations; MCP mappings are in `AGENT_CAPABILITIES.md`.
 
-> The unified stack also owns TACWork Server (8787), TACWork Web (5173) and the
+> The transition Web stack also owns TACWork Server (18002), TACWork Web (18003) and the
 > OpenCode Engine. Always use `start-stack.bat` / `stop-stack.bat`; do not launch a
 > second Agent stack. `logs/run/services.json` records both Email Automation and
 > TACWork runtime PIDs.
@@ -91,7 +91,7 @@ trigger -> queued -> running -> success | partial | failed
 .\start-stack.bat
 ```
 
-启动脚本会停止记录在 `logs/run/services.json` 的旧进程，清理遗留的 8000/3000 监听进程，启动新服务，并等待 Backend、Frontend、Consumer 心跳全部通过。
+启动脚本只清理经状态文件验证属于本应用的旧进程，绝不结束外部端口进程；过渡端口组为 18000-18003。正式 Electron 版不启动 Next Web Server。
 
 启动后必须验证：
 

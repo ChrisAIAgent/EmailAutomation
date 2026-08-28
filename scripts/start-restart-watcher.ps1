@@ -5,6 +5,7 @@ param(
 $ErrorActionPreference = "Stop"
 $rootPath = (Resolve-Path $Root).Path
 . (Join-Path $PSScriptRoot "data-dir.ps1")
+. (Join-Path $PSScriptRoot "runtime-ports.ps1")
 $markerPath = Join-Path $global:DataLogs "run\restart-requested.json"
 
 # Spawned on-demand by POST /api/system/restart. The backend writes the marker
@@ -23,7 +24,7 @@ Remove-Item -LiteralPath $markerPath -Force -ErrorAction SilentlyContinue
 & (Join-Path $PSScriptRoot "stop-demo.ps1") -Root $rootPath
 
 # Wait for the service ports to be free before starting (stop may need a moment).
-$ports = @(8000, 3000)
+$ports = @($script:BackendPort, $script:FrontendPort)
 foreach ($port in $ports) {
     $wait = 0
     while ($wait -lt 10) {

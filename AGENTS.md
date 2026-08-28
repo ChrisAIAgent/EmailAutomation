@@ -58,8 +58,9 @@ again for an already-admitted Contact or an already-rejected sender.
 
 ## 服务入口
 
-- 前端：`http://127.0.0.1:3000`
-- 后端：`http://127.0.0.1:8000`
+- 正式 Windows 应用：`Email Automation.exe`。Electron 仅在完整 runtime、Backend、Consumer 与 TACWork 健康后显示主窗口；前端通过 `app://email-automation` 加载，不依赖浏览器 localhost。
+- 开发入口：`scripts/dev-stack.ps1`，使用独立开发数据目录与 `28000-28003` 端口组。
+- 过渡 Web 入口：`start-stack.bat`，使用 `18000-18003` 端口组；仅用于兼容和诊断。
 - 干净启动或重启：`start-stack.bat`
 - 停止：`stop-stack.bat`
 - 健康检查：`powershell -ExecutionPolicy Bypass -File scripts/agent-health.ps1`
@@ -67,6 +68,8 @@ again for an already-admitted Contact or an already-rejected sender.
 - 生成运营报告：`powershell -ExecutionPolicy Bypass -File scripts/agent-report.ps1`
 
 `start-stack.bat` 会先停止旧进程，再启动一套 Backend、Huey Consumer 和 Frontend。不要手工重复启动第二套服务。
+
+正式 Gmail 连接使用客户自有 Google Cloud **Desktop app OAuth**。用户导入 `credentials.json` 后，系统在默认浏览器完成 loopback 授权；不要求 API Key，也不要求手工填写 Client Secret 或 Redirect URI。OAuth 配置、Token 和邮件数据只保存在当前 Windows 用户的本机数据目录。不得在 Electron 或 TACWork iframe 内嵌 Google 登录页，不得把 Desktop 配置或 Token 写入项目 `.env`。
 
 ## 操作前检查
 
@@ -466,9 +469,11 @@ Gmail-sync, Inbox-sort, Global-Run, or run-poll operation.
 
 The Agent Settings page configures Email Automation LangGraph's OpenAI-compatible Base URL, model and encrypted API key. TACWork conversation AI is currently configured separately in TACWork's own Web UI; do not claim that changing Email Agent Settings also configures TACWork. Read APIs return only configured status and never return keys. Restart the unified service after changing the Email provider before treating the new runtime configuration as active.
 
-- Use `start-stack.bat` as the single startup entry. It starts Email Automation
-  Backend, Consumer, Frontend, TACWork Server, TACWork Web, and the OpenCode
-  Engine. Do not manually start a second TACWork or Email Automation stack.
+- In the installed product, use `Email Automation.exe` as the single startup entry.
+  It validates the immutable runtime and starts Backend, Consumer, TACWork Server,
+  TACWork Web, and the OpenCode Engine; the UI is loaded from `app://`, not a Next
+  server. `start-stack.bat` remains a transition/diagnostic entry only. Do not
+  manually start a second TACWork or Email Automation stack.
 - TACWork runs loopback-only and is locked to this Email Automation Workspace as
   its writable root. It may inspect and edit this Workspace only when the user has
   authorized development or configuration changes.

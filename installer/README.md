@@ -20,10 +20,13 @@
 powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1
 ```
 
+正式构建要求工作树干净且 HEAD 正好带 `v<version>` tag。Review 前仅做开发构建时使用
+`-AllowUncommitted`；该产物报告会标记 `git_dirty=true` / `git_tag=unreleased`，不得发布。
+
 显式指定版本（同步写入 .iss、安装包文件名、Payload `version.txt`）：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1 -Version "1.0.0"
+powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1 -Version "1.2.0"
 ```
 
 也可直接指定编译器：
@@ -33,7 +36,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1 `
   -InnoCompiler "C:\Users\Administrats\AppData\Local\Programs\Inno Setup 6\ISCC.exe"
 ```
 
-输出：`dist\Email-Automation-Setup-1.0.0.exe`
+输出：`dist\Email-Automation-Setup-1.2.0.exe`，以及 JSON/Markdown 构建报告。
 
 构建流程（`build-installer.ps1`）：定位 ISCC / magick → 复用 `portable-package.ps1`
 的排除 / 完整性 / 安全规则暂存 Payload → 二次完整性校验 → 由正式 Logo 生成
@@ -45,22 +48,19 @@ powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1 `
 
 安装后在「开始菜单 / Email Automation」与（可选）桌面提供：
 
-- **启动 Email Automation** → `start-stack.bat`（首次会自动 bootstrap 再启动）
 - **停止 Email Automation** → `stop-stack.bat`
-- **打开 Email Automation** → 默认浏览器打开 `http://127.0.0.1:3000`
+- **Email Automation** → 启动 Electron 正式应用；完整健康检查通过后显示主窗口
 - **健康检查** → `scripts/agent-health.ps1`
 
-安装完成页的「启动」为可勾选项（默认勾选），由 `start-stack.bat` 引导首启。
+安装完成页的「启动」为可勾选项（默认勾选），直接进入 Electron 正式应用。
 
 ## 首次启动流程
 
 1. 用户点击「启动 Email Automation」。
-2. `start-stack.bat` 的守卫检测：若 `backend/.venv` 或 `frontend/node_modules` 缺失，
-   先调用 `portable-bootstrap.ps1` 用随包 Python 建虚拟环境、从离线缓存安装依赖；
-   初始化失败会明确报错退出，不会进入「启动却缺运行时」的半残状态。已就绪则跳过。
-3. 启动 Backend、Huey Consumer、Frontend、TACWork，等待健康检查。
-4. 浏览器打开 `http://127.0.0.1:3000` 显示配置向导：
-   AI Provider / Base URL / Model / API Key、APP_ENCRYPTION_KEY、SECRET_KEY、Gmail OAuth。
+2. Electron 校验 SHA-256 runtime manifest；正式启动不执行 pip、npm、构建或下载。
+3. 启动 Backend、Huey Consumer 与 TACWork，等待健康检查；正式版不启动 Next Web Server。
+4. Electron 主窗口显示配置向导；前端使用 `app://email-automation`，不依赖浏览器 localhost：
+   AI Provider / Base URL / Model / API Key、Agent Profile、Knowledge Base、Reply Strategy、Approval Mode，以及客户自有 Google Desktop OAuth `credentials.json`。
    未完成配置前**不会**自动同步 Gmail、生成 Draft、创建 / 批准 Approval、发送邮件或
    启用 Automation。配置完成后重启服务进入正常运营 Dashboard。
 
@@ -72,15 +72,13 @@ powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1 `
 
 ## 升级与卸载
 
-- **覆盖安装**：保留 `backend/.env`、`backend/app.db`、`backend/data`、`data`、OAuth 与
-  业务配置；安装前自动停止当前运行的服务；安装后不自动执行 Gmail 同步，由用户重新启动。
+- **覆盖安装**：保留 `%LOCALAPPDATA%\TAC AISolution\Email Automation` 中的 OAuth、数据库、知识库、Profile、Session 与业务配置；安装前停止本应用服务；安装后不自动执行 Gmail 同步。
 - **卸载**：默认只删除程序文件，**保留**业务数据、配置与日志；额外提供
   「是否删除业务数据与日志」卸载选项（默认不勾选），勾选后**二次确认并显示准确目录**
   才删除。绝不在默认卸载中删除数据库 / OAuth / 配置文件。
 
-## 品牌资源与已知缺口
+## 品牌资源
 
 - 安装器、快捷方式与 Web 页面统一使用现有正式 Logo（`TACWork-Logo-Black.PNG`、
   `frontend/public/tac-logo.png`）。
-- 当前工作区**未发现** `TACWork-Logo-White` 文件，因此：不伪造白色 Logo，也不将其作为
-  构建阻塞；安装器图标由正式黑色 Logo 经 ImageMagick 转换为多尺寸 `.ico`。
+- 安装器图标由正式黑色 Logo 经 ImageMagick 转换为多尺寸 `.ico`。

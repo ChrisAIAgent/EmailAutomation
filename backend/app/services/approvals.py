@@ -38,7 +38,7 @@ def _account_for_campaign(db, campaign):
     # placeholder) but with consistent ordering and an OAuth join, so a stale placeholder row
     # can never win over the real connected account. ``provision=True`` keeps
     # draft-only mode working when no real account exists.
-    return resolve_sending_account(db, campaign=campaign, provision=True)
+    return resolve_sending_account(db, campaign=campaign, provision=get_settings().ALLOW_INMEMORY_GMAIL)
 
 
 def _account_for_thread(db, thread):
@@ -55,7 +55,7 @@ def _account_for_thread(db, thread):
             owner_id = acc.user_id
     if owner_id is None:
         owner_id = db.query(models.User.id).order_by(models.User.id.asc()).scalar()
-    return resolve_sending_account(db, thread=thread, owner_id=owner_id, provision=True)
+    return resolve_sending_account(db, thread=thread, owner_id=owner_id, provision=get_settings().ALLOW_INMEMORY_GMAIL)
 
 
 def _append_reference(references: str | None, message_id: str) -> str:

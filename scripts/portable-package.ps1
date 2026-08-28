@@ -108,6 +108,7 @@ $xdPaths = @(
     # original build machine's absolute paths - they must never ship.
     (Join-Path $root "backend\logs"),
     (Join-Path $root "reports"),
+    (Join-Path $root "audit"),
     (Join-Path $root "qa-e2e"),
     (Join-Path $root "qa_scripts"),
     (Join-Path $root ".pytest-final-all"),
@@ -119,8 +120,8 @@ $xdPaths = @(
     # Stray pytest temp dir left by local test runs (no secret, just noise).
     (Join-Path $root "backend\.pytest-temp"),
     # Local test suite + fixtures are not part of the customer deliverable.
-    (Join-Path $root "backend\tests")
-    (Join-Path $root "offline-cache")
+    (Join-Path $root "backend\tests"),
+    (Join-Path $root "offline-cache"),
     (Join-Path $root "runtime\.frontend-build")
 )
 if (-not $IncludeData) {
@@ -139,6 +140,7 @@ if (-not $IncludeData) {
 # The project's own frontend deps are renewable (rebuilt by portable-bootstrap).
 # robocopy /XD does NOT accept wildcards inside a full path, so resolve the real
 # directory names now - this also catches leftovers like node_modules.broken-e-drive.
+$xdPaths += (Join-Path $root "desktop\node_modules")
 Get-ChildItem (Join-Path $root "frontend") -Directory -Force -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -like "node_modules*" } |
     ForEach-Object { $xdPaths += $_.FullName }
@@ -179,6 +181,15 @@ if ($LASTEXITCODE -ge 8) {
     throw ("robocopy staging failed (exit $LASTEXITCODE). See the details above and $rcLog.")
 }
 
+# Ship only customer-facing neutral templates/runbooks from audit; never package
+# local analysis reports, sample contacts or QA evidence.
+$templateTarget = Join-Path (Join-Path $payload "docs") "templates"
+New-Item -ItemType Directory -Force -Path $templateTarget | Out-Null
+foreach ($templateName in @("kb-content-template.md", "WINDOWS_CUSTOMER_PACKAGING_RUNBOOK.md")) {
+    $templateSource = Join-Path (Join-Path $root "audit") $templateName
+    if (Test-Path -LiteralPath $templateSource) { Copy-Item -LiteralPath $templateSource -Destination $templateTarget -Force }
+}
+
 # --- Integrity sweep: the bundled runtimes must be complete ---------------
 # A broken exclusion rule can silently gut the bundled npm/Node/Python and the
 # damage only shows up on the target machine. Fail loudly here instead.
@@ -191,6 +202,8 @@ $mustExist = @(
     "backend\requirements.txt",
     "runtime\python-packages",
     "runtime\frontend\server.js",
+    "runtime\frontend-static\index.html",
+    "runtime\electron\Email Automation.exe",
     "runtime\runtime-manifest.json",
     "scripts\portable-start.ps1",
     "scripts\portable-start-unified.ps1",

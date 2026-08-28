@@ -1,5 +1,7 @@
 // Frontend API client. All data comes from the backend (DB + real runs).
-export const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+declare global { interface Window { __EMAIL_AUTOMATION_RUNTIME__?: { apiUrl?: string; tacworkUrl?: string; tacworkServerUrl?: string; version?: string }; emailAutomation?: { openExternal: (url: string) => Promise<unknown>; openLogs: () => Promise<unknown>; repair: () => Promise<unknown>; quitAndStop: () => Promise<unknown>; getRuntimeStatus: () => Promise<unknown> } } }
+const runtimeConfig = typeof window !== "undefined" ? window.__EMAIL_AUTOMATION_RUNTIME__ : undefined;
+export const API_BASE = runtimeConfig?.apiUrl || process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:18000";
 
 // Keep ordinary dashboard reads snappy, but real Gmail/model operations often
 // take 20-60s in a live demo. Those long-running actions pass an explicit
@@ -50,8 +52,8 @@ export const api = {
   gmailStart: () => req<any>("/api/gmail/oauth/start"),
   gmailDisconnect: () => req<any>("/api/gmail/disconnect", { method: "POST" }),
   gmailOauthConfig: () => req<any>("/api/gmail/oauth-config"),
-  gmailOauthSave: (body: { client_id: string; client_secret: string; redirect_uri?: string }) =>
-    req<any>("/api/gmail/oauth-config", { method: "PUT", body: JSON.stringify(body) }),
+  gmailOauthSave: (credentials: Record<string, unknown>) =>
+    req<any>("/api/gmail/oauth-config", { method: "PUT", body: JSON.stringify({ credentials }) }),
   gmailSync: (fullScan = false) => req<any>(`/api/gmail/sync${fullScan ? "?full_scan=true" : ""}`, { method: "POST" }, LONG_ACTION_TIMEOUT_MS),
 
   contacts: (query = "") => req<any[]>(`/api/contacts${query ? `?${query}` : ""}`),

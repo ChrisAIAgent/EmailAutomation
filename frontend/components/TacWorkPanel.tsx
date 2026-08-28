@@ -4,8 +4,9 @@ import { Bot, ExternalLink, PanelRightClose, PanelRightOpen, Plus, RefreshCw } f
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useLang } from "@/lib/i18n";
 
-const TACWORK_URL = process.env.NEXT_PUBLIC_TACWORK_URL || "http://127.0.0.1:5173";
-const TACWORK_SERVER_URL = process.env.NEXT_PUBLIC_TACWORK_SERVER_URL || "http://127.0.0.1:8787";
+const runtimeConfig = typeof window !== "undefined" ? window.__EMAIL_AUTOMATION_RUNTIME__ : undefined;
+const TACWORK_URL = runtimeConfig?.tacworkUrl || process.env.NEXT_PUBLIC_TACWORK_URL || "http://127.0.0.1:18003";
+const TACWORK_SERVER_URL = runtimeConfig?.tacworkServerUrl || process.env.NEXT_PUBLIC_TACWORK_SERVER_URL || "http://127.0.0.1:18002";
 // Fixed local loopback service identifier exchanged between this Email Automation
 // host and the co-located TACWork server. It is NOT a secret and is intentionally
 // not configurable as a NEXT_PUBLIC_* value (those ship in browser bundles).

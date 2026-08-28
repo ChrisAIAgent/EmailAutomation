@@ -1,0 +1,1 @@
+window.__EMAIL_AUTOMATION_RUNTIME__ = window.__EMAIL_AUTOMATION_RUNTIME__ || {};

@@ -3,7 +3,7 @@
 > `AGENTS.md` is authoritative for modes, safety gates and send reporting. This
 > document contains procedures only; MCP mappings are in `AGENT_CAPABILITIES.md`.
 
-> Unified runtime: `start-stack.bat` also starts the bundled TACWork Server,
+> Transition Web runtime: `start-stack.bat` also starts the bundled TACWork Server,
 > TACWork Web and OpenCode Engine. TACWork runs loopback-only with
 > `approval=auto`; its writable root is locked to this Email Automation
 > Workspace. Verify the complete stack with `scripts/portable-health.ps1`.
@@ -492,10 +492,10 @@ Operational rules:
   changing code:
 
 ```text
-GET http://127.0.0.1:8000/api/health
-GET http://127.0.0.1:8787/status
-GET http://127.0.0.1:5173/
-GET http://127.0.0.1:3000/
+GET http://127.0.0.1:18000/api/health
+GET http://127.0.0.1:18002/status
+GET http://127.0.0.1:18003/
+正式 Windows 版直接启动 `Email Automation.exe` 并等待 `app://email-automation` 主窗口；过渡 Web 诊断才访问 `http://127.0.0.1:18001/`。
 ```
 
 For browser origin issues, both `127.0.0.1` and `localhost` origins are expected
