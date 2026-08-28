@@ -23,7 +23,7 @@ param()
 
 $ErrorActionPreference = "Stop"
 
-$backendDir = (Resolve-Path (Join-Path $PSScriptRoot '..' 'backend')).Path
+$backendDir = (Resolve-Path (Join-Path (Join-Path $PSScriptRoot '..') 'backend')).Path
 
 function Test-ProtectedInstall {
     param([string]$Path)
@@ -45,7 +45,7 @@ if ($env:EMAIL_AUTOMATION_DATA_DIR) {
     $local = $env:LOCALAPPDATA
     if (-not $local) { $local = $env:APPDATA }
     if (-not $local) { $local = $env:TEMP }
-    $script:DataRoot = Join-Path $local 'TAC AISolution' 'Email Automation'
+    $script:DataRoot = Join-Path (Join-Path $local 'TAC AISolution') 'Email Automation'
     $script:DataMode = 'app'
 } else {
     $script:DataRoot = $backendDir
@@ -63,7 +63,7 @@ if ($script:DataMode -eq 'app') {
     $script:DataDatabase = $script:DataRoot
     $script:DataQueue    = Join-Path $script:DataRoot 'data'
     $script:DataLogs     = Join-Path $script:DataRoot 'logs'
-    $script:DataTacwork  = Join-Path $script:DataRoot 'data' 'tacwork'
+    $script:DataTacwork  = Join-Path (Join-Path $script:DataRoot 'data') 'tacwork'
 }
 
 foreach ($d in @($script:DataConfig, $script:DataDatabase, $script:DataQueue, $script:DataLogs, $script:DataTacwork)) {

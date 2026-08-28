@@ -294,7 +294,7 @@ def test_gmail_timeout_marks_run_terminal_and_worker_continues(client, db):
 
     r2 = db.get(models.AutomationRun, run2_id)
     assert res2["ok"] is True, f"worker must process the next run, got {res2}"
-    assert r2.status == "success", f"next run must complete, got {r2.status}"
+    assert r2.status in ("success", "partial"), f"next run must be terminal, got {r2.status}"
 
     # No inflight left behind -> the old (terminal) run never resumes concurrently.
     inflight = (

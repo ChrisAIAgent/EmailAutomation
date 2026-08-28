@@ -4,7 +4,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $rootPath = (Resolve-Path $Root).Path
-$markerPath = Join-Path $rootPath "logs\run\restart-requested.json"
+. (Join-Path $PSScriptRoot "data-dir.ps1")
+$markerPath = Join-Path $global:DataLogs "run\restart-requested.json"
 
 # Spawned on-demand by POST /api/system/restart. The backend writes the marker
 # then exits after ~1s; wait a little so the port is released before stop runs.

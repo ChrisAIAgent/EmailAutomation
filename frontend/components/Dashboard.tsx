@@ -139,13 +139,10 @@ export default function Dashboard() {
     <div className="h-screen flex overflow-hidden">
       <aside className="h-full w-16 lg:w-60 shrink-0 border-r border-border bg-panel p-2 lg:p-4 flex flex-col gap-1 relative overflow-hidden transition-[width] duration-200">
         <div className="absolute -top-12 -right-12 h-28 w-28 rounded-full bg-accent/10 blur-2xl" />
-        <div className="flex items-center justify-center lg:justify-start gap-3 mb-5 lg:px-2 relative">
-          <div className="h-10 w-10 lg:h-11 lg:w-11 rounded-lg overflow-hidden border border-brand/40 bg-[#151a24] shrink-0">
-            <img src="/tac-logo.png" alt="TAC" className="h-full w-full object-cover" />
-          </div>
-          <div className="hidden lg:block min-w-0">
+        <div className="flex items-center justify-center lg:justify-start mb-5 lg:px-2 relative">
+          <div className="min-w-0 text-center lg:text-left">
             <div className="font-black tracking-[0.24em] text-brand text-lg leading-none">TAC</div>
-            <div className="text-[10px] uppercase tracking-[0.16em] text-muted mt-1 truncate">{t('dash_email_automation')}</div>
+            <div className="hidden lg:block text-[10px] uppercase tracking-[0.16em] text-muted mt-1 truncate">{t('dash_email_automation')}</div>
           </div>
         </div>
         {(Object.entries(TAB_KEYS) as [Tab, typeof TAB_KEYS[Tab]][]).map(([id, cfg]) => {

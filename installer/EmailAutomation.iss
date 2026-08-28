@@ -1,0 +1,130 @@
+; Email Automation - Windows installer (Inno Setup 6)
+; Build:  powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1 -Version "1.0.0"
+;         (which stages the payload, generates the icon, injects the version
+;          and calls ISCC on this file)
+
+#define MyAppName "Email Automation"
+#define MyAppVersion "1.1.3"
+#define MyAppPublisher "TAC AISolution"
+#define MyAppId "B8C9D0F2-2E6D-4C89-9A1D-EMAILAUTOMATION"
+
+[Setup]
+AppId={#MyAppId}
+AppName={#MyAppName}
+AppVersion={#MyAppVersion}
+AppVerName={#MyAppName} {#MyAppVersion}
+AppPublisher={#MyAppPublisher}
+VersionInfoVersion={#MyAppVersion}
+VersionInfoDescription={#MyAppName} installer
+VersionInfoCopyright=Copyright (C) TAC AISolution
+DefaultDirName={autopf}\TAC AISolution\Email Automation
+DefaultGroupName={#MyAppName}
+OutputDir=..\dist
+OutputBaseFilename=Email-Automation-Setup-{#MyAppVersion}
+Compression=lzma2/fast
+SolidCompression=yes
+PrivilegesRequired=admin
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+WizardStyle=modern
+SetupIconFile=assets\EmailAutomation.ico
+UninstallDisplayIcon={app}\branding\EmailAutomation.ico
+DisableProgramGroupPage=yes
+; Reserve the install dir; do not require an empty folder.
+DirExistsWarning=no
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+Name: "chinese"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+
+[Tasks]
+Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "快捷方式："; Flags: unchecked
+
+[Files]
+; The build script stages the sanitized workspace into installer\payload.
+; The build script stages the sanitized workspace into installer\payload.
+; Excludes "*.docx" because no deliverable .docx exists; this also robustly
+; drops the Unicode-named dev artifact (截图.docx) that robocopy /XF cannot
+; match on its own.
+Source: "payload\*"; DestDir: "{app}"; Excludes: "*.docx"; Flags: recursesubdirs createallsubdirs ignoreversion
+; Official brand assets for the installed Web UI and shortcuts.
+Source: "..\TACWork-Logo-Black.PNG"; DestDir: "{app}\branding"; Flags: ignoreversion
+Source: "..\frontend\public\tac-logo.png"; DestDir: "{app}\branding"; Flags: ignoreversion
+; Installer icon (also used as the uninstall icon).
+Source: "assets\EmailAutomation.ico"; DestDir: "{app}\branding"; Flags: ignoreversion
+
+[Dirs]
+; The program directory ({app}) is kept read-only. All mutable data (DB, queue,
+; logs, .env, keys, TACWork session) is created under %LOCALAPPDATA% on first
+; launch (see backend/app/config.py and scripts/data-dir.ps1), never under {app}.
+; No [Dirs] entries are needed here because the first launch creates them.
+
+[Icons]
+; Start-menu group
+Name: "{group}\{#MyAppName}"; Filename: "{app}\start-stack.bat"; WorkingDir: "{app}"
+Name: "{group}\停止 {#MyAppName}"; Filename: "{app}\stop-stack.bat"; WorkingDir: "{app}"
+Name: "{group}\打开 {#MyAppName}"; Filename: "{win}\explorer.exe"; Parameters: "http://127.0.0.1:3000"; WorkingDir: "{app}"
+Name: "{group}\健康检查"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\scripts\agent-health.ps1"""; WorkingDir: "{app}"
+; Desktop (optional task)
+Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\start-stack.bat"; WorkingDir: "{app}"; Tasks: desktopicon
+
+[Run]
+; Optional launch after install. start-stack.bat starts only the prebuilt
+; runtime and opens Web Setup/Dashboard after every service is healthy.
+; The installer never triggers Gmail sync / drafts / approvals / sends / automations.
+Filename: "{app}\start-stack.bat"; Description: "启动 {#MyAppName}"; Flags: postinstall nowait skipifsilent
+
+[Code]
+function InitializeSetup(): Boolean;
+var
+  UninstallKey, UninstallString: string;
+  ResultCode: Integer;
+begin
+  Result := True;
+  // Upgrade path: if a previous build is installed, stop its running services
+  // before files are replaced, so we never overwrite a live stack.
+  UninstallKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppId}_is1';
+  if (RegQueryStringValue(HKLM, UninstallKey, 'UninstallString', UninstallString)) or
+     (RegQueryStringValue(HKCU, UninstallKey, 'UninstallString', UninstallString)) then begin
+    if FileExists(ExpandConstant('{app}\stop-stack.bat')) then begin
+      Exec('cmd.exe', '/c "{app}\stop-stack.bat"', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    end;
+  end;
+end;
+
+function IsSilentUninstall(): Boolean;
+var
+  i: Integer;
+  s: string;
+begin
+  Result := False;
+  for i := 1 to ParamCount do begin
+    s := ParamStr(i);
+    if (CompareText(s, '/SILENT') = 0) or (CompareText(s, '/VERYSILENT') = 0) then
+      Result := True;
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurStep: TUninstallStep);
+var
+  Msg, Paths, LocalDataDir: string;
+begin
+  // Only prompt in INTERACTIVE uninstall. In silent (/VERYSILENT) mode we keep
+  // ALL business data, config and logs by default - deletion is never implicit.
+  if (CurStep = usPostUninstall) and (not IsSilentUninstall()) then begin
+    LocalDataDir := ExpandConstant('{localappdata}') + '\TAC AISolution\Email Automation';
+    Paths := LocalDataDir + #13#10 +
+             LocalDataDir + '\database (app.db*)' + #13#10 +
+             LocalDataDir + '\queue (huey.db, consumer-status.json)' + #13#10 +
+             LocalDataDir + '\logs' + #13#10 +
+             LocalDataDir + '\config (.env, security.json)';
+    Msg := '是否删除业务数据与日志？' + #13#10#13#10 +
+           '默认保留以下目录与文件（推荐升级时保留）：' + #13#10 + Paths;
+    if MsgBox(Msg, mbConfirmation, MB_YESNO) = IDYES then begin
+      if MsgBox('即将删除以下业务数据与日志，此操作不可逆，确认删除吗？' + #13#10#13#10 + Paths,
+                mbCriticalError, MB_YESNO) = IDYES then begin
+        DelTree(LocalDataDir, True, True, True);
+      end;
+    end;
+  end;
+end;

@@ -11,6 +11,10 @@ const distDir = process.env.NEXT_DIST_DIR || ".next";
 
 const nextConfig = {
   reactStrictMode: true,
+  // The Windows installer runs the prebuilt Next server directly with the
+  // bundled Node runtime. Keep this enabled so build-runtime.ps1 can package
+  // .next-prod/standalone/server.js instead of relying on customer npm files.
+  output: "standalone",
   distDir,
   async rewrites() {
     return [

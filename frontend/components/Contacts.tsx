@@ -48,7 +48,7 @@ export default function ContactsView({ onChanged }: { onChanged:()=>void }) {
   const confirmImport=async()=>{if(!fileRef.current)return;try{await api.importContacts(fileRef.current,true);setPreview(null);fileRef.current=null;await load();onChanged();}catch(e:any){setError(e.message);}};
 
   return <div className="space-y-4">
-    <p className="text-xs text-muted">{zh?"CSV ����Ҫ Email����������˾����һ������������ѡ��":"CSV required: Email and at least one of First name or Company. All other fields are optional."}</p>
+    <p className="text-xs text-muted">{zh?"CSV 必须填写 Email，以及姓名或公司中的至少一项；其他字段均为可选。":"CSV required: Email and at least one of First name or Company. All other fields are optional."}</p>
     <div className="text-sm text-muted">{zh?`共 ${contacts.length} 位联系人`:`${contacts.length} contacts`}</div>
     <div className="flex items-center gap-2 flex-wrap"><h2 className="text-lg font-semibold">{zh?"联系人":"Contacts"}</h2><button className="btn-primary flex items-center gap-1" onClick={()=>open()}><Plus size={14}/>{zh?"新建联系人":"New Contact"}</button><button className="btn flex items-center gap-1" onClick={downloadTemplate}><Download size={14}/>{zh?"下载示例模板":"Example Template"}</button><button className="btn flex items-center gap-1" onClick={chooseFile}><FileSpreadsheet size={14}/>{zh?"导入 Excel/CSV":"Import Excel/CSV"}</button><input id="contacts-file" className="hidden" type="file" accept=".xlsx,.csv" onChange={e=>e.target.files?.[0]&&readFile(e.target.files[0])}/></div>
     {error&&<div className="bg-danger/10 text-danger rounded p-2 text-sm">{error}</div>}

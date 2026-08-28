@@ -10,6 +10,7 @@ $processPath = [Environment]::GetEnvironmentVariable("Path", "Process")
 [Environment]::SetEnvironmentVariable("Path", $processPath, "Process")
 
 $rootPath = (Resolve-Path $Root).Path
+. (Join-Path $PSScriptRoot "data-dir.ps1")
 . (Join-Path $PSScriptRoot "tacwork-runtime.ps1")
 
 # Unified TACWork config: the Email frontend must reach the SAME ports the
@@ -20,14 +21,20 @@ $rootPath = (Resolve-Path $Root).Path
 [Environment]::SetEnvironmentVariable("NEXT_PUBLIC_TACWORK_URL", "http://127.0.0.1:$script:TacWorkWebPort", "Process")
 [Environment]::SetEnvironmentVariable("NEXT_PUBLIC_TACWORK_SERVER_URL", "http://127.0.0.1:$script:TacWorkServerPort", "Process")
 
-$logsPath = Join-Path $rootPath "logs"
+$logsPath = $global:DataLogs
 $runPath = Join-Path $logsPath "run"
 $pidPath = Join-Path $runPath "services.json"
-$pythonPath = Join-Path $rootPath "backend\.venv\Scripts\python.exe"
-$bundledNpm = Join-Path $rootPath "tools\node\npm.cmd"
-$npmPath = if (Test-Path $bundledNpm) { $bundledNpm } else { (Get-Command npm.cmd -ErrorAction Stop).Source }
-$pnpmCommand = Get-Command pnpm.cmd -ErrorAction SilentlyContinue
-$pnpmPath = if ($pnpmCommand) { $pnpmCommand.Source } else { $null }
+$pythonPath = Join-Path $rootPath "tools\python\python.exe"
+$nodePath = Join-Path $rootPath "tools\node\node.exe"
+$pythonPackages = Join-Path $rootPath "runtime\python-packages"
+$frontendServer = Join-Path $rootPath "runtime\frontend\server.js"
+$runtimeManifest = Join-Path $rootPath "runtime\runtime-manifest.json"
+foreach ($required in @($pythonPath, $nodePath, $pythonPackages, $frontendServer, $runtimeManifest)) {
+    if (-not (Test-Path $required)) { throw "runtime_missing: $required" }
+}
+$env:EMAIL_AUTOMATION_ROOT = $rootPath
+$env:EMAIL_AUTOMATION_DATA_DIR = $global:DataRoot
+$env:PYTHONPATH = (Join-Path $rootPath "backend") + ";" + $pythonPackages
 
 # Decrypt the Email Automation LLM configuration into this trusted parent process.
 # Child services inherit it; secrets are never written to logs or project config.
@@ -193,14 +200,14 @@ $consumer = Start-Process -FilePath $pythonPath `
     -RedirectStandardError (Join-Path $logsPath "consumer-error.log") `
     -WindowStyle Hidden -PassThru
 
-$frontend = Start-Process -FilePath $npmPath `
-    -ArgumentList @("run", "dev") `
-    -WorkingDirectory (Join-Path $rootPath "frontend") `
+$frontend = Start-Process -FilePath $nodePath `
+    -ArgumentList ('"{0}"' -f $frontendServer) `
+    -WorkingDirectory (Join-Path $rootPath "runtime\frontend") `
     -RedirectStandardOutput (Join-Path $logsPath "frontend.log") `
     -RedirectStandardError (Join-Path $logsPath "frontend-error.log") `
     -WindowStyle Hidden -PassThru
 
-$tacwork = Start-TacWorkRuntime -WorkspaceRoot $rootPath -LogsPath $logsPath -RunPath $runPath -PythonPath $pythonPath -PnpmPath $pnpmPath
+$tacwork = Start-TacWorkRuntime -WorkspaceRoot $rootPath -LogsPath $logsPath -RunPath $runPath -PythonPath $pythonPath -PnpmPath $null
 
 @{
     started_at = (Get-Date).ToString("o")

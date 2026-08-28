@@ -4,8 +4,9 @@ param(
 
 $ErrorActionPreference = "Continue"
 $rootPath = (Resolve-Path $Root).Path
+. (Join-Path $PSScriptRoot "data-dir.ps1")
 . (Join-Path $PSScriptRoot "tacwork-runtime.ps1")
-$pidPath = Join-Path $rootPath "logs\run\services.json"
+$pidPath = Join-Path $global:DataLogs "run\services.json"
 
 if (Test-Path $pidPath) {
     $servicePids = Get-Content -Raw -Encoding UTF8 $pidPath | ConvertFrom-Json
@@ -17,7 +18,7 @@ if (Test-Path $pidPath) {
     ) | Where-Object { $_ } | Select-Object -Unique
     foreach ($servicePid in $recorded) {
         if ($servicePid) {
-            & taskkill.exe /PID $servicePid /T /F 2>$null | Out-Null
+            Stop-Process -Id ([int]$servicePid) -Force -ErrorAction SilentlyContinue
         }
     }
     Remove-Item -LiteralPath $pidPath -Force -ErrorAction SilentlyContinue

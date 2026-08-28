@@ -147,6 +147,7 @@ def test_generate_reply_returns_policy_reason_without_empty_approval(client, db)
         contact_email=contact.email,
         campaign_id=campaign.id,
         subject="Original subject",
+            pending_action="reply",
     )
     db.add(thread)
     db.flush()

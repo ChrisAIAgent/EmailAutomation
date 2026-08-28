@@ -44,14 +44,20 @@ config/secrets/
 *.bak*
 backend/data/
 backend/app.db*
+backend/config/
+backend/queue/
+backend/tacwork/run/
 
 # ---------------- Bundled runtimes / binaries (~1.9 GB, NOT source) -------
 offline-cache/
 tools/
 tacwork-runtime/
-installer/
+installer/payload/
+installer/output/
+installer/*.exe
 dist/
 .portable_stage/
+runtime/
 
 # ---------------- Logs / reports / build output ---------------------------
 *.log
@@ -84,10 +90,10 @@ portable-bootstrap.bat
 portable-start.bat
 portable-start-unified.ps1
 portable-diagnose.ps1
-scripts/build-installer.ps1
-scripts/portable-package.ps1
-scripts/portable-*.ps1
-scripts/prepare-tacwork-runtime.ps1
+
+# ---------------- Local diagnostic scratch -------------------------------
+_procs.txt
+_start_out.txt
 
 # ---------------- Pytest / coverage temp artifacts -------------------------
 .pytest_cache/
