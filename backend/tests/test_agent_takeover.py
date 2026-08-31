@@ -74,7 +74,7 @@ def test_changing_disabled_interval_does_not_start_takeover(client):
     assert body["active_session_id"] == ""
 
 
-def test_capability_can_only_start_global_inbox(client, db):
+def test_capability_can_start_owned_enabled_full_auto_runs(client, db):
     response = client.post("/api/agent-takeover", json={"enabled": True, "interval_minutes": 60})
     global_id = response.json()["global_automation_id"]
     token = "scheduled-session-secret"
@@ -92,13 +92,18 @@ def test_capability_can_only_start_global_inbox(client, db):
     db.add(campaign_automation); db.commit()
 
     allowed = client.post("/api/agent-takeover/authorize", json={
-        "token": token, "operation": "start_global_run", "automation_id": global_id,
+        "token": token, "operation": "start_agent_run", "automation_id": global_id,
     })
     assert allowed.status_code == 200
-    denied = client.post("/api/agent-takeover/authorize", json={
-        "token": token, "operation": "start_global_run", "automation_id": campaign_automation.id,
+    campaign_allowed = client.post("/api/agent-takeover/authorize", json={
+        "token": token, "operation": "start_agent_run", "automation_id": campaign_automation.id,
     })
-    assert denied.status_code == 403
+    assert campaign_allowed.status_code == 200
+    campaign_automation.execution_mode = "semi_auto"; db.commit()
+    denied = client.post("/api/agent-takeover/authorize", json={
+        "token": token, "operation": "start_agent_run", "automation_id": campaign_automation.id,
+    })
+    assert denied.status_code == 409
 
 
 def test_due_tick_creates_fresh_tacwork_session_and_records_stage(client, db, monkeypatch):

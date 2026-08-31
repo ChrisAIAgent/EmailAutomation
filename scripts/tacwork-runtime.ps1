@@ -47,7 +47,7 @@ function Resolve-TacWorkRuntime([string]$WorkspaceRoot) {
 }
 
 function Get-TacWorkHealth([string]$WorkspaceRoot) {
-    $serverReady = $false; $webReady = $false; $engineReady = $false; $workspaceReady = $false; $status = $null
+    $serverReady = $false; $webReady = $false; $webConfigReady = $false; $engineReady = $false; $workspaceReady = $false; $status = $null
     $headers = @{ Authorization = "Bearer $script:TacWorkClientToken" }
     try {
         $serverHealth = Invoke-RestMethod "http://127.0.0.1:$script:TacWorkServerPort/health" -TimeoutSec 2
@@ -65,34 +65,36 @@ function Get-TacWorkHealth([string]$WorkspaceRoot) {
         $engineHealth = Invoke-RestMethod "http://127.0.0.1:$script:TacWorkServerPort/opencode/global/health" -Headers $headers -TimeoutSec 2
         $engineReady = $engineHealth.healthy -eq $true
     } catch {}
-    try { $webReady = (Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$script:TacWorkWebPort" -TimeoutSec 2).StatusCode -eq 200 } catch {}
+    try {
+        $web = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$script:TacWorkWebPort" -TimeoutSec 2
+        $webReady = $web.StatusCode -eq 200
+        $expectedOpenCodeUrl = "http://127.0.0.1:$script:TacWorkServerPort/opencode"
+        $expectedServerUrl = "http://127.0.0.1:$script:TacWorkServerPort"
+        $webConfigReady = (
+            $web.Content -match [regex]::Escape($expectedOpenCodeUrl) -and
+            $web.Content -match [regex]::Escape("openwork.server.urlOverride") -and
+            $web.Content -match [regex]::Escape($expectedServerUrl) -and
+            $web.Content -match [regex]::Escape("openwork.server.port")
+        )
+    } catch {}
     return [pscustomobject]@{
-        server = $serverReady; web = $webReady; engine = $engineReady; workspace = $workspaceReady
-        ready = ($serverReady -and $webReady -and $engineReady -and $workspaceReady); status = $status
+        server = $serverReady; web = $webReady; web_config = $webConfigReady; engine = $engineReady; workspace = $workspaceReady
+        ready = ($serverReady -and $webReady -and $webConfigReady -and $engineReady -and $workspaceReady); status = $status
     }
 }
 
-function Set-EmailAutomationMcpCommand([string]$WorkspaceRoot) {
-    # OpenCode starts local MCP processes from an engine-owned working
-    # directory. Normalize this one Workspace-local command before each start
-    # so it remains portable when the installation folder changes.
+function Test-EmailAutomationMcpConfig([string]$WorkspaceRoot) {
+    # The packaged workspace stays read-only. The local MCP command is a stable
+    # cmd.exe launcher found through PATH, so startup never rewrites opencode.jsonc.
     $configPath = Join-Path $WorkspaceRoot "opencode.jsonc"
-    $pythonPath = Join-Path $WorkspaceRoot "tools\python\python.exe"
-    $serverPath = Join-Path $WorkspaceRoot "scripts\mcp_server.py"
-    if (-not (Test-Path $configPath) -or -not (Test-Path $pythonPath) -or -not (Test-Path $serverPath)) {
+    $launcherPath = Join-Path $WorkspaceRoot "scripts\email-automation-mcp.cmd"
+    if (-not (Test-Path $configPath) -or -not (Test-Path $launcherPath)) {
         throw "email_automation_mcp_config_missing"
     }
-    $commandJson = @($pythonPath, $serverPath) | ConvertTo-Json -Compress
     $raw = [IO.File]::ReadAllText($configPath)
-    $pattern = '("email_automation"\s*:\s*\{\s*"type"\s*:\s*"local"\s*,\s*"enabled"\s*:\s*true\s*,\s*"command"\s*:\s*)\[[^\]]*\]'
-    $updated = $raw -replace $pattern, ('$1' + $commandJson)
-    # A previous clean start may already have written the same absolute command.
-    # That is valid and must not prevent a later restart.
-    if ($updated -eq $raw) {
-        if ($raw -notmatch $pattern) { throw "email_automation_mcp_config_unrecognized" }
-        return
+    if ($raw -notmatch '"email_automation"' -or $raw -notmatch 'email-automation-mcp\.cmd') {
+        throw "email_automation_mcp_config_unrecognized"
     }
-    [IO.File]::WriteAllText($configPath, $updated, [Text.UTF8Encoding]::new($false))
 }
 
 function Start-TacWorkRuntime(
@@ -100,13 +102,14 @@ function Start-TacWorkRuntime(
     [string]$PythonPath, [string]$PnpmPath
 ) {
     $runtime = Resolve-TacWorkRuntime $WorkspaceRoot
-    Set-EmailAutomationMcpCommand $WorkspaceRoot
+    Test-EmailAutomationMcpConfig $WorkspaceRoot
     $hostToken = [guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N")
     $oldManage = $env:OPENWORK_MANAGE_OPENCODE; $oldEngine = $env:OPENWORK_OPENCODE_BIN
-    $oldConfig = $env:OPENWORK_SERVER_CONFIG; $oldTokenStore = $env:OPENWORK_TOKEN_STORE
+    $oldConfig = $env:OPENWORK_SERVER_CONFIG; $oldTokenStore = $env:OPENWORK_TOKEN_STORE; $oldPath = $env:Path
     $env:OPENWORK_MANAGE_OPENCODE = "1"; $env:OPENWORK_OPENCODE_BIN = $runtime.engine
     $env:OPENWORK_SERVER_CONFIG = Join-Path $RunPath "tacwork-server.json"
     $env:OPENWORK_TOKEN_STORE = Join-Path $RunPath "tacwork-tokens.json"
+    $env:Path = (Join-Path $WorkspaceRoot "scripts") + ";" + $oldPath
     try {
         $serverArgs = "--workspace `"$WorkspaceRoot`" --host 127.0.0.1 --port $script:TacWorkServerPort --token $script:TacWorkClientToken --host-token $hostToken --approval auto --cors http://127.0.0.1:$script:TacWorkWebPort,http://localhost:$script:TacWorkWebPort,http://127.0.0.1:$script:FrontendPort,http://localhost:$script:FrontendPort,app://email-automation"
         $server = Start-Process -FilePath $runtime.server -ArgumentList $serverArgs -WorkingDirectory $runtime.root `
@@ -115,11 +118,13 @@ function Start-TacWorkRuntime(
     } finally {
         $env:OPENWORK_MANAGE_OPENCODE = $oldManage; $env:OPENWORK_OPENCODE_BIN = $oldEngine
         $env:OPENWORK_SERVER_CONFIG = $oldConfig; $env:OPENWORK_TOKEN_STORE = $oldTokenStore
+        $env:Path = $oldPath
     }
 
     if ($runtime.mode -eq "bundled") {
         $spaScript = Join-Path $PSScriptRoot "serve-spa.py"
-        $webArgs = "`"$spaScript`" --root `"$($runtime.web_root)`" --host 127.0.0.1 --port $script:TacWorkWebPort"
+        $openCodeUrl = "http://127.0.0.1:$script:TacWorkServerPort/opencode"
+        $webArgs = "`"$spaScript`" --root `"$($runtime.web_root)`" --host 127.0.0.1 --port $script:TacWorkWebPort --client-token $script:TacWorkClientToken --opencode-url $openCodeUrl"
         $web = Start-Process -FilePath $PythonPath -ArgumentList $webArgs -WorkingDirectory $WorkspaceRoot `
             -RedirectStandardOutput (Join-Path $LogsPath "tacwork-web.log") `
             -RedirectStandardError (Join-Path $LogsPath "tacwork-web-error.log") -WindowStyle Hidden -PassThru

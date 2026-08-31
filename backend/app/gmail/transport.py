@@ -35,6 +35,14 @@ class GmailTimeoutError(Exception):
     """
 
 
+class GmailTransientNetworkError(Exception):
+    """A retryable Gmail transport failure exhausted its bounded retries.
+
+    Callers must leave durable sync cursors unchanged so the same Gmail History
+    change set can be retried safely on the next explicit sync.
+    """
+
+
 @dataclass
 class MessageDTO:
     gmail_message_id: str
@@ -66,15 +74,47 @@ class ThreadDTO:
 class _TextExtractor(HTMLParser):
     """Strip tags from HTML and keep readable text lines."""
 
+    _SKIP_TAGS = {"head", "script", "style", "template", "noscript", "title"}
+    _BLOCK_TAGS = {"address", "article", "br", "div", "footer", "h1", "h2", "h3", "h4", "h5", "h6", "li", "p", "section", "table", "tr"}
+
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag in self._SKIP_TAGS:
+            self._skip_depth += 1
+            return
+        if self._skip_depth:
+            return
+        if tag in self._BLOCK_TAGS:
+            self.parts.append("\n")
+        if tag == "img":
+            alt = next((value for name, value in attrs if name.lower() == "alt"), None)
+            if alt:
+                self.parts.append(alt)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in self._SKIP_TAGS and self._skip_depth:
+            self._skip_depth -= 1
+            return
+        if not self._skip_depth and tag in self._BLOCK_TAGS:
+            self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
-        self.parts.append(data)
+        if not self._skip_depth:
+            self.parts.append(data)
 
     def get_text(self) -> str:
-        return "\n".join(p.strip() for p in self.parts if p.strip())
+        lines = []
+        for line in "".join(self.parts).splitlines():
+            collapsed = " ".join(line.split())
+            if collapsed:
+                lines.append(collapsed)
+        return "\n".join(lines)
 
 
 def _html_to_text(html_text: str) -> str:
@@ -87,6 +127,30 @@ def _html_to_text(html_text: str) -> str:
         return html.unescape(parser.get_text())
     except Exception:
         return html.unescape(re.sub(r"<[^>]+>", " ", html_text))
+
+
+def _looks_like_html_or_css_residue(value: str | None) -> bool:
+    """Detect markup/style payload accidentally chosen as a message's text part."""
+    text = (value or "").lower()
+    if not text:
+        return False
+    markers = ("<html", "<body", "<style", "</style", "@import", "@media", "color-scheme:", "mso-", "application/ld+json")
+    return any(marker in text for marker in markers)
+
+
+def readable_email_text(body_text: str | None, body_html: str | None) -> str:
+    """Return safe, readable local text without rendering arbitrary email HTML."""
+    text = (body_text or "").strip()
+    html_text = (body_html or "").strip()
+    if html_text and (not text or _looks_like_html_or_css_residue(text)):
+        extracted = _html_to_text(html_text).strip()
+        if extracted:
+            return extracted
+    if text and "<" in text and ">" in text:
+        extracted = _html_to_text(text).strip()
+        if extracted:
+            return extracted
+    return text
 
 
 def _text_corruption_score(value: str) -> int:
@@ -236,8 +300,7 @@ def parse_gmail_raw_message(msg: dict, owner_email: Optional[str] = None) -> Mes
         elif content_type == "text/html" and html_body is None:
             html_body = _repair_text_mojibake(str(value))
 
-    if not text and html_body:
-        text = _html_to_text(html_body)
+    text = readable_email_text(text, html_body)
 
     from_header = str(parsed.get("From") or "")
     to_header = str(parsed.get("To") or "")
@@ -281,8 +344,7 @@ def parse_gmail_message(msg: dict, owner_email: Optional[str] = None) -> Message
     text, html = _decode_body(msg.get("payload", {}))
     snippet = _repair_text_mojibake(msg.get("snippet") or "") or None
     # HTML-only emails: derive readable text so the UI never shows raw markup.
-    if not text and html:
-        text = _html_to_text(html)
+    text = readable_email_text(text, html)
     if not text and snippet:
         text = snippet
 
@@ -367,7 +429,8 @@ class GmailTransport(abc.ABC):
     def archive_thread(self, thread_id: str) -> None: ...
 
     @abc.abstractmethod
-    def list_history(self, start_history_id: str, label_id: Optional[str] = None) -> tuple[list[dict], Optional[str]]: ...
+    def list_history(self, start_history_id: str, label_id: Optional[str] = None,
+                     page_token: Optional[str] = None) -> tuple[list[dict], Optional[str], Optional[str]]: ...
 
 
 class InMemoryGmailTransport(GmailTransport):
@@ -421,10 +484,13 @@ class InMemoryGmailTransport(GmailTransport):
 
     def list_threads(self, query: str, max_results: int = 20, page_token: Optional[str] = None, include_spam_trash: bool = False):
         items = list(self._threads.values())
-        if query:
+        if query and query.strip().lower() != "in:anywhere -in:spam -in:trash":
             q = query.lower()
             items = [t for t in items if q in (t.subject or "").lower() or q in (t.snippet or "").lower()]
-        return items[:max_results], None
+        offset = int(page_token or 0)
+        page = items[offset:offset + max_results]
+        next_offset = offset + len(page)
+        return page, (str(next_offset) if next_offset < len(items) else None)
 
     def get_thread(self, thread_id: str) -> ThreadDTO:
         return self._threads[thread_id]
@@ -502,10 +568,13 @@ class InMemoryGmailTransport(GmailTransport):
     def archive_thread(self, thread_id):
         self._labels.get(thread_id, set()).discard("INBOX")
 
-    def list_history(self, start_history_id, label_id=None):
+    def list_history(self, start_history_id, label_id=None, page_token=None):
         start = int(start_history_id or 0)
-        events = [h for h in self._history if int(h.get("historyId", start)) > start] if False else []
-        return self._history, str(self._history_id)
+        events = [h for h in self._history if int(h.get("historyId", self._history_id)) > start]
+        offset = int(page_token or 0)
+        page = events[offset:offset + 100]
+        next_offset = offset + len(page)
+        return page, str(self._history_id), (str(next_offset) if next_offset < len(events) else None)
 
 
 def build_mime(to: str, subject: str, body_text: str, body_html: str, thread_id: Optional[str], in_reply_to: Optional[str], references: Optional[str]) -> str:

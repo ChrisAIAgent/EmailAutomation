@@ -128,6 +128,105 @@ class OAuthCredential(TimestampMixin, Base):
     account = relationship("GmailAccount", back_populates="oauth")
 
 
+class GmailSyncRun(TimestampMixin, Base):
+    """Durable first-import/incremental synchronization state.
+
+    Full mailbox imports are resumable background work. Incremental runs are
+    recorded as well so the UI and Agent can report the exact synchronization
+    semantics instead of treating a partial recent-page scan as complete.
+    """
+
+    __tablename__ = "gmail_sync_runs"
+    id = Column(Integer, primary_key=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    gmail_account_id = Column(
+        Integer, ForeignKey("gmail_accounts.id"), nullable=False, index=True
+    )
+    kind = Column(String(30), nullable=False, index=True)  # initial_full | incremental
+    status = Column(String(30), default="queued", nullable=False, index=True)
+    # queued | running | paused | completed | failed | cancelled | cursor_expired
+    query = Column(String(500), nullable=True)
+    include_spam_trash = Column(Boolean, default=False, nullable=False)
+    page_token = Column(Text, nullable=True)
+    start_history_id = Column(String(50), nullable=True)
+    latest_history_id = Column(String(50), nullable=True)
+    threads_scanned = Column(Integer, default=0, nullable=False)
+    new_threads = Column(Integer, default=0, nullable=False)
+    new_messages = Column(Integer, default=0, nullable=False)
+    failures = Column(Integer, default=0, nullable=False)
+    error = Column(Text, nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index(
+            "uq_gmail_sync_inflight",
+            gmail_account_id,
+            unique=True,
+            sqlite_where=text("status IN ('queued', 'running', 'paused')"),
+            postgresql_where=text("status IN ('queued', 'running', 'paused')"),
+        ),
+    )
+
+
+class InboxTriageRun(TimestampMixin, Base):
+    """Durable Inbox triage work owned by one Workspace.
+
+    The run is intentionally separate from Gmail synchronization and outbound
+    automation: it only classifies a fixed local EmailThread snapshot.
+    """
+
+    __tablename__ = "inbox_triage_runs"
+    id = Column(Integer, primary_key=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    gmail_sync_run_id = Column(Integer, ForeignKey("gmail_sync_runs.id"), nullable=True, index=True)
+    kind = Column(String(30), default="initial_history", nullable=False, index=True)
+    # initial_history | daily_incremental
+    status = Column(String(30), default="queued", nullable=False, index=True)
+    # queued | running | paused | completed | failed | cancelled | recovery_pending
+    batch_size = Column(Integer, default=50, nullable=False)
+    total_threads = Column(Integer, default=0, nullable=False)
+    processed_threads = Column(Integer, default=0, nullable=False)
+    auto_filtered = Column(Integer, default=0, nullable=False)
+    human_review = Column(Integer, default=0, nullable=False)
+    business_threads = Column(Integer, default=0, nullable=False)
+    no_action = Column(Integer, default=0, nullable=False)
+    skipped_threads = Column(Integer, default=0, nullable=False)
+    failed_threads = Column(Integer, default=0, nullable=False)
+    current_batch = Column(Integer, default=0, nullable=False)
+    last_progress_at = Column(DateTime(timezone=True), nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    error = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "uq_inbox_triage_inflight",
+            "owner_id",
+            unique=True,
+            sqlite_where=text("status IN ('queued', 'running', 'paused', 'recovery_pending')"),
+            postgresql_where=text("status IN ('queued', 'running', 'paused', 'recovery_pending')"),
+        ),
+    )
+
+
+class InboxTriageRunItem(TimestampMixin, Base):
+    """One frozen EmailThread member of an InboxTriageRun snapshot."""
+
+    __tablename__ = "inbox_triage_run_items"
+    id = Column(Integer, primary_key=True)
+    triage_run_id = Column(Integer, ForeignKey("inbox_triage_runs.id"), nullable=False, index=True)
+    email_thread_id = Column(Integer, ForeignKey("email_threads.id"), nullable=False, index=True)
+    status = Column(String(20), default="queued", nullable=False, index=True)
+    # queued | running | completed | failed | skipped
+    outcome = Column(String(30), nullable=True)
+    error = Column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("triage_run_id", "email_thread_id", name="uq_triage_run_thread"),
+    )
+
+
 class Campaign(TimestampMixin, Base):
     __tablename__ = "campaigns"
     id = Column(Integer, primary_key=True)
@@ -355,6 +454,21 @@ class NonCustomerFilter(TimestampMixin, Base):
 
     __table_args__ = (
         UniqueConstraint("owner_id", "email", name="uq_owner_non_customer_email"),
+    )
+
+
+class InboxReviewRule(TimestampMixin, Base):
+    """Durable sender-level handling for explicitly accepted Inbox review rules."""
+    __tablename__ = "inbox_review_rules"
+    id = Column(Integer, primary_key=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    email = Column(String(320), nullable=False, index=True)
+    review_kind = Column(String(60), nullable=False, index=True)
+    action = Column(String(60), nullable=False, default="no_action")
+    created_by = Column(String(50), default="user", nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("owner_id", "email", "review_kind", name="uq_owner_inbox_review_rule"),
     )
 
 

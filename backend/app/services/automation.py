@@ -14,6 +14,7 @@ from .. import models
 from ..config import is_internal_test_email
 from ..agents.orchestrator import Orchestrator
 from ..gmail.transport import GmailTimeoutError
+from .inbox_triage import contact_is_terminal
 from ..schemas import (
     AnalyzeMessageInput,
     AutomationPlan,
@@ -262,7 +263,7 @@ def _prepare_global(db, automation, run, plan, now):
             .filter_by(owner_id=automation.owner_id, email=(thread.contact_email or "").lower())
             .first()
         )
-        if contact is None or contact.next_action not in {
+        if contact is None or contact_is_terminal(contact) or contact.next_action not in {
             "reply", "follow_up", "human_review"
         }:
             continue
@@ -492,10 +493,10 @@ def run_tick(db, automation, trigger: str, source: str,
     account, oauth = resolve_sending_account(
         db, owner_id=automation.owner_id, provision=False
     )
-    if account is not None:
-        sync_result = sync_svc.sync_inbox(
-            db, account, oauth, max_results=50
-        )
+    if account is not None and account.is_connected and oauth is not None:
+        if not sync_svc.initial_import_completed(db, account.id):
+            raise RuntimeError("initial_import_required")
+        sync_result = sync_svc.sync_incremental(db, account, oauth)
         synced_threads = int(sync_result.get("threads", 0))
         run.synced_threads = synced_threads
         db.commit()

@@ -411,8 +411,30 @@ def test_sync_skips_bad_sent_message_without_aborting(db):
                 gmail_thread_id=thread_id, history_id="h", subject="s", snippet="", messages=[],
             )
 
-    merged, meta = sync_svc._search_demo_relevant_threads(db, FakeTL(), query="", max_results=50)
+    merged, meta = sync_svc._search_relevant_threads(db, FakeTL(), query="", max_results=50)
 
     assert len(merged) == 1
     assert merged[0].gmail_thread_id == "gtid-good"
     assert meta["sent_message_queries"] == 2  # both attempted, bad skipped
+
+
+def test_local_html_body_repair_is_idempotent_and_never_calls_gmail(db):
+    account = models.GmailAccount(user_id=1, email="owner@example.com", is_connected=True)
+    db.add(account); db.flush()
+    thread = models.EmailThread(gmail_account_id=account.id, gmail_thread_id="html-repair", contact_email="sender@example.com")
+    db.add(thread); db.flush()
+    message = models.EmailMessage(
+        thread_id=thread.id, gmail_message_id="html-repair-message", from_email="sender@example.com",
+        to_email=account.email, subject="Update",
+        body_text="@import url('fonts'); body { color: red; } Useful update",
+        body_html="<html><head><style>body { color: red; }</style></head><body><p>Useful update</p></body></html>",
+        is_incoming=True,
+    )
+    db.add(message); db.commit()
+
+    assert sync_svc.repair_stored_mail_bodies(db) == 1
+    db.refresh(message)
+    assert message.body_text == "Useful update"
+    assert "color: red" not in message.body_text
+    assert sync_svc.repair_stored_mail_bodies(db) == 0
+    assert db.query(models.AuditLog).filter_by(action="gmail_html_body_repaired", entity_id=str(message.id)).count() == 1

@@ -21,8 +21,8 @@ from typing import Any
 
 API_BASE = os.environ.get("EMAIL_AUTOMATION_API_URL", "http://127.0.0.1:18000").rstrip("/")
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
-SERVER_INFO = {"name": "email-automation", "version": "1.2.0"}
-MCP_DIAGNOSTIC_LOG = WORKSPACE_ROOT / "logs" / "mcp-server.log"
+SERVER_INFO = {"name": "email-automation", "version": "1.2.2"}
+MCP_DIAGNOSTIC_LOG = Path(os.environ.get("EMAIL_AUTOMATION_DATA_DIR", str(WORKSPACE_ROOT))) / "logs" / "mcp-server.log"
 
 
 def _diagnostic(event: str, **fields: Any) -> None:
@@ -62,12 +62,22 @@ TOOLS = [
     _tool("ea_dashboard", "Read readiness, metrics, Inbox stats and scheduler status. Read-only."),
     _tool("ea_list_inbox", "List Inbox threads by effective category. human_review is not needs_reply.", {"category": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}}),
     _tool("ea_get_agent_run", "Read one Agent Run, including plan, timeline and status. Scheduled takeover sessions should include their capability so progress is traced.", {"run_id": {"type": "integer", "minimum": 1}, "authorization_source": {"type": "string", "enum": ["agent_takeover"]}, "takeover_token": {"type": "string"}}, ["run_id"]),
-    _tool("ea_sync_gmail", "WRITE: Sync Gmail into local operational data. Requires explicit user authorization or a valid scheduled Agent Takeover capability; never sends mail.", {"full_scan": {"type": "boolean", "default": False}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["user_authorized"]),
-    _tool("ea_sort_inbox", "WRITE: Run the AI one-click sort on all unprocessed Inbox threads. Requires explicit user authorization or a valid scheduled Agent Takeover capability; never sends mail.", {"user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["user_authorized"]),
+    _tool("ea_gmail_import_status", "READ: Check whether the one-time full mailbox import is required, running, paused or complete, including non-sensitive progress counters."),
+    _tool("ea_start_gmail_import", "WRITE, NO SEND: Start the one-time full mailbox import after explicit user authorization. Imports all accessible mail except Spam and Trash into local data; it does not sort, create Contacts/Drafts/Approvals or send.", {"user_authorized": {"type": "boolean"}}, ["user_authorized"]),
+    _tool("ea_control_gmail_import", "WRITE, NO SEND: Pause, resume or cancel the current full mailbox import after explicit user authorization.", {"run_id": {"type": "integer", "minimum": 1}, "action": {"type": "string", "enum": ["pause", "resume", "cancel"]}, "user_authorized": {"type": "boolean"}}, ["run_id", "action", "user_authorized"]),
+    _tool("ea_initial_triage_status", "READ: Check the one-time first-history Inbox triage after mailbox import, including progress and non-sensitive classification counters."),
+    _tool("ea_start_initial_triage", "WRITE, NO SEND: Start the one-time first-history Inbox triage after the full mailbox import is complete. It classifies a frozen local snapshot in 50-thread batches; it never creates Drafts, Approvals or sends mail.", {"user_authorized": {"type": "boolean"}}, ["user_authorized"]),
+    _tool("ea_control_initial_triage", "WRITE, NO SEND: Pause, resume, cancel or retry failed items in the first-history Inbox triage after explicit user authorization.", {"run_id": {"type": "integer", "minimum": 1}, "action": {"type": "string", "enum": ["pause", "resume", "cancel", "retry_failed"]}, "user_authorized": {"type": "boolean"}}, ["run_id", "action", "user_authorized"]),
+    _tool("ea_daily_triage_status", "READ: Check the current or latest daily incremental triage Run, its fixed snapshot, progress and results.", {}, []),
+    _tool("ea_recent_triage_result", "READ: Get the latest first-history or daily Inbox triage summary and its completed/progress time.", {}, []),
+    _tool("ea_start_daily_triage", "WRITE, NO SEND: Freeze all currently untriaged newly synced or changed conversations into one resumable daily triage Run. It processes every snapshot item in safe 50-thread worker batches; it never drafts or sends mail.", {"user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["user_authorized"]),
+    _tool("ea_control_daily_triage", "WRITE, NO SEND: Pause, resume, cancel or retry failed items in a daily incremental triage Run.", {"run_id": {"type": "integer", "minimum": 1}, "action": {"type": "string", "enum": ["pause", "resume", "cancel", "retry_failed"]}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["run_id", "action", "user_authorized"]),
+    _tool("ea_sync_gmail", "WRITE: After the first full import is complete, pull only Gmail History changes since the last successful cursor. Requires explicit user authorization or a valid scheduled Agent Takeover capability; never sends mail.", {"full_scan": {"type": "boolean", "default": False, "description": "Deprecated compatibility flag; use ea_start_gmail_import."}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["user_authorized"]),
+    _tool("ea_sort_inbox", "Deprecated compatibility alias for ea_start_daily_triage. It creates a resumable snapshot Run; 50 is only the worker batch size. Requires explicit user authorization or a valid Agent Takeover capability; never sends mail.", {"user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["user_authorized"]),
     _tool("ea_create_contact", "WRITE: Create one confirmed-human Contact through the API. Never infer identity from forwarded/system mail.", {"contact": {"type": "object"}, "user_authorized": {"type": "boolean"}}, ["contact", "user_authorized"]),
     _tool("ea_import_contacts", "WRITE: Preview or import a UTF-8 CSV/XLSX file located inside this Workspace. Confirm=false is preview-only.", {"path": {"type": "string"}, "confirm": {"type": "boolean", "default": False}, "user_authorized": {"type": "boolean"}}, ["path", "user_authorized"]),
-    _tool("ea_create_campaign", "WRITE: Create a Campaign configuration; does not generate or send mail.", {"campaign": {"type": "object"}, "user_authorized": {"type": "boolean"}}, ["campaign", "user_authorized"]),
-    _tool("ea_start_agent_run", "HIGH IMPACT: Start an existing Automation Run. A scheduled Agent Takeover capability can authorize only the Global Inbox Automation.", {"automation_id": {"type": "integer", "minimum": 1}, "mode": {"type": "string", "enum": ["full_auto", "semi_auto"]}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["automation_id", "mode", "user_authorized"]),
+    _tool("ea_create_campaign", "WRITE: Create a Campaign configuration; does not generate or send mail. A valid Agent Takeover capability may create it as part of full operating authority.", {"campaign": {"type": "object"}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign", "user_authorized"]),
+    _tool("ea_start_agent_run", "HIGH IMPACT: Start an owned enabled Automation Run. A scheduled Agent Takeover capability may use full operating authority; server safety gates still apply.", {"automation_id": {"type": "integer", "minimum": 1}, "mode": {"type": "string", "enum": ["full_auto", "semi_auto"]}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["automation_id", "mode", "user_authorized"]),
     _tool("ea_confirm_run", "SEND-CAPABLE: Confirm the exact frozen semi-auto plan. May send mail through server safeguards. Use only after explicit confirmation of recipients and full content.", {"run_id": {"type": "integer", "minimum": 1}, "confirmed_by": {"type": "string"}, "user_authorized": {"type": "boolean"}}, ["run_id", "user_authorized"]),
     _tool("ea_cancel_run", "WRITE, NO SEND: Cancel one exact prepared semi-auto Run. Does not generate or send mail.", {"run_id": {"type": "integer", "minimum": 1}, "user_authorized": {"type": "boolean"}}, ["run_id", "user_authorized"]),
     _tool("ea_invalidate_approval", "WRITE, NO SEND: Expire one pending Approval and cancel its unsent Draft.", {"approval_id": {"type": "integer", "minimum": 1}, "reason": {"type": "string"}, "editor_email": {"type": "string"}, "user_authorized": {"type": "boolean"}}, ["approval_id", "reason", "user_authorized"]),
@@ -117,7 +127,7 @@ def _authorized(args: dict[str, Any], operation: str | None = None) -> None:
         _request("POST", "/api/agent-takeover/authorize", {
             "token": args.get("takeover_token") or "",
             "operation": operation,
-            **({"automation_id": args.get("automation_id")} if operation == "start_global_run" else {}),
+            **({"automation_id": args.get("automation_id")} if operation == "start_agent_run" else {}),
         })
 
 
@@ -185,7 +195,6 @@ def _takeover_status() -> dict[str, Any]:
     campaigns = _request("GET", "/api/campaigns")
     automations = _request("GET", "/api/automation")
     approvals = _request("GET", "/api/approvals?status=pending")
-    unsorted = _request("GET", "/api/inbox/threads?category=unsorted&limit=500")
     scheduler = _request("GET", "/api/automation/scheduler/status")
     takeover = _request("GET", "/api/agent-takeover")
 
@@ -201,19 +210,27 @@ def _takeover_status() -> dict[str, Any]:
     blockers = list(readiness.get("blockers", [])) if isinstance(readiness, dict) else []
     if not ai_configured and "email_ai_not_configured" not in blockers:
         blockers.append("email_ai_not_configured")
+    if gmail_connected and not bool(gmail.get("initial_import_completed")) and "initial_import_required" not in blockers:
+        blockers.append("initial_import_required")
 
     counts = {
         "contacts": _count(contacts),
         "campaigns": _count(campaigns),
         "automations": _count(automations),
         "pending_approvals": _count(approvals),
-        "unsorted_threads": _count(unsorted),
+        # ``triage_review`` is an already-analysed review outcome whose legacy
+        # display category is ``unsorted``.  The operational count must use the
+        # API's explicit unprocessed metric, matching the Inbox action button.
+        "unsorted_threads": int(stats.get("unprocessed", 0) or 0),
+        "untriaged_threads": int(stats.get("unprocessed", 0) or 0),
         "human_review_threads": int(stats.get("human_review", 0) or 0),
         "needs_reply_threads": int(stats.get("needs_reply", 0) or 0),
     }
     recommended: list[str] = []
     if not gmail_connected:
         recommended.append("connect_gmail_in_browser")
+    elif not bool(gmail.get("initial_import_completed")):
+        recommended.append("explain_and_request_first_mail_import_authorization")
     if not ai_configured:
         recommended.append("configure_email_ai")
     if not bool(profile.get("configured")):
@@ -239,6 +256,8 @@ def _takeover_status() -> dict[str, Any]:
         "gmail": {
             "connected": gmail_connected,
             "email": gmail.get("email") if isinstance(gmail, dict) else None,
+            "initial_import_completed": bool(gmail.get("initial_import_completed")) if isinstance(gmail, dict) else False,
+            "sync_state": gmail.get("sync_state") if isinstance(gmail, dict) else None,
         },
         "ai": {
             "configured": ai_configured,
@@ -321,17 +340,44 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
                 "run_id": int(args["run_id"]), "status": result.get("status") if isinstance(result, dict) else None,
             })
         return result
+    if name == "ea_gmail_import_status":
+        return _request("GET", "/api/gmail/imports/current")
+    if name == "ea_start_gmail_import":
+        _authorized(args)
+        return _request("POST", "/api/gmail/imports")
+    if name == "ea_control_gmail_import":
+        _authorized(args)
+        return _request("POST", f"/api/gmail/imports/{int(args['run_id'])}/{args['action']}")
+    if name == "ea_initial_triage_status":
+        return _request("GET", "/api/inbox/initial-triage/current")
+    if name == "ea_start_initial_triage":
+        _authorized(args)
+        return _request("POST", "/api/inbox/initial-triage")
+    if name == "ea_control_initial_triage":
+        _authorized(args)
+        suffix = "retry-failed" if args["action"] == "retry_failed" else args["action"]
+        return _request("POST", f"/api/inbox/initial-triage/{int(args['run_id'])}/{suffix}")
+    if name == "ea_daily_triage_status":
+        return _request("GET", "/api/inbox/daily-triage/current")
+    if name == "ea_recent_triage_result":
+        return _request("GET", "/api/inbox/triage/recent")
+    if name == "ea_start_daily_triage":
+        return _takeover_operation(args, "start_daily_triage", "start_daily_triage", lambda: _request("POST", "/api/inbox/daily-triage"))
+    if name == "ea_control_daily_triage":
+        suffix = "retry-failed" if args["action"] == "retry_failed" else args["action"]
+        return _takeover_operation(args, "control_daily_triage", "control_daily_triage", lambda: _request("POST", f"/api/inbox/daily-triage/{int(args['run_id'])}/{suffix}"))
     if name == "ea_sync_gmail":
         query = "?full_scan=true" if args.get("full_scan") else ""
         return _takeover_operation(args, "sync_gmail", "sync_gmail", lambda: _request("POST", "/api/gmail/sync" + query))
     if name == "ea_sort_inbox":
-        return _takeover_operation(args, "sort_inbox", "sort_inbox", lambda: _request("POST", "/api/inbox/sort", timeout=600))
+        return _takeover_operation(args, "start_daily_triage", "start_daily_triage", lambda: _request("POST", "/api/inbox/daily-triage"))
     if name == "ea_create_contact": _authorized(args); return _request("POST", "/api/contacts", args["contact"])
     if name == "ea_import_contacts": return _upload_contacts(args)
-    if name == "ea_create_campaign": _authorized(args); return _request("POST", "/api/campaigns", args["campaign"])
+    if name == "ea_create_campaign":
+        return _takeover_operation(args, "create_campaign", "create_campaign", lambda: _request("POST", "/api/campaigns", args["campaign"]))
     if name == "ea_start_agent_run":
         if args.get("authorization_source") == "agent_takeover":
-            return _takeover_operation(args, "start_global_run", "start_global_run", lambda: _request("POST", "/api/agent-runs", {"automation_id": args["automation_id"], "mode": args["mode"]}))
+            return _takeover_operation(args, "start_agent_run", "start_agent_run", lambda: _request("POST", "/api/agent-runs", {"automation_id": args["automation_id"], "mode": args["mode"]}))
         _authorized(args); return _request("POST", "/api/agent-runs", {"automation_id": args["automation_id"], "mode": args["mode"]})
     if name == "ea_confirm_run": _authorized(args); return _request("POST", f"/api/agent-runs/{int(args['run_id'])}/confirm", {"confirmed_by": args.get("confirmed_by")})
     if name == "ea_cancel_run": _authorized(args); return _request("POST", f"/api/agent-runs/{int(args['run_id'])}/cancel")

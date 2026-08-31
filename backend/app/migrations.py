@@ -61,6 +61,21 @@ def run() -> list[tuple[str, str, str]]:
                     "WHERE membership_active IS NULL"
                 ))
 
+    # Repair legacy CRM rows created before terminal contact decisions cleared
+    # their cached next action.  This is idempotent and only removes reply or
+    # follow-up work from explicit terminal states; it does not alter messages,
+    # contacts, or historical classification.
+    if inspector.has_table("contacts"):
+        with engine.begin() as conn:
+            result = conn.execute(text(
+                "UPDATE contacts SET next_action = 'none', next_follow_up_at = NULL "
+                "WHERE (lifecycle_stage IN ('stopped', 'won') "
+                "OR status IN ('unsubscribed', 'not_interested', 'bounced', 'archived')) "
+                "AND (next_action IS NULL OR next_action != 'none' OR next_follow_up_at IS NOT NULL)"
+            ))
+            if result.rowcount:
+                logger.info("Normalized terminal contact actions: %s row(s).", result.rowcount)
+
     # SQLite cannot relax the legacy NOT NULL campaign_id in place. Rebuild this
     # one table once so a global automation can exist without a dummy Campaign.
     if engine.dialect.name == "sqlite":
@@ -108,4 +123,23 @@ def run() -> list[tuple[str, str, str]]:
             "WHERE status IN ('queued', 'running', 'awaiting_confirmation', 'confirmed')"
         ))
     logger.info("Ensured index uq_automation_inflight (<=1 inflight run per automation).")
+    if inspect(engine).has_table("gmail_sync_runs"):
+        with engine.begin() as conn:
+            conn.execute(text("DROP INDEX IF EXISTS uq_gmail_sync_inflight"))
+            conn.execute(text(
+                "CREATE UNIQUE INDEX uq_gmail_sync_inflight "
+                "ON gmail_sync_runs(gmail_account_id) "
+                "WHERE status IN ('queued', 'running', 'paused')"
+            ))
+        logger.info("Ensured index uq_gmail_sync_inflight (<=1 active sync per account).")
+    if inspect(engine).has_table("inbox_triage_runs"):
+        with engine.begin() as conn:
+            conn.execute(text("DROP INDEX IF EXISTS uq_inbox_initial_triage_inflight"))
+            conn.execute(text("DROP INDEX IF EXISTS uq_inbox_triage_inflight"))
+            conn.execute(text(
+                "CREATE UNIQUE INDEX uq_inbox_triage_inflight "
+                "ON inbox_triage_runs(owner_id) "
+                "WHERE status IN ('queued', 'running', 'paused', 'recovery_pending')"
+            ))
+        logger.info("Ensured index uq_inbox_triage_inflight (<=1 active Inbox triage per Workspace).")
     return added

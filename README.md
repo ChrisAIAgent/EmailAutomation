@@ -9,10 +9,11 @@ suppression, send-windows, daily caps, and stop-rules.
 > ⚠️ **Responsible use.** This tool is built for permission-based,
 > legitimately-interested outreach only. Do **not** use it to send spam.
 > You are responsible for complying with CAN-SPAM, GDPR, CASL, and every
-> other applicable law in the jurisdictions you email. Real sending is gated
-> behind `ENABLE_REAL_SEND=false` by default and a recipient allow-list; it
-> must stay off until you have verified consent, human confirmation, and a
-> real Gmail connection.
+> other applicable law in the jurisdictions you email. A verified connection
+> to a customer-owned Gmail account enables real-send capability automatically;
+> disconnecting Gmail disables it again. It never bypasses consent, Approval
+> mode, pause, suppression, sending windows, daily caps, idempotency, or the
+> other policy gates.
 
 ---
 
@@ -96,12 +97,16 @@ cp .env.local.example .env.local   # or set NEXT_PUBLIC_API_URL=http://127.0.0.1
 npm run dev                        # http://127.0.0.1:3000
 ```
 
-### 4. Or use the bundled dev launcher (Windows)
+### 4. Windows entry points
 
 ```powershell
-.\start-stack.bat      # stops old processes, starts backend + consumer + frontend
-.\stop-stack.bat       # stop everything
+.\runtime\electron\Email Automation.exe  # formal application runtime
+.\start-stack.bat                         # transition/diagnostic Web stack
+.\stop-stack.bat                          # stop transition stack
 ```
+
+For source development, use `scripts\dev-stack.ps1` and `scripts\dev-stop.ps1`.
+They use the isolated `Email Automation Dev` data directory and ports 28000-28003.
 
 Operational health checks live in `scripts/agent-health.ps1`,
 `scripts/agent-tick.ps1`, and `scripts/agent-report.ps1`.
@@ -114,7 +119,7 @@ Copy `backend/.env.example` → `backend/.env`. Key variables:
 |----------|---------|
 | Customer Desktop OAuth import | Gmail OAuth configuration stored with current-user Windows DPAPI |
 | `LLM_PROVIDER` / `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | LLM endpoint |
-| `ENABLE_REAL_SEND` | **false** by default; turn on only after verification |
+| `ENABLE_REAL_SEND` | Legacy/internal-test compatibility override; customer Gmail OAuth derives real-send capability automatically |
 | `RESTRICTED_RECIPIENT_ALLOWLIST` | Restrict real sends to specific addresses |
 | `APP_ENCRYPTION_KEY` / `SECRET_KEY` | Encrypt OAuth tokens / sign sessions |
 | `DEFAULT_TIMEZONE` | Used for send-windows |

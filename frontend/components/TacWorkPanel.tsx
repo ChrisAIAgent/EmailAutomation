@@ -24,6 +24,17 @@ type TacWorkSession = {
 const sessionTimestamp = (session: TacWorkSession) => session.time?.updated ?? session.time?.created ?? 0;
 const wait = (milliseconds: number) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 
+function isCurrentWorkspaceSessionUrl(value: string | null, workspaceId: string) {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    const expected = `/workspace/${encodeURIComponent(workspaceId)}/session/`;
+    return url.origin === TACWORK_URL && url.pathname.startsWith(expected);
+  } catch {
+    return false;
+  }
+}
+
 function localClock() {
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "local";
   const value = new Intl.DateTimeFormat(undefined, {
@@ -67,6 +78,8 @@ export default function TacWorkPanel() {
         if (!status.activeWorkspaceId) throw new Error("TACWork has no active workspace");
 
         const workspaceUrl = `${TACWORK_URL}/workspace/${encodeURIComponent(status.activeWorkspaceId)}/session`;
+        let cachedUrl: string | null = null;
+        try { cachedUrl = window.localStorage.getItem(LAST_SESSION_STORAGE_KEY); } catch {}
         const sessionsResponse = await fetch(
           `${TACWORK_SERVER_URL}/workspace/${encodeURIComponent(status.activeWorkspaceId)}/sessions?roots=true&limit=200`,
           { headers: { Authorization: `Bearer ${TACWORK_CLIENT_TOKEN}` } },
@@ -78,7 +91,9 @@ export default function TacWorkPanel() {
           .sort((left, right) => sessionTimestamp(right) - sessionTimestamp(left))[0];
 
         setNewSessionUrl(workspaceUrl);
-        const resolvedUrl = latest ? `${workspaceUrl}/${encodeURIComponent(latest.id)}` : workspaceUrl;
+        const resolvedUrl = latest
+          ? `${workspaceUrl}/${encodeURIComponent(latest.id)}`
+          : (isCurrentWorkspaceSessionUrl(cachedUrl, status.activeWorkspaceId) ? cachedUrl! : workspaceUrl);
         if (agentUrlRef.current === resolvedUrl) return;
         setLoaded(false);
         setAgentUrl(resolvedUrl);
@@ -107,14 +122,6 @@ export default function TacWorkPanel() {
   }, []);
 
   useEffect(() => {
-    try {
-      const cachedUrl = window.localStorage.getItem(LAST_SESSION_STORAGE_KEY);
-      if (cachedUrl?.startsWith(`${TACWORK_URL}/workspace/`) && cachedUrl.includes("/session/")) {
-        setAgentUrl(cachedUrl);
-      }
-    } catch {
-      // Storage may be unavailable in privacy-restricted browser contexts.
-    }
     void restoreLatestSession();
     const timer = window.setInterval(() => void restoreLatestSession(), 15_000);
     return () => window.clearInterval(timer);

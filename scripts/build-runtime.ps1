@@ -23,6 +23,8 @@ $pythonTarget = Join-Path $runtime "python-packages"
 $frontendTarget = Join-Path $runtime "frontend"
 $frontendStaticTarget = Join-Path $runtime "frontend-static"
 $frontendStage = Join-Path $runtime ".frontend-runtime-next"
+$frontendSmokeData = $null
+$frontendSmokeProcess = $null
 $wheels = Join-Path $root "offline-cache\python-wheels"
 $npmCache = Join-Path $root "offline-cache\npm-cache"
 $frontend = Join-Path $root "frontend"
@@ -166,6 +168,116 @@ foreach ($manifestName in @("build-manifest.json", "app-build-manifest.json")) {
 }
 if ($missingAssets.Count -gt 0) {
     throw ("runtime_frontend_asset_mismatch: " + (($missingAssets | Select-Object -Unique) -join ", "))
+}
+
+# The compatibility Web launcher uses this standalone server, whereas Electron
+# loads runtime/frontend-static through app://. Exercise every public static
+# route here so a traced dependency omission cannot become an infinite loading
+# page on a customer machine.
+$frontendSmokePort = Get-Random -Minimum 43000 -Maximum 49000
+$frontendSmokeData = Join-Path ([System.IO.Path]::GetTempPath()) ("email-automation-runtime-smoke-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $frontendSmokeData | Out-Null
+$oldPort = $env:PORT
+$oldHostname = $env:HOSTNAME
+$runtimeVerifyStartedAt = Get-Date
+$runtimeVerifyVersion = (Get-Content -Raw (Join-Path $root 'VERSION')).Trim()
+$runtimeVerifyRoutes = 0
+$runtimeVerifyAssets = 0
+$runtimeVerifyResult = 'failed'
+$runtimeVerifyErrorCode = 'frontend_smoke_failed'
+$runtimeVerifyLog = $null
+try {
+    $env:PORT = [string]$frontendSmokePort
+    $env:HOSTNAME = '127.0.0.1'
+    $smokeOut = Join-Path $frontendSmokeData 'frontend-smoke.log'
+    $smokeErr = Join-Path $frontendSmokeData 'frontend-smoke-error.log'
+    $frontendSmokeProcess = Start-Process -FilePath (Join-Path $root 'tools\node\node.exe') -ArgumentList ('"{0}"' -f (Join-Path $frontendStage 'server.js')) -WorkingDirectory $frontendStage -RedirectStandardOutput $smokeOut -RedirectStandardError $smokeErr -WindowStyle Hidden -PassThru
+    $deadline = (Get-Date).AddSeconds(30)
+    $page = $null
+    do {
+        Start-Sleep -Milliseconds 500
+        if ($frontendSmokeProcess.HasExited) { throw 'frontend_smoke_failed: standalone process exited before the homepage became ready.' }
+        try { $page = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$frontendSmokePort/" -TimeoutSec 2 } catch {}
+    } while ((-not $page -or $page.StatusCode -ne 200) -and (Get-Date) -lt $deadline)
+    $smokeText = ((Get-Content -Raw $smokeOut -ErrorAction SilentlyContinue) + "`n" + (Get-Content -Raw $smokeErr -ErrorAction SilentlyContinue))
+    if (-not $page -or $page.StatusCode -ne 200 -or $smokeText -match 'MODULE_NOT_FOUND') {
+        throw 'frontend_smoke_failed: standalone server did not return a clean HTTP 200.'
+    }
+
+    $smokeRoutes = @{}
+    function Add-SmokeRoute([string]$Route) {
+        if (-not $Route) { return }
+        $candidate = $Route -replace '/page$', ''
+        if (-not $candidate) { $candidate = '/' }
+        if (-not $candidate.StartsWith('/')) { $candidate = '/' + $candidate }
+        if ($candidate -eq '/index') { $candidate = '/' }
+        if ($candidate -like '/_*' -or $candidate -like '/api/*' -or $candidate -match '[\[\]]') { return }
+        $smokeRoutes[$candidate] = $true
+    }
+    foreach ($manifestName in @('app-paths-manifest.json', 'pages-manifest.json')) {
+        $routeManifest = Join-Path $stageDist (Join-Path 'server' $manifestName)
+        if (-not (Test-Path $routeManifest)) { continue }
+        $routeMap = Get-Content -Raw $routeManifest | ConvertFrom-Json
+        foreach ($property in $routeMap.PSObject.Properties) { Add-SmokeRoute $property.Name }
+    }
+    $routesManifestPath = Join-Path $stageDist 'routes-manifest.json'
+    if (Test-Path $routesManifestPath) {
+        $routesManifest = Get-Content -Raw $routesManifestPath | ConvertFrom-Json
+        foreach ($route in @($routesManifest.staticRoutes)) { Add-SmokeRoute $route.page }
+    }
+    Add-SmokeRoute '/'
+    Add-SmokeRoute '/404'
+
+    $verifiedAssets = @{}
+    foreach ($route in ($smokeRoutes.Keys | Sort-Object)) {
+        if ($frontendSmokeProcess.HasExited) { throw 'frontend_smoke_failed: standalone process exited while validating routes.' }
+        # The real 404 fallback deliberately returns HTTP 404. Verify its
+        # generated document without relying on PowerShell 5.1's exception
+        # handling for expected non-2xx HTTP responses.
+        if ($route -eq '/404') {
+            if (-not (Test-Path (Join-Path $stageDist 'server\pages\404.html'))) { throw 'frontend_smoke_failed: generated 404 page is missing.' }
+            $runtimeVerifyRoutes++
+            continue
+        }
+        $response = Invoke-WebRequest -UseBasicParsing ("http://127.0.0.1:$frontendSmokePort" + $route) -TimeoutSec 5
+        if ($response.StatusCode -ne 200) { throw "frontend_smoke_failed: route $route returned $($response.StatusCode)." }
+        $runtimeVerifyRoutes++
+        $assetPaths = [regex]::Matches($response.Content, '(?:src|href)="(/_next/static/[^\"]+)"') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique
+        foreach ($assetPath in $assetPaths) {
+            if ($verifiedAssets.ContainsKey($assetPath)) { continue }
+            $asset = Invoke-WebRequest -UseBasicParsing ("http://127.0.0.1:$frontendSmokePort" + $assetPath) -TimeoutSec 5
+            if ($asset.StatusCode -ne 200) { throw "frontend_smoke_failed: static asset $assetPath returned $($asset.StatusCode)." }
+            $verifiedAssets[$assetPath] = $true
+            $runtimeVerifyAssets++
+        }
+    }
+    $smokeText = ((Get-Content -Raw $smokeOut -ErrorAction SilentlyContinue) + "`n" + (Get-Content -Raw $smokeErr -ErrorAction SilentlyContinue))
+    if ($smokeText -match 'MODULE_NOT_FOUND') { throw 'frontend_smoke_failed: standalone process reported MODULE_NOT_FOUND.' }
+    $runtimeVerifyResult = 'passed'
+    $runtimeVerifyErrorCode = 'none'
+} catch {
+    if ($_.Exception.Message -match '^(frontend_smoke_failed|runtime_frontend_[a-z_]+)') {
+        $runtimeVerifyErrorCode = ($_.Exception.Message -split ':', 2)[0]
+    }
+    throw
+} finally {
+    if ($frontendSmokeProcess -and -not $frontendSmokeProcess.HasExited) { Stop-Process -Id $frontendSmokeProcess.Id -Force -ErrorAction SilentlyContinue }
+    $env:PORT = $oldPort
+    $env:HOSTNAME = $oldHostname
+    if ($frontendSmokeData) { Remove-Item -LiteralPath $frontendSmokeData -Recurse -Force -ErrorAction SilentlyContinue }
+    $runtimeVerifyDirectory = Join-Path $root 'logs'
+    New-Item -ItemType Directory -Force -Path $runtimeVerifyDirectory | Out-Null
+    $runtimeVerifyLog = Join-Path $runtimeVerifyDirectory ("runtime-verify-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.log')
+    @(
+        "version=$runtimeVerifyVersion",
+        "started_at=$($runtimeVerifyStartedAt.ToString('o'))",
+        "finished_at=$((Get-Date).ToString('o'))",
+        "temporary_port=$frontendSmokePort",
+        "routes_checked=$runtimeVerifyRoutes",
+        "assets_checked=$runtimeVerifyAssets",
+        "result=$runtimeVerifyResult",
+        "error_code=$runtimeVerifyErrorCode"
+    ) | Set-Content -LiteralPath $runtimeVerifyLog -Encoding UTF8
 }
 
 if (Test-Path $frontendTarget) { Remove-Item -LiteralPath $frontendTarget -Recurse -Force }

@@ -158,15 +158,15 @@ def run_agent_takeover_now(db: Session = Depends(get_db)):
 def authorize_agent_takeover(body: AgentTakeoverAuthorize, db: Session = Depends(get_db)):
     """Validate one scheduled-session capability without expanding its scope."""
     owner_id = ensure_owner(db)
-    allowed = {"sync_gmail", "sort_inbox", "start_global_run"}
+    allowed = {"sync_gmail", "sort_inbox", "start_daily_triage", "control_daily_triage", "create_campaign", "start_agent_run"}
     if body.operation not in allowed or not takeover_svc.token_is_valid(db, body.token):
         raise HTTPException(status_code=403, detail="invalid_or_expired_agent_takeover_grant")
-    if body.operation == "start_global_run":
-        automation = _global_automation(db, owner_id)
-        if not automation or automation.id != body.automation_id or automation.scope != "global":
-            raise HTTPException(status_code=403, detail="agent_takeover_only_allows_global_inbox_run")
+    if body.operation == "start_agent_run":
+        automation = db.get(models.Automation, body.automation_id)
+        if not automation or automation.owner_id != owner_id:
+            raise HTTPException(status_code=403, detail="agent_takeover_automation_not_owned")
         if automation.execution_mode != "full_auto" or automation.status != "enabled":
-            raise HTTPException(status_code=409, detail="global_inbox_not_ready_for_takeover")
+            raise HTTPException(status_code=409, detail="automation_not_ready_for_takeover")
     return {"authorized": True, "operation": body.operation}
 
 
@@ -176,7 +176,7 @@ def record_agent_takeover_telemetry(body: AgentTakeoverTelemetry, db: Session = 
     ensure_owner(db)
     if not takeover_svc.token_is_valid(db, body.token):
         raise HTTPException(status_code=403, detail="invalid_or_expired_agent_takeover_grant")
-    allowed_stages = {"sync_gmail", "sort_inbox", "start_global_run", "poll_agent_run"}
+    allowed_stages = {"sync_gmail", "sort_inbox", "start_daily_triage", "control_daily_triage", "poll_daily_triage", "create_campaign", "start_agent_run", "poll_agent_run"}
     allowed_statuses = {"started", "success", "failed"}
     if body.stage not in allowed_stages or body.status not in allowed_statuses:
         raise HTTPException(status_code=422, detail="invalid_takeover_telemetry")

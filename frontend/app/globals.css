@@ -3,25 +3,61 @@
 @tailwind utilities;
 
 :root {
+  --ea-bg: #0b0f17;
+  --ea-panel: #121826;
+  --ea-panel2: #1a2233;
+  --ea-border: #243044;
+  --ea-muted: #8b97ab;
+  --ea-foreground: #e6ebf2;
+  --ea-accent: #4f8cff;
+  --ea-brand: #ef1b2d;
+  --ea-accent-dark: #b90f1d;
+  --ea-danger: #ff5d5d;
+  --ea-warn: #ffb020;
+  --ea-ok: #3ddc84;
+  --ea-page-glow: rgba(239, 27, 45, 0.09);
+  --ea-card-shadow: rgba(0, 0, 0, .12);
+  --ea-accent-shadow: rgba(239, 27, 45, .22);
   color-scheme: dark;
 }
 
+:root[data-theme="light"] {
+  --ea-bg: #f5f7fb;
+  --ea-panel: #ffffff;
+  --ea-panel2: #edf1f7;
+  --ea-border: #cbd5e1;
+  --ea-muted: #526278;
+  --ea-foreground: #172033;
+  --ea-accent: #2563eb;
+  --ea-brand: #dc2638;
+  --ea-accent-dark: #b91c2c;
+  --ea-danger: #d92d3a;
+  --ea-warn: #a35b00;
+  --ea-ok: #138a52;
+  --ea-page-glow: rgba(220, 38, 56, .07);
+  --ea-card-shadow: rgba(15, 23, 42, .08);
+  --ea-accent-shadow: rgba(37, 99, 235, .18);
+  color-scheme: light;
+}
+
+:root[data-density="large"] { font-size: 17px; }
+
 html,
 body {
-  background: #0a0d13;
-  color: #e6ebf2;
+  background: var(--ea-bg);
+  color: var(--ea-foreground);
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
 body {
-  background-image: radial-gradient(circle at 85% 0%, rgba(239, 27, 45, 0.09), transparent 28rem);
+  background-image: radial-gradient(circle at 85% 0%, var(--ea-page-glow), transparent 28rem);
 }
 
-button:focus-visible, a:focus-visible { outline: 2px solid #ef1b2d; outline-offset: 2px; }
+button:focus-visible, a:focus-visible { outline: 2px solid var(--ea-brand); outline-offset: 2px; }
 
 .card {
   @apply bg-panel border border-border rounded-xl p-4;
-  box-shadow: 0 12px 32px rgba(0,0,0,.12);
+  box-shadow: 0 12px 32px var(--ea-card-shadow);
 }
 
 .btn {
@@ -30,7 +66,7 @@ button:focus-visible, a:focus-visible { outline: 2px solid #ef1b2d; outline-offs
 
 .btn-primary {
   @apply px-3 py-1.5 rounded-lg text-sm font-medium bg-accent text-white hover:opacity-90 transition;
-  box-shadow: 0 5px 16px rgba(239, 27, 45, .22);
+  box-shadow: 0 5px 16px var(--ea-accent-shadow);
 }
 
 .btn-danger {

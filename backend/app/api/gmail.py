@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from .. import models
 from ..config import _DATA, get_settings, is_gmail_configured
@@ -17,6 +19,8 @@ from ..security import Cipher, redact_for_log
 from ..services import sync as sync_svc
 from .. import oauth_config as oauth_config_svc
 from ..services.accounts import resolve_sending_account
+from ..services.real_send import is_real_send_enabled
+from .. import tasks
 from .deps import get_db, ensure_owner
 
 logger = logging.getLogger("api.gmail")
@@ -43,10 +47,17 @@ def gmail_status(db: Session = Depends(get_db)):
             "is_demo": not is_gmail_configured(),
             "configured": oauth_configured,
             "oauth_state": oauth_state,
+            "real_send": False,
+            "initial_import_completed": False,
+            "sync_state": "gmail_not_connected",
         }
     cipher = Cipher()
     access = cipher.decrypt(account.oauth.access_token_enc)
     connected = bool(access) and is_gmail_configured()
+    latest_sync = db.query(models.GmailSyncRun).filter_by(
+        gmail_account_id=account.id
+    ).order_by(models.GmailSyncRun.id.desc()).first()
+    initial_completed = sync_svc.initial_import_completed(db, account.id)
     return {
         "connected": connected,
         "email": account.email,
@@ -55,6 +66,10 @@ def gmail_status(db: Session = Depends(get_db)):
         "is_demo": not is_gmail_configured(),
         "configured": oauth_configured,
         "oauth_state": "oauth_connected" if connected else oauth_state,
+        "real_send": is_real_send_enabled(get_settings(), account, account.oauth) if connected else False,
+        "initial_import_completed": initial_completed,
+        "sync_state": (latest_sync.status if latest_sync else
+                       ("incremental_ready" if initial_completed else "initial_import_required")),
     }
 
 
@@ -162,6 +177,14 @@ def oauth_callback(code: str = Query(...), state: str = Query(...), db: Session 
     oauth.refresh_token_enc = cipher.encrypt(result.refresh_token) if result.refresh_token else oauth.refresh_token_enc
     from datetime import datetime, timezone
     oauth.token_expiry = datetime.fromtimestamp(result.token_expiry, tz=timezone.utc) if result.token_expiry else None
+    # A successful customer-owned OAuth connection is the explicit operational
+    # boundary for real delivery. Approval/pause/limit/suppression gates remain
+    # unchanged and still run before every send.
+    db.add(models.AuditLog(
+        actor="user", action="real_send_enabled_gmail_connected",
+        entity="gmail_account", entity_id=str(account.id),
+        detail="enabled_by_verified_gmail_oauth_connection",
+    ))
     db.commit()
     logger.info("Gmail connected: %s (access %s)", email, redact_for_log(result.access_token))
     return HTMLResponse(
@@ -171,33 +194,177 @@ def oauth_callback(code: str = Query(...), state: str = Query(...), db: Session 
     )
 
 
-@router.post("/sync")
-def sync(db: Session = Depends(get_db), query: str = "", max_results: int = 50, full_scan: bool = False):
-    if full_scan:
-        query = query or "in:anywhere"
-        max_results = max(max_results, 500)
+def _sync_run_out(run: models.GmailSyncRun | None, db: Session, account_id: int | None = None):
+    completed = False
+    if account_id is not None:
+        completed = sync_svc.initial_import_completed(db, account_id)
+    if run is None:
+        return {"run": None, "initial_import_completed": completed}
+    return {
+        "run": {
+            "id": run.id, "kind": run.kind, "status": run.status,
+            "threads_scanned": run.threads_scanned,
+            "new_threads": run.new_threads, "new_messages": run.new_messages,
+            "failures": run.failures, "error": run.error,
+            "can_pause": run.status in {"queued", "running"},
+            "can_resume": run.status in {"paused", "failed"},
+            "can_cancel": run.status in {"queued", "running", "paused"},
+            "started_at": run.started_at, "finished_at": run.finished_at,
+        },
+        "initial_import_completed": completed,
+    }
+
+
+def _connected_account(db: Session):
     account, _oauth = resolve_sending_account(
         db, owner_id=ensure_owner(db), provision=False
     )
     if not account or not account.oauth:
-        # Offline mode: no connected Gmail account is available to sync.
-        return {"ok": True, "offline": True, "threads": 0, "new_threads": 0, "new_messages": 0,
-                "note": "No real Gmail connected. Connect OAuth to sync real mail."}
+        raise ApiError(409, "GMAIL_NOT_CONNECTED", "Connect Gmail before synchronizing mail.")
+    return account
+
+
+def _create_initial_import(db: Session, account):
+    inflight = db.query(models.GmailSyncRun).filter(
+        models.GmailSyncRun.gmail_account_id == account.id,
+        models.GmailSyncRun.status.in_(("queued", "running", "paused")),
+    ).order_by(models.GmailSyncRun.id.desc()).first()
+    if inflight:
+        return inflight, False
+    run = models.GmailSyncRun(
+        owner_id=account.user_id, gmail_account_id=account.id,
+        kind="initial_full", status="queued",
+        query=sync_svc.INITIAL_IMPORT_QUERY, include_spam_trash=False,
+    )
+    db.add(run)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        run = db.query(models.GmailSyncRun).filter(
+            models.GmailSyncRun.gmail_account_id == account.id,
+            models.GmailSyncRun.status.in_(("queued", "running", "paused")),
+        ).order_by(models.GmailSyncRun.id.desc()).first()
+        return run, False
+    tasks.enqueue_gmail_initial_import(run.id)
+    return run, True
+
+
+@router.post("/imports")
+def start_initial_import(db: Session = Depends(get_db)):
+    account = _connected_account(db)
+    run, created = _create_initial_import(db, account)
+    return {"ok": True, "created": created, **_sync_run_out(run, db, account.id)}
+
+
+@router.get("/imports/current")
+def current_import(db: Session = Depends(get_db)):
+    account, _oauth = resolve_sending_account(
+        db, owner_id=ensure_owner(db), provision=False
+    )
+    if not account:
+        return {"run": None, "initial_import_completed": False}
+    run = db.query(models.GmailSyncRun).filter_by(
+        gmail_account_id=account.id, kind="initial_full"
+    ).order_by(models.GmailSyncRun.id.desc()).first()
+    return _sync_run_out(run, db, account.id)
+
+
+@router.post("/imports/{run_id}/pause")
+def pause_import(run_id: int, db: Session = Depends(get_db)):
+    account = _connected_account(db)
+    run = db.get(models.GmailSyncRun, run_id)
+    if not run or run.gmail_account_id != account.id or run.kind != "initial_full":
+        raise HTTPException(status_code=404, detail="gmail_import_not_found")
+    if run.status not in {"queued", "running"}:
+        raise HTTPException(status_code=409, detail=f"gmail_import_is_{run.status}")
+    run.status = "paused"
+    db.commit()
+    return {"ok": True, **_sync_run_out(run, db, account.id)}
+
+
+@router.post("/imports/{run_id}/resume")
+def resume_import(run_id: int, db: Session = Depends(get_db)):
+    account = _connected_account(db)
+    run = db.get(models.GmailSyncRun, run_id)
+    if not run or run.gmail_account_id != account.id or run.kind != "initial_full":
+        raise HTTPException(status_code=404, detail="gmail_import_not_found")
+    if run.status not in {"paused", "failed"}:
+        raise HTTPException(status_code=409, detail=f"gmail_import_is_{run.status}")
+    run.status = "queued"
+    run.error = None
+    run.finished_at = None
+    db.commit()
+    tasks.enqueue_gmail_initial_import(run.id)
+    return {"ok": True, **_sync_run_out(run, db, account.id)}
+
+
+@router.post("/imports/{run_id}/cancel")
+def cancel_import(run_id: int, db: Session = Depends(get_db)):
+    account = _connected_account(db)
+    run = db.get(models.GmailSyncRun, run_id)
+    if not run or run.gmail_account_id != account.id or run.kind != "initial_full":
+        raise HTTPException(status_code=404, detail="gmail_import_not_found")
+    if run.status not in {"queued", "running", "paused"}:
+        raise HTTPException(status_code=409, detail=f"gmail_import_is_{run.status}")
+    run.status = "cancelled"
+    run.finished_at = datetime.now(timezone.utc)
+    db.commit()
+    return {"ok": True, **_sync_run_out(run, db, account.id)}
+
+
+@router.post("/sync")
+def sync(db: Session = Depends(get_db), full_scan: bool = False):
+    account = _connected_account(db)
+    if full_scan:
+        run, created = _create_initial_import(db, account)
+        return {"ok": True, "created": created, "legacy_full_scan": True,
+                **_sync_run_out(run, db, account.id)}
+    if not sync_svc.initial_import_completed(db, account.id):
+        raise ApiError(409, "INITIAL_IMPORT_REQUIRED",
+                       "Complete the first full mailbox import before incremental sync.")
+    inflight = db.query(models.GmailSyncRun).filter(
+        models.GmailSyncRun.gmail_account_id == account.id,
+        models.GmailSyncRun.status.in_(("queued", "running", "paused")),
+    ).first()
+    if inflight:
+        raise ApiError(409, "GMAIL_SYNC_IN_PROGRESS", "Another Gmail synchronization is active.")
     cipher = Cipher()
     access = cipher.decrypt(account.oauth.access_token_enc)
     if not access:
         raise HTTPException(status_code=400, detail="Gmail tokens missing/undecryptable.")
-    try:
-        summary = sync_svc.sync_inbox(
-            db, account, account.oauth, query=query, max_results=max_results,
-            include_spam_trash=full_scan,
-        )
-    except Exception as e:
-        logger.warning("Gmail sync failed: %s", e)
-        raise ApiError(502, "GMAIL_SYNC_FAILED", f"Gmail sync failed: {str(e)[:300]}")
+    run = models.GmailSyncRun(
+        owner_id=account.user_id, gmail_account_id=account.id,
+        kind="incremental", status="running", started_at=datetime.now(timezone.utc),
+    )
+    db.add(run)
     db.commit()
-    publish("sync", {"full_scan": full_scan, **summary})
-    return {"ok": True, "full_scan": full_scan, **summary}
+    try:
+        summary = sync_svc.sync_incremental(db, account, account.oauth)
+    except Exception as e:
+        db.rollback()
+        run = db.get(models.GmailSyncRun, run.id)
+        message = str(e)
+        cursor_expired = "404" in message or "historyid" in message.lower() and "invalid" in message.lower()
+        run.status = "cursor_expired" if cursor_expired else "failed"
+        run.error = "gmail_history_cursor_expired" if cursor_expired else message[:1000]
+        run.finished_at = datetime.now(timezone.utc)
+        db.commit()
+        logger.warning("Gmail sync failed: %s", e)
+        code = "GMAIL_HISTORY_CURSOR_EXPIRED" if cursor_expired else "GMAIL_SYNC_FAILED"
+        raise ApiError(409 if cursor_expired else 502, code,
+                       "Gmail incremental cursor expired; a user-authorized history import is required."
+                       if cursor_expired else f"Gmail sync failed: {message[:300]}")
+    run.status = "completed"
+    run.threads_scanned = summary["threads"]
+    run.new_threads = summary["new_threads"]
+    run.new_messages = summary["new_messages"]
+    run.failures = summary["failures"]
+    run.latest_history_id = summary["history_id"]
+    run.finished_at = datetime.now(timezone.utc)
+    db.commit()
+    publish("sync", {"kind": "incremental", **summary})
+    return {"ok": True, "kind": "incremental", "run_id": run.id, **summary}
 
 
 @router.post("/disconnect")
@@ -213,5 +380,10 @@ def disconnect(db: Session = Depends(get_db)):
             db.delete(account.oauth)
         account.is_connected = False
         account.granted_scopes = None
+        db.add(models.AuditLog(
+            actor="user", action="real_send_disabled_gmail_disconnected",
+            entity="gmail_account", entity_id=str(account.id),
+            detail="disabled_until_a_verified_gmail_oauth_connection_exists",
+        ))
         db.commit()
     return {"ok": True, "connected": False}

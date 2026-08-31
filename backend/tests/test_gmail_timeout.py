@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import threading
 import time
+import ssl
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
@@ -24,7 +25,7 @@ from google.oauth2.credentials import Credentials
 from app import models
 from app.gmail.auth import maybe_refresh
 from app.gmail.client import RealGmailTransport
-from app.gmail.transport import GmailTimeoutError, GmailTransport, InMemoryGmailTransport
+from app.gmail.transport import GmailTimeoutError, GmailTransientNetworkError, GmailTransport, InMemoryGmailTransport
 from app.tasks import execute_automation_run
 
 
@@ -46,7 +47,8 @@ class _StubCipher:
 
 
 def _make_connected_account(db):
-    acct = models.GmailAccount(id=1, user_id=1, email="tac.aisolution@gmail.com", is_connected=True)
+    acct = models.GmailAccount(id=1, user_id=1, email="tac.aisolution@gmail.com", is_connected=True,
+                               history_id="1")
     db.add(acct)
     db.flush()
     oauth = models.OAuthCredential(
@@ -56,6 +58,10 @@ def _make_connected_account(db):
         token_expiry=datetime(2999, 1, 1, tzinfo=timezone.utc),
     )
     db.add(oauth)
+    db.add(models.GmailSyncRun(
+        owner_id=1, gmail_account_id=acct.id, kind="initial_full",
+        status="completed", start_history_id="1", latest_history_id="1",
+    ))
     db.flush()
     return acct, oauth
 
@@ -115,7 +121,38 @@ class _TimeoutTransport(GmailTransport):
         raise NotImplementedError
 
     def list_history(self, *a, **k):
-        raise NotImplementedError
+        time.sleep(0.3)
+        raise GmailTimeoutError("gmail_timeout: simulated socket timeout")
+
+
+def test_transient_tls_eof_is_retried_within_bound(monkeypatch):
+    """A proxy/TLS EOF is replayed without leaking credentials into logs."""
+    transport = RealGmailTransport.__new__(RealGmailTransport)
+    transport._service = object()
+    transport._ensure_service = lambda: None
+    monkeypatch.setattr("app.gmail.client.time.sleep", lambda _: None)
+    attempts = {"count": 0}
+
+    def call(_service):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise ssl.SSLEOFError(8, "EOF occurred in violation of protocol")
+        return {"ok": True}
+
+    assert transport._call(call) == {"ok": True}
+    assert attempts["count"] == 3
+
+
+def test_exhausted_tls_eof_is_recognizable_and_durable(monkeypatch):
+    transport = RealGmailTransport.__new__(RealGmailTransport)
+    transport._service = object()
+    transport._ensure_service = lambda: None
+    monkeypatch.setattr("app.gmail.client.time.sleep", lambda _: None)
+
+    with pytest.raises(GmailTransientNetworkError, match="gmail_transport_retry_exhausted"):
+        transport._call(lambda _service: (_ for _ in ()).throw(
+            ssl.SSLEOFError(8, "EOF occurred in violation of protocol")
+        ))
 
 
 # ---------------------------------------------------------------------------

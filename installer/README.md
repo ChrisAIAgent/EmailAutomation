@@ -26,7 +26,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1
 显式指定版本（同步写入 .iss、安装包文件名、Payload `version.txt`）：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1 -Version "1.2.0"
+powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1 -Version "1.2.1"
 ```
 
 也可直接指定编译器：
@@ -36,7 +36,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1 `
   -InnoCompiler "C:\Users\Administrats\AppData\Local\Programs\Inno Setup 6\ISCC.exe"
 ```
 
-输出：`dist\Email-Automation-Setup-1.2.0.exe`，以及 JSON/Markdown 构建报告。
+输出：`dist\Email-Automation-Setup-1.2.1.exe`，以及 JSON/Markdown 构建报告。
 
 构建流程（`build-installer.ps1`）：定位 ISCC / magick → 复用 `portable-package.ps1`
 的排除 / 完整性 / 安全规则暂存 Payload → 二次完整性校验 → 由正式 Logo 生成

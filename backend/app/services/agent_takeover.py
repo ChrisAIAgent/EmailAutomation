@@ -81,15 +81,15 @@ Workspace display timezone: {timezone_name}. Use this time zone for every human-
 
 Execute exactly one Global Inbox operating cycle and do not create Campaign outreach:
 1. Call ea_takeover_status and re-read current health, Gmail, pause, approval mode, queues and automation state.
-2. If the system is paused, Gmail/consumer/AI is unavailable, or another Global Inbox Run is active, do not write or retry; report the exact blocker and finish.
+2. If the system is paused, Gmail/consumer/AI is unavailable, the first Gmail history import is incomplete, or another Global Inbox Run is active, do not write or retry; report the exact blocker and finish. Scheduled takeover never starts the first full import.
 Cycle ID: {cycle_id}
-3. Call ea_sync_gmail and ea_sort_inbox with user_authorized=true, authorization_source=agent_takeover and takeover_token={token}.
-4. Find the enabled Global Inbox Automation and start one full_auto Run with ea_start_agent_run, user_authorized=true, authorization_source=agent_takeover and takeover_token={token}. The token cannot authorize a Campaign Run.
+3. Call ea_sync_gmail, then ea_daily_triage_status. If untriaged conversations exist and no triage Run is active, call ea_start_daily_triage with user_authorized=true, authorization_source=agent_takeover and takeover_token={token}. Its fixed snapshot may exceed 50 conversations; 50 is only the safe worker batch size. If a daily Run is active, read and report its real progress rather than creating a duplicate. Newly synced mail during a Run waits for the next cycle.
+4. Start only the enabled Automation work that the current triaged, admitted Contacts actually require. Use ea_start_agent_run with user_authorized=true, authorization_source=agent_takeover and takeover_token={token}; do not create duplicate or irrelevant Campaign work.
 5. Follow that same Run with ea_get_agent_run, authorization_source=agent_takeover and takeover_token={token}, until it reaches a terminal status. Never start a duplicate Run and never treat queued/running, a Draft, Approval, or HTTP 200 as sent.
 6. Leave contact_admission_uncertain, content_uncertain, opt_out_confirmation and every other human-review item for a person; report and skip them without blocking eligible admitted Contacts.
-7. Finish with a concise Chinese operating report containing the supplied local execution time and next Agent Takeover time (including {timezone_name}), Gmail account, sync/sort counts, filtered and human-review counts, Run ID/status, drafts/approvals, actual Gmail-accepted sends/message IDs, stops, skips and failures. Only Gmail acceptance may be reported as sent.
+7. Finish with a concise Chinese operating report containing the supplied local execution time and next Agent Takeover time (including {timezone_name}), Gmail account, sync/triage counts and progress, filtered and human-review counts, Run ID/status, drafts/approvals, actual Gmail-accepted sends/message IDs, stops, skips and failures. Only Gmail acceptance may be reported as sent.
 
-The Agent Takeover switch is authorization only for this routine Inbox cycle. It does not authorize Contact admission, Campaign/Profile/Knowledge changes, deletions, or bypassing pause, suppression, send windows, daily limits, idempotency, thread integrity, OAuth, delivery reconciliation, or any human-review gate."""
+The Agent Takeover switch authorizes routine Inbox operation and eligible admitted-contact follow-up within this cycle. It never authorizes Contact admission, deletion, or bypassing pause, suppression, send windows, daily limits, idempotency, thread integrity, OAuth, delivery reconciliation, or any human-review gate."""
 
 
 def token_is_valid(db, token: str) -> bool:

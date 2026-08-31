@@ -32,6 +32,9 @@ from .db import SessionLocal
 from .gmail.transport import GmailTimeoutError
 from .services import automation as automation_svc
 from .services import agent_takeover as takeover_svc
+from .services import sync as sync_svc
+from .tools.email_tools import UnifiedEmailToolLayer
+from .events import publish
 
 logger = logging.getLogger("automation.worker")
 
@@ -78,6 +81,9 @@ def validate_task_registry() -> None:
     required = (
         "app.tasks.execute_automation_run",
         "app.tasks.execute_prepared_agent_run",
+        "app.tasks.execute_gmail_initial_import",
+        "app.tasks.execute_initial_inbox_triage",
+        "app.tasks.execute_daily_inbox_triage",
         "app.tasks.periodic_heartbeat",
         "app.tasks.periodic_reclaim",
         "app.tasks.periodic_scan",
@@ -195,6 +201,265 @@ def execute_prepared_agent_run(run_id: int) -> dict:
             return {"ok": False, "error": str(e)[:2000]}
     finally:
         db.close()
+
+
+@huey.task()
+def execute_gmail_initial_import(run_id: int) -> dict:
+    """Import every normal Gmail thread in resumable 100-thread batches."""
+    db = SessionLocal()
+    try:
+        claimed = db.execute(
+            sa_update(models.GmailSyncRun)
+            .where(models.GmailSyncRun.id == run_id,
+                   models.GmailSyncRun.status == "queued")
+            .values(status="running", started_at=func.coalesce(
+                models.GmailSyncRun.started_at, func.now()
+            ))
+        )
+        db.commit()
+        if claimed.rowcount == 0:
+            return {"ok": False, "skipped": True, "reason": "not_queued"}
+
+        run = db.get(models.GmailSyncRun, run_id)
+        account = db.get(models.GmailAccount, run.gmail_account_id) if run else None
+        if run is None or account is None or not account.oauth or not account.is_connected:
+            if run is not None:
+                run.status = "failed"
+                run.error = "gmail_not_connected"
+                run.finished_at = func.now()
+                db.commit()
+            return {"ok": False, "error": "gmail_not_connected"}
+
+        tl = UnifiedEmailToolLayer(db, account, account.oauth)
+        if not run.start_history_id:
+            profile = tl._transport().get_profile()
+            run.start_history_id = str(profile.get("historyId") or account.history_id or "")
+            if not run.start_history_id:
+                raise RuntimeError("gmail_history_id_missing")
+            db.commit()
+
+        while True:
+            db.refresh(run)
+            if run.status in {"paused", "cancelled"}:
+                return {"ok": True, "status": run.status, "run_id": run.id}
+            threads, next_page = tl.search_threads(
+                run.query or sync_svc.INITIAL_IMPORT_QUERY,
+                max_results=sync_svc.INITIAL_IMPORT_BATCH_SIZE,
+                page_token=run.page_token,
+                include_spam_trash=False,
+                agent="system", is_primary=True,
+            )
+            stored = sync_svc.store_thread_batch(db, account, threads)
+            run.threads_scanned += len(threads)
+            run.new_threads += stored["new_threads"]
+            run.new_messages += stored["new_messages"]
+            run.failures += stored["failures"]
+            run.page_token = next_page
+            db.commit()
+            if not next_page:
+                break
+
+        replay = sync_svc.sync_history(db, account, account.oauth, run.start_history_id)
+        run.latest_history_id = replay["history_id"]
+        run.threads_scanned += replay["threads"]
+        run.new_threads += replay["new_threads"]
+        run.new_messages += replay["new_messages"]
+        run.failures += replay["failures"]
+        run.status = "completed"
+        run.finished_at = func.now()
+        run.error = None
+        db.add(models.AuditLog(
+            actor="system", action="gmail_initial_import_completed",
+            entity="gmail_sync_run", entity_id=str(run.id),
+            detail=(f"threads={run.threads_scanned};messages={run.new_messages};"
+                    f"failures={run.failures};scope=all_mail_excluding_spam_trash"),
+        ))
+        db.commit()
+        return {"ok": True, "run_id": run.id, "status": run.status,
+                "threads": run.threads_scanned, "new_messages": run.new_messages,
+                "failures": run.failures}
+    except Exception as exc:
+        db.rollback()
+        run = db.get(models.GmailSyncRun, run_id)
+        if run is not None and run.status not in {"paused", "cancelled"}:
+            run.status = "failed"
+            run.error = str(exc)[:1000]
+            run.finished_at = func.now()
+            db.commit()
+        logger.exception("Gmail initial import %s failed: %s", run_id, exc)
+        return {"ok": False, "run_id": run_id, "error": str(exc)[:1000]}
+    finally:
+        db.close()
+
+
+def enqueue_gmail_initial_import(run_id: int) -> None:
+    execute_gmail_initial_import(run_id)
+
+
+def _triage_outcome(summary: dict) -> str:
+    intent = str(summary.get("intent") or "")
+    action = str(summary.get("pending_action") or "")
+    if intent.startswith("filtered_"):
+        return "auto_filtered"
+    if action == "human_review":
+        return "human_review"
+    if action == "no_action":
+        return "no_action"
+    return "business"
+
+
+def _execute_inbox_triage(run_id: int) -> dict:
+    """Classify one frozen Inbox snapshot in safe 50-thread batches."""
+    db = SessionLocal()
+    try:
+        claimed = db.execute(
+            sa_update(models.InboxTriageRun)
+            .where(
+                models.InboxTriageRun.id == run_id,
+                models.InboxTriageRun.status == "queued",
+            )
+            .values(status="running", started_at=func.coalesce(
+                models.InboxTriageRun.started_at, func.now()
+            ), last_progress_at=func.now(), error=None)
+        )
+        db.commit()
+        if claimed.rowcount == 0:
+            return {"ok": False, "skipped": True, "reason": "not_queued"}
+
+        # Import here to avoid an API-router/task-registry import cycle at worker
+        # startup. The helper is the existing single-thread business pipeline.
+        from .api.inbox import _analyze_thread
+
+        while True:
+            run = db.get(models.InboxTriageRun, run_id)
+            if run is None:
+                return {"ok": False, "error": "triage_run_not_found"}
+            if run.status in {"paused", "cancelled"}:
+                return {"ok": True, "run_id": run.id, "status": run.status}
+
+            batch = (
+                db.query(models.InboxTriageRunItem)
+                .filter_by(triage_run_id=run.id, status="queued")
+                .order_by(models.InboxTriageRunItem.id.asc())
+                .limit(run.batch_size)
+                .all()
+            )
+            if not batch:
+                run.status = "completed"
+                run.finished_at = func.now()
+                run.last_progress_at = func.now()
+                run.error = None
+                action_prefix = "initial_inbox_triage" if run.kind == "initial_history" else "daily_inbox_triage"
+                db.add(models.AuditLog(
+                    actor="system", action=f"{action_prefix}_completed",
+                    entity="inbox_triage_run", entity_id=str(run.id),
+                    detail=(f"total={run.total_threads};processed={run.processed_threads};"
+                            f"filtered={run.auto_filtered};review={run.human_review};"
+                            f"business={run.business_threads};no_action={run.no_action};"
+                            f"skipped={run.skipped_threads};failed={run.failed_threads}"),
+                ))
+                db.commit()
+                publish("inbox", {"action": "inbox_triage_completed", "kind": run.kind, "run_id": run.id})
+                return {"ok": True, "run_id": run.id, "status": "completed"}
+
+            run.current_batch += 1
+            run.last_progress_at = datetime.now(timezone.utc)
+            db.commit()
+            for item in batch:
+                db.refresh(run)
+                if run.status in {"paused", "cancelled"}:
+                    return {"ok": True, "run_id": run.id, "status": run.status}
+                item = db.get(models.InboxTriageRunItem, item.id)
+                if item is None or item.status != "queued":
+                    continue
+                item.status = "running"
+                db.commit()
+                try:
+                    thread = db.get(models.EmailThread, item.email_thread_id)
+                    if thread is None or thread.intent is not None:
+                        item.status = "skipped"
+                        item.outcome = "already_processed"
+                        item.error = None
+                        run = db.get(models.InboxTriageRun, run_id)
+                        run.skipped_threads += 1
+                    else:
+                        summary = _analyze_thread(db, thread)
+                        item.status = "completed"
+                        item.outcome = _triage_outcome(summary)
+                        item.error = None
+                        run = db.get(models.InboxTriageRun, run_id)
+                        run.processed_threads += 1
+                        if item.outcome == "auto_filtered":
+                            run.auto_filtered += 1
+                        elif item.outcome == "human_review":
+                            run.human_review += 1
+                        elif item.outcome == "no_action":
+                            run.no_action += 1
+                        else:
+                            run.business_threads += 1
+                    run.last_progress_at = datetime.now(timezone.utc)
+                    db.commit()
+                except Exception as exc:  # one malformed thread cannot block the snapshot
+                    db.rollback()
+                    item = db.get(models.InboxTriageRunItem, item.id)
+                    run = db.get(models.InboxTriageRun, run_id)
+                    if item is not None:
+                        item.status = "failed"
+                        item.outcome = None
+                        item.error = str(exc)[:1000]
+                    if run is not None:
+                        run.failed_threads += 1
+                        run.last_progress_at = datetime.now(timezone.utc)
+                    db.commit()
+                    logger.warning("Inbox triage item %s failed", item.id if item else None, exc_info=True)
+            publish("inbox", {"action": "inbox_triage_progress", "kind": run.kind, "run_id": run_id})
+    except Exception as exc:
+        db.rollback()
+        run = db.get(models.InboxTriageRun, run_id)
+        if run is not None and run.status not in {"paused", "cancelled", "completed"}:
+            run.status = "failed"
+            run.error = str(exc)[:1000]
+            run.last_progress_at = datetime.now(timezone.utc)
+            db.commit()
+        logger.exception("Inbox triage %s failed", run_id)
+        return {"ok": False, "run_id": run_id, "error": str(exc)[:1000]}
+    finally:
+        db.close()
+
+
+@huey.task()
+def execute_initial_inbox_triage(run_id: int) -> dict:
+    """Compatibility task name for first-history snapshot triage."""
+    return _execute_inbox_triage(run_id)
+
+
+@huey.task()
+def execute_daily_inbox_triage(run_id: int) -> dict:
+    """Process a frozen post-sync incremental triage snapshot."""
+    return _execute_inbox_triage(run_id)
+
+
+def enqueue_inbox_triage(run_id: int) -> None:
+    db = SessionLocal()
+    try:
+        run = db.get(models.InboxTriageRun, run_id)
+        if run is None:
+            return
+        if run.kind == "daily_incremental":
+            execute_daily_inbox_triage(run_id)
+        else:
+            execute_initial_inbox_triage(run_id)
+    finally:
+        db.close()
+
+
+def enqueue_initial_inbox_triage(run_id: int) -> None:
+    """Compatibility wrapper retained for first-history callers and tests."""
+    execute_initial_inbox_triage(run_id)
+
+
+def enqueue_daily_inbox_triage(run_id: int) -> None:
+    execute_daily_inbox_triage(run_id)
 
 
 def enqueue_run(db, automation, trigger: str, source: str, fail_if_inflight: bool = False,
@@ -359,6 +624,59 @@ def reclaim_stale_runs(timeout_minutes: int | None = None) -> int:
     return 0
 
 
+def reclaim_stale_gmail_imports(timeout_minutes: int | None = None) -> int:
+    """Make interrupted full-import jobs resumable after a worker crash."""
+    from .config import get_settings
+    if timeout_minutes is None:
+        timeout_minutes = get_settings().STALE_RUN_TIMEOUT_MINUTES
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=timeout_minutes)
+    db = SessionLocal()
+    try:
+        stale = db.query(models.GmailSyncRun).filter(
+            models.GmailSyncRun.kind == "initial_full",
+            models.GmailSyncRun.status == "running",
+            models.GmailSyncRun.updated_at < cutoff,
+        ).all()
+        for run in stale:
+            run.status = "failed"
+            run.error = "worker_timeout_resumable"
+            run.finished_at = func.now()
+        db.commit()
+        return len(stale)
+    finally:
+        db.close()
+
+
+def reclaim_stale_inbox_triage(timeout_minutes: int | None = None) -> int:
+    """Release any Inbox triage snapshot after a consumer crash without losing work."""
+    from .config import get_settings
+    if timeout_minutes is None:
+        timeout_minutes = get_settings().STALE_RUN_TIMEOUT_MINUTES
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=timeout_minutes)
+    db = SessionLocal()
+    try:
+        stale = db.query(models.InboxTriageRun).filter(
+            models.InboxTriageRun.status == "running",
+            models.InboxTriageRun.last_progress_at < cutoff,
+        ).all()
+        for run in stale:
+            db.query(models.InboxTriageRunItem).filter_by(
+                triage_run_id=run.id, status="running"
+            ).update({"status": "queued"}, synchronize_session=False)
+            run.status = "recovery_pending"
+            run.error = "worker_timeout_resumable"
+            run.last_progress_at = datetime.now(timezone.utc)
+        db.commit()
+        return len(stale)
+    finally:
+        db.close()
+
+
+def reclaim_stale_initial_triage(timeout_minutes: int | None = None) -> int:
+    """Backward-compatible name for callers that predate daily triage."""
+    return reclaim_stale_inbox_triage(timeout_minutes)
+
+
 @huey.periodic_task(crontab(minute="*"))
 def periodic_heartbeat():
     """Prove that the Huey scheduler and a worker can execute tasks."""
@@ -370,8 +688,14 @@ def periodic_reclaim():
     """Periodically reclaim stale running runs so Automations never wedge."""
     try:
         n = reclaim_stale_runs()
+        imported = reclaim_stale_gmail_imports()
+        triaged = reclaim_stale_inbox_triage()
         if n:
             logger.info("reclaimed %s stale running run(s)", n)
+        if imported:
+            logger.info("reclaimed %s stale Gmail import(s)", imported)
+        if triaged:
+            logger.info("reclaimed %s stale Inbox triage run(s)", triaged)
     except Exception as e:  # pragma: no cover - logging only
         logger.exception("periodic reclaim failed: %s", e)
 

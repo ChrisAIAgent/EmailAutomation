@@ -45,6 +45,45 @@ async function req<T>(path: string, init?: RequestInit, timeoutMs: number = DEFA
   }
 }
 
+export function parseApiError(e: any): { status: number | null; code: string | null; raw: string } {
+  const raw = String(e?.message ?? e ?? "");
+  const match = raw.match(/^(\d{3}):\s*([\s\S]*)$/);
+  const status = match ? Number(match[1]) : null;
+  const body = match ? match[2] : raw;
+  let code: string | null = null;
+  try {
+    const parsed = JSON.parse(body);
+    code = parsed?.detail ?? parsed?.error?.code ?? null;
+  } catch {
+    // Unknown non-JSON errors retain their original text below.
+  }
+  return { status, code: code ? String(code) : null, raw };
+}
+
+export function friendlyError(e: any, zh: boolean): string {
+  const { status, code, raw } = parseApiError(e);
+  if (raw.startsWith("Request timeout")) return raw;
+  const key = (code ?? "").toLowerCase();
+  if (key === "initial_import_required") {
+    return zh ? "需先完成首次历史导入，再执行首次历史分拣。" : "Complete the first mail history import before running first history triage.";
+  }
+  if (key === "initial_triage_no_failed_items") {
+    return zh ? "当前没有失败项可重试。" : "There are no failed items to retry.";
+  }
+  if (key.startsWith("initial_triage_is_")) {
+    const state = key.replace("initial_triage_is_", "");
+    return zh ? `任务当前状态为 ${state}，无法执行该操作。` : `The run is ${state}; this action is not allowed.`;
+  }
+  if (key === "initial_triage_not_found" || key === "initial_triage_action_not_found") {
+    return zh ? "未找到对应的首次分拣任务或操作。" : "First-triage run or action not found.";
+  }
+  if (key === "gmail_sync_failed") {
+    return zh ? "Gmail 同步暂时遇到网络连接中断，请稍后重试；已同步的邮件不会丢失。" : "Gmail sync was interrupted by a network connection issue. Retry shortly; already-synced mail is preserved.";
+  }
+  if (status && code) return `${status}: ${code}`;
+  return raw;
+}
+
 // Every method declares a concrete return type so callers never receive `unknown`.
 export const api = {
   health: () => req<any>("/api/health"),
@@ -54,7 +93,12 @@ export const api = {
   gmailOauthConfig: () => req<any>("/api/gmail/oauth-config"),
   gmailOauthSave: (credentials: Record<string, unknown>) =>
     req<any>("/api/gmail/oauth-config", { method: "PUT", body: JSON.stringify({ credentials }) }),
-  gmailSync: (fullScan = false) => req<any>(`/api/gmail/sync${fullScan ? "?full_scan=true" : ""}`, { method: "POST" }, LONG_ACTION_TIMEOUT_MS),
+  gmailSync: () => req<any>("/api/gmail/sync", { method: "POST" }, LONG_ACTION_TIMEOUT_MS),
+  gmailImportStatus: () => req<any>("/api/gmail/imports/current"),
+  gmailImportStart: () => req<any>("/api/gmail/imports", { method: "POST" }),
+  gmailImportPause: (id: number) => req<any>(`/api/gmail/imports/${id}/pause`, { method: "POST" }),
+  gmailImportResume: (id: number) => req<any>(`/api/gmail/imports/${id}/resume`, { method: "POST" }),
+  gmailImportCancel: (id: number) => req<any>(`/api/gmail/imports/${id}/cancel`, { method: "POST" }),
 
   contacts: (query = "") => req<any[]>(`/api/contacts${query ? `?${query}` : ""}`),
   createContact: (body: any) => req<any>("/api/contacts", { method: "POST", body: JSON.stringify(body) }),
@@ -88,6 +132,19 @@ export const api = {
   inboxThreads: () => req<any[]>("/api/inbox/threads"),
   inboxCustomers: () => req<any[]>("/api/inbox/customers"),
   inboxStats: () => req<any>("/api/inbox/stats"),
+  initialTriageStatus: () => req<any>("/api/inbox/initial-triage/current"),
+  startInitialTriage: () => req<any>("/api/inbox/initial-triage", { method: "POST" }),
+  controlInitialTriage: (id: number, action: "pause" | "resume" | "cancel") =>
+    req<any>(`/api/inbox/initial-triage/${id}/${action}`, { method: "POST" }),
+  retryInitialTriageFailed: (id: number) =>
+    req<any>(`/api/inbox/initial-triage/${id}/retry-failed`, { method: "POST" }),
+  dailyTriageStatus: () => req<any>("/api/inbox/daily-triage/current"),
+  recentTriageResult: () => req<any>("/api/inbox/triage/recent"),
+  startDailyTriage: () => req<any>("/api/inbox/daily-triage", { method: "POST" }),
+  controlDailyTriage: (id: number, action: "pause" | "resume" | "cancel") =>
+    req<any>(`/api/inbox/daily-triage/${id}/${action}`, { method: "POST" }),
+  retryDailyTriageFailed: (id: number) =>
+    req<any>(`/api/inbox/daily-triage/${id}/retry-failed`, { method: "POST" }),
   sortInbox: () => req<any>("/api/inbox/sort", { method: "POST" }, LONG_ACTION_TIMEOUT_MS),
   threadDetail: (id: number) => req<any>(`/api/inbox/threads/${id}`),
   analyzeThread: (id: number) => req<any>(`/api/inbox/threads/${id}/analyze`, { method: "POST" }, LONG_ACTION_TIMEOUT_MS),
@@ -96,6 +153,10 @@ export const api = {
     req<any>(`/api/inbox/threads/${id}/contact`, { method: "POST", body: JSON.stringify(body) }),
   resolveHumanReview: (id: number, decision: "approve" | "reject" | "agent_decide") =>
     req<any>(`/api/inbox/threads/${id}/human-review`, { method: "POST", body: JSON.stringify({ decision }) }),
+  enableSenderContentReviewIgnore: (email: string) =>
+    req<any>(`/api/inbox/senders/${encodeURIComponent(email)}/content-review/ignore`, { method: "POST" }),
+  removeSenderContentReviewIgnore: (email: string) =>
+    req<any>(`/api/inbox/senders/${encodeURIComponent(email)}/content-review/ignore`, { method: "DELETE" }),
   clearStaleInboxReview: (id: number) =>
     req<any>(`/api/inbox/threads/${id}/clear-stale-review`, { method: "POST" }),
   nonCustomerFilters: () => req<any[]>("/api/inbox/non-customer-filters"),

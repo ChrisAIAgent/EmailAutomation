@@ -145,6 +145,11 @@ def update_contact(contact_id: int, payload: ContactUpdate, db: Session = Depend
         contact.custom_fields = (
             json.dumps(custom_fields, ensure_ascii=False) if custom_fields is not None else None
         )
+    # Terminal CRM decisions must clear residual reply/follow-up actions from
+    # historical Inbox classification.  Without this, a stopped Contact can
+    # still appear in Needs Action and expose a draft-reply entry point.
+    from ..services.inbox_triage import normalize_terminal_contact_state
+    normalize_terminal_contact_state(contact)
     # A human CRM edit becomes authoritative until explicitly unlocked.
     if changes.get("manual_lock") is True:
         from datetime import datetime, timezone

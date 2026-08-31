@@ -12,7 +12,10 @@ $ErrorActionPreference = "Continue"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $root = Split-Path -Parent $scriptDir
+. (Join-Path $scriptDir "data-dir.ps1") -Mode Formal
+. (Join-Path $scriptDir "runtime-ports.ps1")
 . (Join-Path $scriptDir "tacwork-runtime.ps1")
+$apiBase = "http://127.0.0.1:$script:BackendPort"
 
 function Pick($rel, $cmd) {
     $bundled = Join-Path $root $rel
@@ -33,8 +36,8 @@ Write-Output ("Workspace root  : " + $root)
 Write-Output ("Python runtime   : " + $pyBin)
 Write-Output ("Node runtime     : " + $nodeBin)
 Write-Output ("npm runtime      : " + $npmBin)
-Write-Output "TACWork Server   : http://127.0.0.1:8787"
-Write-Output "TACWork Web      : http://127.0.0.1:5173"
+Write-Output "TACWork Server   : http://127.0.0.1:$($script:TacWorkServerPort)"
+Write-Output "TACWork Web      : http://127.0.0.1:$($script:TacWorkWebPort)"
 try {
     $twRuntime = Resolve-TacWorkRuntime $root
     Write-Output ("TACWork runtime  : " + $twRuntime.root + " [" + $twRuntime.mode + "]")
@@ -46,7 +49,7 @@ Write-Output ""
 function Show($label, $val) { Write-Output ("{0,-18}: {1}" -f $label, $val) }
 
 try {
-    $h = Invoke-RestMethod "http://127.0.0.1:8000/api/health" -TimeoutSec 5
+    $h = Invoke-RestMethod "$apiBase/api/health" -TimeoutSec 5
     Show "Backend status" $h.status
     Show "Consumer healthy" $h.consumer.healthy
     Show "Consumer state" $h.consumer.state
@@ -67,7 +70,8 @@ try {
     Show "TACWork ready" "UNREACHABLE"
 }
 
-$servicesPath = Join-Path $root "logs\run\services.json"
+$servicesPath = Join-Path $global:DataRun "services.json"
+$services = $null
 if (Test-Path $servicesPath) {
     try {
         $services = Get-Content -Raw -Encoding UTF8 $servicesPath | ConvertFrom-Json
@@ -77,7 +81,7 @@ if (Test-Path $servicesPath) {
 }
 
 try {
-    $g = Invoke-RestMethod "http://127.0.0.1:8000/api/gmail/status" -TimeoutSec 5
+    $g = Invoke-RestMethod "$apiBase/api/gmail/status" -TimeoutSec 5
     Show "Gmail account" $g.email
     Show "Gmail connected" $g.connected
 } catch {
@@ -85,24 +89,29 @@ try {
 }
 
 try {
-    $p = Invoke-RestMethod "http://127.0.0.1:8000/api/system/pause" -TimeoutSec 5
+    $p = Invoke-RestMethod "$apiBase/api/system/pause" -TimeoutSec 5
     Show "System paused" $p.global_pause
 } catch {
     Show "System pause" "UNREACHABLE"
 }
 
 try {
-    Invoke-RestMethod "http://127.0.0.1:8000/api/agent/health" -TimeoutSec 5 | Out-Null
+    Invoke-RestMethod "$apiBase/api/agent/health" -TimeoutSec 5 | Out-Null
     Show "Agent health" "ok"
 } catch {
     Show "Agent health" "UNREACHABLE"
 }
 
-try {
-    $code = (Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:3000" -TimeoutSec 5).StatusCode
-    Show "Frontend (3000)" $code
-} catch {
-    Show "Frontend (3000)" "UNREACHABLE"
+if ($services -and $null -eq $services.frontend) {
+    $staticIndex = Join-Path $root 'runtime\frontend-static\index.html'
+    Show 'Frontend (Electron app://)' $(if (Test-Path $staticIndex) { 'static runtime ready' } else { 'RUNTIME MISSING' })
+} else {
+    try {
+        $code = (Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$script:FrontendPort" -TimeoutSec 5).StatusCode
+        Show "Frontend ($script:FrontendPort)" $code
+    } catch {
+        Show "Frontend ($script:FrontendPort)" "UNREACHABLE"
+    }
 }
 
 Write-Output ""

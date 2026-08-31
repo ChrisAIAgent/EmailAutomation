@@ -19,6 +19,8 @@ def test_email_ai_config_is_encrypted_and_read_api_never_returns_key(client, db)
     saved = client.put("/api/agent-profile/email-ai-config", json=_email_payload())
     assert saved.status_code == 200
     assert saved.json()["api_key_configured"] is True
+    assert saved.json()["restart_required"] is False
+    assert saved.json()["applies_to_next_run"] is True
     assert "api_key" not in saved.json()
     row = db.get(models.SystemFlag, "email_ai_config")
     assert row is not None

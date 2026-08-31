@@ -4,7 +4,7 @@
 ;          and calls ISCC on this file)
 
 #define MyAppName "Email Automation"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.2.2"
 #define MyAppPublisher "TAC AISolution"
 #define MyAppId "B8C9D0F2-2E6D-4C89-9A1D-EMAILAUTOMATION"
 
@@ -139,5 +139,4 @@ begin
     end;
   end;
 end;
-
 

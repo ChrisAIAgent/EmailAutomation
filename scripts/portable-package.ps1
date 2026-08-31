@@ -84,6 +84,7 @@ $xdNames = @(
     ".venv",
     ".pytest_cache",
     ".pytest-tmp",
+    ".tmp-*",
     ".next",
     ".next-dev",
     ".next-prod",
@@ -157,7 +158,7 @@ if ($StageDir) {
 # "nul"/"con"/"aux"/"prn" are reserved Windows device names. A stray file with
 # such a name cannot be deleted or extracted by normal tooling, so it must never
 # enter the archive.
-$xf = @("nul", "con", "aux", "prn", "*.log", "*.bak", "*.pyc", "*.zip", "*.docx", "debug_*.py", "_procs.txt", "_start_out.txt", ".env", ".env.local", "smoke*.db", "test.db", "*.tsbuildinfo")
+$xf = @("nul", "con", "aux", "prn", "*.log", "*.bak", "*.pyc", "*.zip", "*.docx", "debug_*.py", "_procs.txt", "_start_out.txt", ".env", ".env.local", "smoke*.db", "test.db", "*.tsbuildinfo", "REMAINING-PLAN.md")
 if (-not $IncludeData) { $xf += @("app.db*", "huey.db*", "*.sqlite", "*.sqlite3") }
 
 # Keep the robocopy log under logs/ (which is itself excluded from the archive),

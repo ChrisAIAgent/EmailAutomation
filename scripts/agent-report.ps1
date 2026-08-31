@@ -1,11 +1,16 @@
 param(
-    [string]$ApiBase = "http://127.0.0.1:8000",
-    [string]$OutputDir = "reports"
+    [string]$ApiBase = "",
+    [string]$OutputDir = ""
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
-$target = Join-Path $root $OutputDir
+. (Join-Path $PSScriptRoot "data-dir.ps1")
+if (-not $ApiBase) {
+    $port = if ($env:EMAIL_AUTOMATION_BACKEND_PORT) { $env:EMAIL_AUTOMATION_BACKEND_PORT } else { "18000" }
+    $ApiBase = "http://127.0.0.1:$port"
+}
+$target = if ($OutputDir) { Join-Path $root $OutputDir } else { Join-Path $global:DataLogs "reports" }
 New-Item -ItemType Directory -Force -Path $target | Out-Null
 
 $health = Invoke-RestMethod "$ApiBase/api/health" -TimeoutSec 5

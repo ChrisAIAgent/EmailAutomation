@@ -64,6 +64,7 @@ runtime/
 stage-audit*.log
 syntax-check.log
 build-installer-*.log
+runtime-build*.log
 logs/
 
 # ---------------- QA artifacts (may contain real email screenshots) -------
@@ -100,3 +101,5 @@ _start_out.txt
 .pytest-tmp/
 .pytest-final-all/
 backend/.pytest-tmp/
+.tmp-*/
+REMAINING-PLAN.md

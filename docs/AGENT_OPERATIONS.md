@@ -30,7 +30,7 @@ unsent Draft is also cancelled. Do not confuse either state with delivery.
 
 ## 1. 启动与健康检查
 
-使用 `start-stack.bat` 启动或重启。脚本会清理旧 Backend、Consumer 和 Frontend，记录本次 PID 到 `logs/run/services.json`，并等待三项服务都健康。
+使用 `start-stack.bat` 启动或重启。脚本仅在归属验证通过后清理本应用的旧 Backend、Consumer 和 Frontend，记录本次 PID 到正式数据目录 `%LOCALAPPDATA%\TAC AISolution\Email Automation\run\services.json`，并等待所有服务健康。旧 `backend\logs\run\services.json` 是历史兼容栈记录，需显式使用 `scripts/stop-legacy-stack.ps1` 停止，不迁移或删除其数据。
 
 检查：
 
@@ -45,7 +45,8 @@ GET /api/agent/health
 
 - Backend `status=ok`
 - `consumer.healthy=true`，`consumer.state=running`
-- Frontend 返回 HTTP 200
+- Electron 正式入口显示 `Frontend (Electron app://): static runtime ready` 即为前端健康；不要求监听本机前端端口
+- 仅使用 `start-stack.bat` 的兼容 Web 栈要求 `http://127.0.0.1:18001` 返回 HTTP 200
 - Gmail `connected=true`
 - 系统 `paused=false`
 - 真实发送任务中 `real_send=true`
@@ -58,10 +59,11 @@ GET /api/agent/health
 
 1. 运行 `scripts/agent-health.ps1 -RequireRealSend -RequireEmptyOperationalData`。
 2. 确认 Contacts、Campaign、Automation 和 pending Approval 均为空。
-3. 对已连接 Gmail 执行一次全量扫描。
-4. 分拣严格执行：方向门控 -> 噪音过滤 -> 真人判断 -> 联系人准入判断 -> Contact 创建/更新 -> 内容贴签。
-5. 先汇报过滤依据、真人判断、Contact、动态标签、指标和下一步，再按用户目标创建 Campaign。
-6. 未获得运营目标前，不自行群发或启用 Automation。
+3. 检查首次历史导入状态；经用户明确授权完成全部邮件（不含 Spam/Trash）的可恢复导入。
+4. 导入完成后，经新的明确授权启动首次历史分拣。它冻结当时的未分拣线程快照，以 50 个线程一批后台执行；不与导入混同，也不自动启动。
+5. 分拣严格执行：方向门控 -> 噪音过滤 -> 真人判断 -> 联系人准入判断 -> Contact 创建/更新 -> 内容贴签。
+6. 先汇报过滤依据、真人判断、Contact、动态标签、指标和下一步，再按用户目标创建 Campaign。
+7. 未获得运营目标前，不自行群发或启用 Automation。
 
 ## Scheduled Global Inbox operation
 
@@ -168,24 +170,46 @@ owner 隔离，只有该 owner 的 `published` 文档可参与检索。
 正文必须以 Profile 的签名原样结束；出现 `Best, 1`、`Your Name`、`AI Team`
 等异常签名时禁止发送并重新生成。
 
-增量同步：
+日常增量同步（仅在首次导入完成后）：
 
 ```text
 POST /api/gmail/sync
 ```
 
-全量扫描：
+首次历史导入：
 
 ```text
-POST /api/gmail/sync?full_scan=true
+POST /api/gmail/imports
+GET  /api/gmail/imports/current
+POST /api/gmail/imports/{id}/pause|resume|cancel
 ```
 
-全量扫描使用 Gmail `in:anywhere`，可包含 Spam/Trash，适合首次接管或漏信核查；日常优先增量同步。
+首次导入分页读取 Gmail `in:anywhere -in:spam -in:trash`，每批 100 个线程，
+无总量上限并保存断点。它只同步本机邮件数据，不触发 AI 分拣或任何发送链路。
+完成后须由用户明确启动一次首次历史分拣；该任务冻结未分拣快照、每批处理 50 个
+线程、显示进度并支持暂停/恢复/取消/重试失败项。它仅执行 Inbox 分类、过滤和
+联系人准入，绝不创建 Draft、Approval 或发送。首次分拣完成后 `/api/gmail/sync`
+只消费 Gmail History 变化；游标失效时停止并请求恢复授权。
+
+日常增量分拣：先执行 History API 同步并显示新增/变化后未分拣会话数，再创建一个
+固定快照的后台 Run。Run 没有总量上限，50 仅是安全工作批大小；运行期间再次同步到
+的会话保留给下一次 Run。它与首次分拣同样支持进度、暂停、恢复、取消和失败重试。
+Agent Takeover 启用时可在周期内自行同步、创建和监控此日常 Run；首次全量导入和
+首次历史分拣仍不自动启动。
 
 分拣与查询：
 
 ```text
 GET  /api/inbox/stats
+GET  /api/inbox/initial-triage/current
+GET  /api/inbox/daily-triage/current
+GET  /api/inbox/triage/recent
+POST /api/inbox/initial-triage
+POST /api/inbox/initial-triage/{id}/pause|resume|cancel
+POST /api/inbox/initial-triage/{id}/retry-failed
+POST /api/inbox/daily-triage
+POST /api/inbox/daily-triage/{id}/pause|resume|cancel
+POST /api/inbox/daily-triage/{id}/retry-failed
 POST /api/inbox/sort
 GET  /api/inbox/customers
 GET  /api/inbox/threads/{id}
@@ -203,7 +227,7 @@ POST /api/inbox/threads/{id}/generate-reply
 2. 噪音过滤：系统通知、广告、Newsletter、验证码和垃圾邮件进入 Filtered，不创建 Contact。
 3. 真人判断：先确认当前发件人是真实个人；这一步通过不等于创建 Contact。
 4. 联系人准入：只让真人业务客户候选进入 Contacts。`Approve` 打开人工表单，保存后才完成；`Reject` 将精确邮箱加入可撤销的非客户过滤名单；`Agent Decide` 仅在姓名或公司明确、当前发件人直发且业务相关时自动创建并打标。证据不足继续保留审核并说明缺失项。
-   准入是发件人级的一次性判断：已有 Contact 永远跳过；Reject 对该邮箱后续所有 thread 生效，不重复询问。历史 thread 遗留的 `human_review` 不得让已存在的 Contact 再次出现“是否创建联系人”。
+   准入是发件人级的一次性判断：详情顶部按发件人汇总当前审核会话。Approve 保存人工表单、Reject 或成功的 Agent Decide 会一并关闭当前同类准入审核；Reject 对该邮箱后续所有 thread 生效，不重复询问。历史 thread 遗留的 `human_review` 不得让已存在的 Contact 再次出现“是否创建联系人”。已有 Contact 的 `content_uncertain` 自动记录为“无需动作”，不再显示人工审核；正常业务邮件仍按既有回复/跟进规则处理，退订确认仍必须人工决定。
 5. 内容贴签：仅在 Contact 准入后，根据当前消息与历史往来更新主题、意向、阶段和下一步。
 6. 退订、拒绝、投诉、退信：对已确认真人或既有客户立即停止。
 7. 询价、Demo 请求、异议、明确问题：仅对已准入 Contact 生成上下文回复并等待审批。
@@ -232,6 +256,8 @@ Dashboard 指标口径：
 - `Replies`：已通过真人门控并关联 Contact 的入站邮件数。
 - `Positive Replies`：已确认真人且 intent 为 interested/asking_question 的线程数。
 - `Needs Reply`：当前 `lifecycle_stage=needs_reply` 且 `next_action=reply` 的 Contact 数。
+- `unprocessed` 才是实际尚未经过 AI 分拣的会话数。历史数据中 `triage_review` 的展示分类可能仍为 `unsorted`，但它已经分析完成，不能被表述为“新同步邮件”或再次要求分拣。
+- Gmail History 同步出现短暂 TLS/代理连接中断时，系统会作有限重试；仍失败时不推进本地 History 游标。向运营人员报告“同步暂时失败、稍后重试”，不得把旧的 `unsorted` 统计误报为新邮件。
 - `Pending Approvals`：真实待审核 Approval 数，不等同于 Needs Reply。
 
 同步后必须核对这些指标与 Inbox/Contacts 是否一致。验证码、Newsletter 和系统通知不得增加前三项。
@@ -370,8 +396,10 @@ Use this order on every takeover or cloud restart:
 1. Read `AGENTS.md`, this document, and `docs/AGENT_CRON.md`.
 2. Run `scripts/agent-health.ps1`; require healthy Backend and Consumer, connected
    Gmail, unpaused system, and the intended real-send configuration.
-3. Use incremental sync for daily work. Use full scan only for audit/recovery;
-   full scan uses Gmail `in:anywhere` and can include Archive, Spam, and Trash.
+3. Check first-import state. Start the resumable all-mail import only with explicit
+   user authorization; it excludes Spam/Trash. After completion, daily sync is
+   Gmail History incremental only. A cursor-expired result requires an explicit
+   recovery decision and never a silent full rescan.
 4. Run Inbox sorting and report filtered mail, verified humans, Contacts, stages,
    labels, Needs Reply, and Pending Approvals.
 5. Never manufacture a Contact, message, delivery result, or approval.
@@ -495,7 +523,7 @@ Operational rules:
 GET http://127.0.0.1:18000/api/health
 GET http://127.0.0.1:18002/status
 GET http://127.0.0.1:18003/
-正式 Windows 版直接启动 `Email Automation.exe` 并等待 `app://email-automation` 主窗口；过渡 Web 诊断才访问 `http://127.0.0.1:18001/`。
+正式 Windows 版直接启动 `Email Automation.exe` 并等待 `app://email-automation` 主窗口；过渡 Web 诊断才访问 `http://127.0.0.1:18001/`。源码开发只使用 `scripts/dev-stack.ps1` / `scripts/dev-stop.ps1`、独立数据目录和 `28000-28003` 端口，不得读取正式客户数据。
 ```
 
 For browser origin issues, both `127.0.0.1` and `localhost` origins are expected

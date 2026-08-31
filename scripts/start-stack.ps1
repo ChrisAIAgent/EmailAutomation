@@ -1,6 +1,7 @@
 param(
     [string]$Root = (Split-Path -Parent $PSScriptRoot),
-    [switch]$SkipFrontend
+    [switch]$SkipFrontend,
+    [switch]$Development
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,7 +12,17 @@ $processPath = [Environment]::GetEnvironmentVariable("Path", "Process")
 [Environment]::SetEnvironmentVariable("Path", $processPath, "Process")
 
 $rootPath = (Resolve-Path $Root).Path
-. (Join-Path $PSScriptRoot "data-dir.ps1")
+
+function Test-WorkspaceProcess {
+    param([object]$ProcessId)
+    if (-not $ProcessId) { return $false }
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+    if (-not $proc) { return $false }
+    $identity = "{0} {1}" -f $proc.ExecutablePath, $proc.CommandLine
+    return $identity -like "*$rootPath*"
+}
+
+. (Join-Path $PSScriptRoot "data-dir.ps1") -Mode $(if ($Development) { 'Development' } else { 'Formal' })
 . (Join-Path $PSScriptRoot "runtime-ports.ps1")
 . (Join-Path $PSScriptRoot "tacwork-runtime.ps1")
 
@@ -22,22 +33,33 @@ $rootPath = (Resolve-Path $Root).Path
 # passed to the browser; a backend proxy is planned to remove it from the UI.
 [Environment]::SetEnvironmentVariable("NEXT_PUBLIC_TACWORK_URL", "http://127.0.0.1:$script:TacWorkWebPort", "Process")
 [Environment]::SetEnvironmentVariable("NEXT_PUBLIC_TACWORK_SERVER_URL", "http://127.0.0.1:$script:TacWorkServerPort", "Process")
+$env:NEXT_PUBLIC_TACWORK_URL = "http://127.0.0.1:$script:TacWorkWebPort"
+$env:NEXT_PUBLIC_TACWORK_SERVER_URL = "http://127.0.0.1:$script:TacWorkServerPort"
 
 $logsPath = $global:DataLogs
-$runPath = Join-Path $logsPath "run"
+$runPath = $global:DataRun
 $pidPath = Join-Path $runPath "services.json"
-$pythonPath = Join-Path $rootPath "tools\python\python.exe"
+$pythonPath = if ($Development) { Join-Path $rootPath "backend\.venv\Scripts\python.exe" } else { Join-Path $rootPath "tools\python\python.exe" }
 $nodePath = Join-Path $rootPath "tools\node\node.exe"
 $pythonPackages = Join-Path $rootPath "runtime\python-packages"
 $frontendServer = Join-Path $rootPath "runtime\frontend\server.js"
+$frontendDevServer = Join-Path $rootPath "frontend\node_modules\next\dist\bin\next"
 $runtimeManifest = Join-Path $rootPath "runtime\runtime-manifest.json"
-foreach ($required in @($pythonPath, $nodePath, $pythonPackages, $frontendServer, $runtimeManifest)) {
+foreach ($required in @($pythonPath, $nodePath)) {
     if (-not (Test-Path $required)) { throw "runtime_missing: $required" }
+}
+if ($Development) {
+    if (-not $SkipFrontend -and -not (Test-Path $frontendDevServer)) { throw "dev_dependency_missing: frontend/node_modules is absent. Run npm ci in frontend on the development machine." }
+} else {
+    foreach ($required in @($pythonPackages, $frontendServer, $runtimeManifest)) {
+        if (-not (Test-Path $required)) { throw "runtime_missing: $required" }
+    }
 }
 $env:EMAIL_AUTOMATION_ROOT = $rootPath
 $env:EMAIL_AUTOMATION_DATA_DIR = $global:DataRoot
-$env:PYTHONPATH = (Join-Path $rootPath "backend") + ";" + $pythonPackages
+$env:PYTHONPATH = if ($Development) { Join-Path $rootPath "backend" } else { (Join-Path $rootPath "backend") + ";" + $pythonPackages }
 $env:API_URL = "http://127.0.0.1:$script:BackendPort"
+$env:NEXT_PUBLIC_API_URL = $env:API_URL
 $env:APP_URL = "http://127.0.0.1:$script:FrontendPort"
 $env:EMAIL_AUTOMATION_API_URL = $env:API_URL
 $env:TACWORK_SERVER_URL = "http://127.0.0.1:$script:TacWorkServerPort"
@@ -45,6 +67,7 @@ $env:GOOGLE_REDIRECT_URI = "$($env:API_URL)/api/gmail/oauth/callback"
 $env:CORS_ORIGINS = "http://127.0.0.1:$script:FrontendPort,http://localhost:$script:FrontendPort,http://127.0.0.1:$script:TacWorkWebPort,http://localhost:$script:TacWorkWebPort,app://email-automation"
 $env:PORT = [string]$script:FrontendPort
 $env:HOSTNAME = "127.0.0.1"
+if ($Development) { $env:NEXT_DIST_DIR = ".next-dev" }
 
 # Decrypt the Email Automation LLM configuration into this trusted parent process.
 # Child services inherit it; secrets are never written to logs or project config.
@@ -67,12 +90,14 @@ $svcJson = Join-Path $runPath "services.json"
 if (Test-Path $svcJson) {
     try {
         $svc = Get-Content -Raw -Encoding UTF8 $svcJson | ConvertFrom-Json
-        $recordedPids = @(
-            $svc.backend, $svc.consumer, $svc.frontend,
-            $svc.tacwork_server, $svc.tacwork_engine, $svc.tacwork_web,
-            $svc.launcher_backend, $svc.launcher_consumer, $svc.launcher_frontend,
-            $svc.launcher_tacwork_server, $svc.launcher_tacwork_web
-        ) | Where-Object { $_ } | Select-Object -Unique
+        if ($svc.data_root -eq $global:DataRoot) {
+            $recordedPids = @(
+                $svc.backend, $svc.consumer, $svc.frontend,
+                $svc.tacwork_server, $svc.tacwork_engine, $svc.tacwork_web,
+                $svc.launcher_backend, $svc.launcher_consumer, $svc.launcher_frontend,
+                $svc.launcher_tacwork_server, $svc.launcher_tacwork_web
+            ) | Where-Object { Test-WorkspaceProcess $_ } | Select-Object -Unique
+        }
     } catch {}
 }
 
@@ -80,6 +105,16 @@ $ports = @($script:BackendPort, $script:TacWorkServerPort, $script:TacWorkWebPor
 if (-not $SkipFrontend) { $ports += $script:FrontendPort }
 $listeners = @{}
 foreach ($port in $ports) { $listeners[$port] = Get-ListenerPid $port }
+
+# A writable source checkout used to start its stack with backend/ as the data
+# root. It is historical data, never a formal instance. Make that condition
+# explicit before listener recovery can mistake it for a formal stack.
+if (-not $Development -and $recordedPids.Count -eq 0) {
+    $legacyStatus = Join-Path (Join-Path (Join-Path $rootPath 'backend') 'logs') 'run\services.json'
+    if ((Test-Path $legacyStatus) -and @($listeners.Values | Where-Object { $_ }).Count -gt 0) {
+        throw "legacy_stack_detected: an older compatibility stack is using the formal port group. Its status file is $legacyStatus. Stop it explicitly with scripts/stop-legacy-stack.ps1; its backend data is retained and is not migrated."
+    }
+}
 
 # ---- Self-recognition fallback (runbook 5.5/8, probe-only) ----
 # If services.json is missing/stale (lost PID record), listeners on $script:BackendPort/$script:FrontendPort
@@ -121,7 +156,7 @@ if ($recordedPids.Count -eq 0) {
     }
     if ($recovered.Count -gt 0) {
         $recordedPids = @($recovered.Values) | Where-Object { $_ } | Select-Object -Unique
-        $recoveredJson = @{ started_at = (Get-Date).ToString("o"); status = "recovered" }
+        $recoveredJson = @{ started_at = (Get-Date).ToString("o"); status = "recovered"; version = (Get-Content -Raw (Join-Path $rootPath 'VERSION')).Trim(); instance_id = [guid]::NewGuid().ToString(); data_root = $global:DataRoot; ports = @{ backend = $script:BackendPort; frontend = $script:FrontendPort; tacwork_server = $script:TacWorkServerPort; tacwork_web = $script:TacWorkWebPort } }
         foreach ($k in $recovered.Keys) { $recoveredJson[$k] = $recovered[$k] }
         $recoveredJson | ConvertTo-Json | Set-Content -Encoding UTF8 -Path $pidPath
         Write-Output ("Recovered own stack (services.json missing, re-registered from live listeners): " + (($recovered.Keys | ForEach-Object { "$_=$($recovered[$_])" }) -join ', '))
@@ -160,14 +195,19 @@ if ($allOursUp) {
         ).StatusCode -eq 200
     } catch {}
 
-    $isHealthyDemo = (
+    $isHealthyStack = (
         $existingHealth.status -eq "ok" -and
         $existingHealth.consumer.healthy -eq $true -and
         $existingFrontendReady -and (Get-TacWorkHealth $rootPath).ready
     )
-    if ($isHealthyDemo) {
+    if ($isHealthyStack) {
         @{
             started_at = (Get-Date).ToString("o")
+            version = (Get-Content -Raw (Join-Path $rootPath 'VERSION')).Trim()
+            instance_id = [guid]::NewGuid().ToString()
+            data_root = $global:DataRoot
+            data_mode = $global:DataMode
+            ports = @{ backend = $script:BackendPort; frontend = $script:FrontendPort; tacwork_server = $script:TacWorkServerPort; tacwork_web = $script:TacWorkWebPort }
             adopted = $true
             backend = $existingBackendPid
             consumer = $existingHealth.consumer.pid
@@ -186,7 +226,7 @@ if ($allOursUp) {
 }
 
 # Our own stale/unhealthy instances: stop them, then start fresh.
-& (Join-Path $PSScriptRoot "stop-demo.ps1") -Root $rootPath
+& (Join-Path $PSScriptRoot "stop-stack.ps1") -Root $rootPath -Development:$Development
 
 $stillOccupied = @()
 foreach ($port in $ports) {
@@ -194,7 +234,7 @@ foreach ($port in $ports) {
     if ($listenerPid) { $stillOccupied += "port $port pid=$listenerPid" }
 }
 if ($stillOccupied.Count -gt 0) {
-    throw "service_start_failed: required ports still occupied after stopping our services: $($stillOccupied -join '; '). Run stop-demo.bat as Administrator, then retry."
+    throw "service_start_failed: required ports still occupied after stopping our services: $($stillOccupied -join '; '). Stop the recorded Email Automation services, then retry."
 }
 
 $backend = Start-Process -FilePath $pythonPath `
@@ -213,9 +253,11 @@ $consumer = Start-Process -FilePath $pythonPath `
 
 $frontend = $null
 if (-not $SkipFrontend) {
+    $frontendArgs = if ($Development) { ('"{0}" dev --hostname 127.0.0.1 --port {1}' -f $frontendDevServer, $script:FrontendPort) } else { ('"{0}"' -f $frontendServer) }
+    $frontendWorkingDirectory = if ($Development) { Join-Path $rootPath "frontend" } else { Join-Path $rootPath "runtime\frontend" }
     $frontend = Start-Process -FilePath $nodePath `
-    -ArgumentList ('"{0}"' -f $frontendServer) `
-    -WorkingDirectory (Join-Path $rootPath "runtime\frontend") `
+    -ArgumentList $frontendArgs `
+    -WorkingDirectory $frontendWorkingDirectory `
     -RedirectStandardOutput (Join-Path $logsPath "frontend.log") `
     -RedirectStandardError (Join-Path $logsPath "frontend-error.log") `
     -WindowStyle Hidden -PassThru
@@ -225,6 +267,11 @@ $tacwork = Start-TacWorkRuntime -WorkspaceRoot $rootPath -LogsPath $logsPath -Ru
 
 @{
     started_at = (Get-Date).ToString("o")
+    version = (Get-Content -Raw (Join-Path $rootPath 'VERSION')).Trim()
+    instance_id = [guid]::NewGuid().ToString()
+    data_root = $global:DataRoot
+    data_mode = $global:DataMode
+    ports = @{ backend = $script:BackendPort; frontend = $script:FrontendPort; tacwork_server = $script:TacWorkServerPort; tacwork_web = $script:TacWorkWebPort }
     backend = $backend.Id
     consumer = $consumer.Id
     frontend = if ($frontend) { $frontend.Id } else { $null }
@@ -251,7 +298,8 @@ do {
 } while ((-not ($backendReady -and $frontendReady -and $consumerReady -and $tacworkReady)) -and (Get-Date) -lt $deadline)
 
 if (-not ($backendReady -and $frontendReady -and $consumerReady -and $tacworkReady)) {
-    Write-Error "Startup failed: backend=$backendReady frontend=$frontendReady consumer=$consumerReady tacwork=$tacworkReady. Check logs/*-error.log."
+    $failureCode = if ($tacworkHealth -and -not $tacworkHealth.web_config) { "tacwork_runtime_config_mismatch" } else { "service_start_failed" }
+    Write-Error "${failureCode}: backend=$backendReady frontend=$frontendReady consumer=$consumerReady tacwork=$tacworkReady. Check logs/*-error.log."
 }
 
 $actualBackendPid = Get-ListenerPid $script:BackendPort
@@ -268,6 +316,11 @@ if ($tacworkHealth.status.workspace.baseUrl) {
 }
 @{
     started_at = (Get-Date).ToString("o")
+    version = (Get-Content -Raw (Join-Path $rootPath 'VERSION')).Trim()
+    instance_id = [guid]::NewGuid().ToString()
+    data_root = $global:DataRoot
+    data_mode = $global:DataMode
+    ports = @{ backend = $script:BackendPort; frontend = $script:FrontendPort; tacwork_server = $script:TacWorkServerPort; tacwork_web = $script:TacWorkWebPort }
     launcher_backend = $backend.Id
     launcher_consumer = $consumer.Id
     launcher_frontend = if ($frontend) { $frontend.Id } else { $null }

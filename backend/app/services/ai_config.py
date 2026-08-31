@@ -113,5 +113,9 @@ def public_email(config: EmailAIConfig) -> dict:
         "base_url": config.base_url,
         "model": config.model,
         "api_key_configured": bool(config.api_key),
-        "restart_required": True,
+        # This DB-backed configuration is resolved for every new LangGraph
+        # operation. Claiming a restart was required left the UI stale after a
+        # successful encrypted save.
+        "restart_required": False,
+        "applies_to_next_run": True,
     }

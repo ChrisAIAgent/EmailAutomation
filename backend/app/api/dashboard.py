@@ -15,6 +15,8 @@ from ..consumer_status import read_consumer_status
 from ..services import flags as flag_svc
 from ..services.accounts import resolve_sending_account
 from ..services.inbox_triage import contact_needs_reply
+from ..services.real_send import is_real_send_enabled
+from ..services.sync import initial_import_completed
 from .deps import ensure_owner, get_db
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
@@ -45,11 +47,15 @@ def readiness(db: Session = Depends(get_db)):
         blockers.append("global_pause_enabled")
     if not profile:
         blockers.append("agent_profile_missing")
+    import_completed = bool(account and initial_import_completed(db, account.id))
+    if account and account.is_connected and account.oauth and not import_completed:
+        blockers.append("initial_import_required")
     if invalid:
         blockers.append("invalidated_semi_auto_run_requires_review")
     next_action = (
         "review_invalidated_run" if invalid else
         "resolve_frozen_confirmation" if frozen else
+        "authorize_initial_mail_import" if account and account.is_connected and not import_completed else
         "review_needs_reply" if metrics_needs_reply(db) else
         "sync_and_triage_inbox" if account and account.is_connected else
         "connect_gmail"
@@ -58,10 +64,12 @@ def readiness(db: Session = Depends(get_db)):
         "status": "blocked" if blockers else "ready",
         "blockers": blockers,
         "next_action": next_action,
-        "gmail": {"connected": bool(account and account.is_connected and account.oauth), "email": account.email if account else None},
+        "gmail": {"connected": bool(account and account.is_connected and account.oauth),
+                  "email": account.email if account else None,
+                  "initial_import_completed": import_completed},
         "consumer": consumer,
         "global_pause": paused,
-        "real_send": settings.ENABLE_REAL_SEND,
+        "real_send": is_real_send_enabled(settings, account, _oauth),
         "profile_configured": bool(profile),
         "approval_mode": (profile.approval_mode if profile and profile.approval_mode else "human_review"),
         "pending_approvals": pending,
@@ -80,6 +88,9 @@ def metrics_needs_reply(db: Session) -> int:
 def metrics(db: Session = Depends(get_db)):
     s = get_settings()
     start_today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    owner_id = ensure_owner(db)
+    account, oauth = resolve_sending_account(db, owner_id=owner_id, provision=False)
+    real_send_enabled = is_real_send_enabled(s, account, oauth)
     connected = db.query(models.GmailAccount).filter_by(is_connected=True).count()
     total_contacts = db.query(models.Contact).count()
     active = db.query(models.Campaign).filter_by(status="active").count()
@@ -135,8 +146,8 @@ def metrics(db: Session = Depends(get_db)):
         "pending_approvals": pending,
         "scheduled_follow_ups": scheduled,
         "failed_tasks": failed_tasks + failed_tools,
-        "real_send_enabled": s.ENABLE_REAL_SEND,
-        "draft_only": not s.ENABLE_REAL_SEND,
+        "real_send_enabled": real_send_enabled,
+        "draft_only": not real_send_enabled,
         "restricted_allowlist_configured": restricted_allowlist_configured,
         "human_review": human_review,
         "suppressions": suppressions,

@@ -25,10 +25,9 @@ def test_takeover_status_is_safe_read_only_aggregate(monkeypatch):
         "/api/agent-profile?create_if_missing=false": {"configured": True, "approval_mode": "human_review"},
         "/api/dashboard/readiness": {"status": "ready", "next_action": "review_needs_reply", "real_send": True, "blockers": [], "awaiting_confirmation_runs": []},
         "/api/dashboard/metrics": {"langgraph_configured": True},
-        "/api/inbox/stats": {"human_review": 2, "needs_reply": 1},
+        "/api/inbox/stats": {"human_review": 2, "needs_reply": 1, "unprocessed": 0},
         "/api/contacts": [{"id": 1}],
         "/api/campaigns": [], "/api/automation": [], "/api/approvals?status=pending": [],
-        "/api/inbox/threads?category=unsorted&limit=500": [],
         "/api/automation/scheduler/status": {"status": "running"},
         "/api/agent-takeover": {"enabled": False, "current_stage": "disabled"},
     }
@@ -41,7 +40,8 @@ def test_takeover_status_is_safe_read_only_aggregate(monkeypatch):
     assert value["workspace_mode"] == "production"
     assert value["profile"]["approval_mode"] == "human_review"
     assert value["agent_takeover"]["enabled"] is False
-    assert value["counts"] == {"contacts": 1, "campaigns": 0, "automations": 0, "pending_approvals": 0, "unsorted_threads": 0, "human_review_threads": 2, "needs_reply_threads": 1}
+    assert value["counts"] == {"contacts": 1, "campaigns": 0, "automations": 0, "pending_approvals": 0, "unsorted_threads": 0, "untriaged_threads": 0, "human_review_threads": 2, "needs_reply_threads": 1}
+    assert "/api/inbox/threads?category=unsorted&limit=500" not in {path for _, path in calls}
     assert "api_key" not in str(value).lower()
     assert "token" not in str(value).lower()
 
@@ -83,10 +83,10 @@ def test_scheduled_takeover_revalidates_capability_before_global_run(monkeypatch
     }})
     assert reply["result"].get("isError") is not True
     assert calls[0] == ("POST", "/api/agent-takeover/authorize", {
-        "token": "capability", "operation": "start_global_run", "automation_id": 7,
+        "token": "capability", "operation": "start_agent_run", "automation_id": 7,
     })
     assert calls[1][1:] == ("/api/agent-takeover/telemetry", {
-        "token": "capability", "stage": "start_global_run", "status": "started", "detail": {},
+        "token": "capability", "stage": "start_agent_run", "status": "started", "detail": {},
     })
     assert calls[2][1] == "/api/agent-runs"
     assert calls[3][1] == "/api/agent-takeover/telemetry"

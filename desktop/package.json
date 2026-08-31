@@ -1,10 +1,11 @@
 {
   "name": "email-automation-desktop",
-  "version": "1.2.0",
+  "version": "1.2.2",
   "private": true,
   "main": "main.cjs",
   "scripts": {
     "start": "electron .",
+    "dev": "node dev.cjs",
     "check": "node --check main.cjs && node --check preload.cjs"
   },
   "devDependencies": {

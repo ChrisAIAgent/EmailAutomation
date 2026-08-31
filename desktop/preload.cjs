@@ -4,5 +4,6 @@ contextBridge.exposeInMainWorld("emailAutomation", Object.freeze({
   openLogs: () => ipcRenderer.invoke("open-logs"),
   repair: () => ipcRenderer.invoke("repair-runtime"),
   quitAndStop: () => ipcRenderer.invoke("quit-and-stop"),
+  reload: () => ipcRenderer.invoke("reload-window"),
   getRuntimeStatus: () => ipcRenderer.invoke("runtime-status"),
 }));

@@ -10,6 +10,17 @@ protocol.registerSchemesAsPrivileged([{ scheme: "app", privileges: { standard: t
 let mainWindow, selectedPorts, appRoot, dataRoot;
 let quitting = false;
 let runtimeStatus = { stage: "starting", error: null };
+const developmentMode = process.env.EMAIL_AUTOMATION_DESKTOP_DEV === "1";
+const developmentDataRoot = process.env.EMAIL_AUTOMATION_DATA_DIR || path.join(
+  process.env.LOCALAPPDATA || app.getPath("userData"),
+  "TAC AISolution",
+  "Email Automation Dev",
+);
+
+// Electron's single-instance lock is scoped to userData.  Give the developer
+// shell its own location before requesting that lock, so it can run alongside
+// the formal application without sharing Chromium state or suppressing launch.
+if (developmentMode) app.setPath("userData", path.join(developmentDataRoot, "electron-shell"));
 function writeDiagnostic(event, detail = {}) {
   if (!dataRoot) return;
   const record = { time: new Date().toISOString(), event, ...detail };
@@ -23,7 +34,7 @@ function rootPath() {
     path.resolve(process.resourcesPath, "..", "..", ".."),
   ].filter(Boolean);
   for (const candidate of candidates) {
-    if (fs.existsSync(path.join(candidate, "VERSION")) && fs.existsSync(path.join(candidate, "scripts", "start-demo.ps1"))) return candidate;
+    if (fs.existsSync(path.join(candidate, "VERSION")) && fs.existsSync(path.join(candidate, "scripts", "start-stack.ps1"))) return candidate;
   }
   throw new Error("runtime_integrity_failed:application_root_not_found");
 }
@@ -34,6 +45,7 @@ const canListen = (port) => new Promise((resolve) => {
   server.listen(port, "127.0.0.1");
 });
 async function choosePorts() {
+  if (developmentMode) return { backend: 28000, frontend: 28001, tacworkServer: 28002, tacworkWeb: 28003 };
   for (let base = 18000; base <= 18900; base += 10) {
     const ports = { backend: base, frontend: base + 1, tacworkServer: base + 2, tacworkWeb: base + 3 };
     if ((await canListen(ports.backend)) && (await canListen(ports.tacworkServer)) && (await canListen(ports.tacworkWeb))) return ports;
@@ -109,7 +121,12 @@ async function waitForUiReady() {
   const deadline = Date.now() + 20000;
   while (Date.now() < deadline) {
     const state = await mainWindow.webContents.executeJavaScript(`({ text: document.body.innerText.slice(0, 500), api: window.__EMAIL_AUTOMATION_RUNTIME__?.apiUrl || "" })`, true);
-    if (state.api === `http://127.0.0.1:${selectedPorts.backend}` && state.text.length > 80 && !/Loading dashboard/i.test(state.text)) return state;
+    const expectedApi = `http://127.0.0.1:${selectedPorts.backend}`;
+    // The formal shell reads its dynamic configuration from app://.  The
+    // development shell deliberately uses source Next dev, whose public API
+    // URL is compiled from its isolated process environment instead.
+    const apiReady = developmentMode ? !state.api || state.api === expectedApi : state.api === expectedApi;
+    if (apiReady && state.text.length > 80 && !/Loading dashboard/i.test(state.text)) return state;
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
   throw new Error("runtime_integrity_failed:frontend_hydration_timeout");
@@ -119,19 +136,36 @@ async function startServices() {
   selectedPorts = await choosePorts();
   writeDiagnostic("ports_selected", { ports: selectedPorts });
   runtimeStatus = { stage: "services_starting", ports: selectedPorts, error: null };
-  await runPowerShell(path.join(appRoot, "scripts", "start-demo.ps1"), ["-Root", appRoot, "-SkipFrontend"]);
+  const script = developmentMode ? "dev-stack.ps1" : "start-stack.ps1";
+  const args = developmentMode ? ["-Root", appRoot] : ["-Root", appRoot, "-SkipFrontend"];
+  await runPowerShell(path.join(appRoot, "scripts", script), args);
   writeDiagnostic("launcher_complete", { ports: selectedPorts });
   await waitForReady();
   runtimeStatus = { stage: "ready", ports: selectedPorts, error: null };
 }
-async function stopServices() { if (selectedPorts) try { await runPowerShell(path.join(appRoot, "scripts", "stop-demo.ps1"), ["-Root", appRoot]); } catch {} }
+async function stopServices() {
+  if (!selectedPorts) return;
+  try {
+    await runPowerShell(
+      path.join(appRoot, "scripts", developmentMode ? "dev-stop.ps1" : "stop-stack.ps1"),
+      ["-Root", appRoot],
+    );
+  } catch {}
+}
 function createWindow() {
   mainWindow = new BrowserWindow({ width: 1500, height: 920, minWidth: 980, minHeight: 680, show: false, backgroundColor: "#080d16", webPreferences: { preload: path.join(__dirname, "preload.cjs"), contextIsolation: true, nodeIntegration: false, sandbox: true } });
   mainWindow.webContents.setWindowOpenHandler(({ url }) => { if (/^https?:\/\//i.test(url)) void shell.openExternal(url); return { action: "deny" }; });
   mainWindow.webContents.on("did-fail-load", (_event, code, description, url) => writeDiagnostic("did_fail_load", { code, description, url }));
   mainWindow.webContents.on("did-finish-load", () => writeDiagnostic("did_finish_load", { url: mainWindow.webContents.getURL() }));
   mainWindow.webContents.on("console-message", (_event, level, message) => writeDiagnostic("renderer_console", { level, message }));
-  mainWindow.webContents.on("will-navigate", (event, url) => { if (!url.startsWith("app://email-automation")) { event.preventDefault(); if (/^https?:\/\//i.test(url)) void shell.openExternal(url); } });
+  mainWindow.webContents.on("will-navigate", (event, url) => {
+    const isFormalUi = url.startsWith("app://email-automation");
+    const isDevelopmentUi = developmentMode && url.startsWith(`http://127.0.0.1:${selectedPorts.frontend}`);
+    if (!isFormalUi && !isDevelopmentUi) {
+      event.preventDefault();
+      if (/^https?:\/\//i.test(url)) void shell.openExternal(url);
+    }
+  });
   mainWindow.on("close", async (event) => {
     if (quitting) return;
     event.preventDefault();
@@ -156,6 +190,7 @@ ipcMain.handle("repair-runtime", async () => {
   return error ? { ok: false, reason: error } : { ok: true };
 });
 ipcMain.handle("quit-and-stop", async () => { quitting = true; await stopServices(); app.quit(); });
+ipcMain.handle("reload-window", () => { if (mainWindow) mainWindow.webContents.reloadIgnoringCache(); });
 
 if (!app.requestSingleInstanceLock()) app.quit();
 app.on("second-instance", () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } });
@@ -166,12 +201,16 @@ app.whenReady().then(async () => {
   writeDiagnostic("app_ready", { appRoot, dataRoot });
   registerAppProtocol(); createWindow();
   try {
-    verifyRuntime();
-    writeDiagnostic("runtime_verified");
+    if (developmentMode) {
+      writeDiagnostic("development_shell_ready");
+    } else {
+      verifyRuntime();
+      writeDiagnostic("runtime_verified");
+    }
     await startServices();
     writeDiagnostic("services_ready", { ports: selectedPorts });
     await Promise.race([
-      mainWindow.loadURL("app://email-automation/"),
+      mainWindow.loadURL(developmentMode ? `http://127.0.0.1:${selectedPorts.frontend}/` : "app://email-automation/"),
       new Promise((_, reject) => setTimeout(() => reject(new Error("runtime_integrity_failed:frontend_load_timeout")), 20000)),
     ]);
     const ui = await waitForUiReady();

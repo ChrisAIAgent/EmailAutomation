@@ -19,7 +19,10 @@
     In legacy mode it maps onto the existing backend layout so dev/portable
     behaviour is unchanged.
 #>
-param()
+param(
+    [ValidateSet('Formal', 'Development', 'Legacy', 'Auto')]
+    [string]$Mode = 'Auto'
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -38,7 +41,22 @@ function Test-ProtectedInstall {
     }
 }
 
-if ($env:EMAIL_AUTOMATION_DATA_DIR) {
+if ($Mode -eq 'Formal') {
+    $local = $env:LOCALAPPDATA
+    if (-not $local) { $local = $env:APPDATA }
+    if (-not $local) { $local = $env:TEMP }
+    if (-not $local) { throw 'LOCALAPPDATA, APPDATA, or TEMP is required for formal application data.' }
+    $script:DataRoot = Join-Path (Join-Path $local 'TAC AISolution') 'Email Automation'
+    $script:DataMode = 'formal'
+} elseif ($Mode -eq 'Development') {
+    $local = $env:LOCALAPPDATA
+    if (-not $local) { throw 'LOCALAPPDATA is required for isolated development data.' }
+    $script:DataRoot = Join-Path (Join-Path $local 'TAC AISolution') 'Email Automation Dev'
+    $script:DataMode = 'development'
+} elseif ($Mode -eq 'Legacy') {
+    $script:DataRoot = $backendDir
+    $script:DataMode = 'legacy'
+} elseif ($env:EMAIL_AUTOMATION_DATA_DIR) {
     $script:DataRoot = $env:EMAIL_AUTOMATION_DATA_DIR
     $script:DataMode = 'app'
 } elseif (Test-ProtectedInstall -Path $backendDir) {
@@ -52,21 +70,23 @@ if ($env:EMAIL_AUTOMATION_DATA_DIR) {
     $script:DataMode = 'legacy'
 }
 
-if ($script:DataMode -eq 'app') {
+if ($script:DataMode -ne 'legacy') {
     $script:DataConfig   = Join-Path $script:DataRoot 'config'
     $script:DataDatabase = Join-Path $script:DataRoot 'database'
     $script:DataQueue    = Join-Path $script:DataRoot 'queue'
     $script:DataLogs     = Join-Path $script:DataRoot 'logs'
     $script:DataTacwork  = Join-Path $script:DataRoot 'tacwork'
+    $script:DataRun      = Join-Path $script:DataRoot 'run'
 } else {
     $script:DataConfig   = $script:DataRoot
     $script:DataDatabase = $script:DataRoot
     $script:DataQueue    = Join-Path $script:DataRoot 'data'
     $script:DataLogs     = Join-Path $script:DataRoot 'logs'
     $script:DataTacwork  = Join-Path (Join-Path $script:DataRoot 'data') 'tacwork'
+    $script:DataRun      = Join-Path $script:DataLogs 'run'
 }
 
-foreach ($d in @($script:DataConfig, $script:DataDatabase, $script:DataQueue, $script:DataLogs, $script:DataTacwork)) {
+foreach ($d in @($script:DataConfig, $script:DataDatabase, $script:DataQueue, $script:DataLogs, $script:DataTacwork, $script:DataRun)) {
     New-Item -ItemType Directory -Force -Path $d | Out-Null
 }
 
@@ -78,3 +98,4 @@ $global:DataDatabase  = $script:DataDatabase
 $global:DataQueue     = $script:DataQueue
 $global:DataLogs      = $script:DataLogs
 $global:DataTacwork   = $script:DataTacwork
+$global:DataRun       = $script:DataRun

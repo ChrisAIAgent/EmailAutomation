@@ -24,6 +24,7 @@ from .errors import register_error_handlers
 from .scheduler import start as start_scheduler
 from .services import flags as flag_svc
 from .services.accounts import resolve_sending_account
+from .services.real_send import is_real_send_enabled
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("main")
@@ -46,6 +47,14 @@ async def lifespan(app: FastAPI):
     try:
         from .api.deps import ensure_owner
         owner_id = ensure_owner(db)
+        from .services.sync import repair_stored_mail_bodies
+        repaired_bodies = repair_stored_mail_bodies(db)
+        if repaired_bodies:
+            logger.info("Repaired %s locally stored HTML/CSS email bodies.", repaired_bodies)
+        from .services.inbox_triage import reconcile_existing_contact_reviews
+        reconciled_reviews = reconcile_existing_contact_reviews(db, owner_id=owner_id)
+        if reconciled_reviews:
+            logger.info("Closed %s legacy review items for existing Contacts.", reconciled_reviews)
         # Upgrade safety: a Global automation created before takeover scopes
         # existed must not process an unbounded historical backlog.
         from .services.automation import parse_plan
@@ -163,7 +172,7 @@ def health(db: Session = Depends(get_db)):
     return {
         "status": "ok" if db_ok else "error",
         "db_ok": db_ok,
-        "real_send": settings.ENABLE_REAL_SEND,
+        "real_send": is_real_send_enabled(settings, gmail_account, _oauth),
         "gmail_configured": is_gmail_configured(settings),
         "gmail_connected": gmail_connected,
         "gmail_account": gmail_account.email if gmail_account else None,

@@ -11,11 +11,13 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .. import models
-from ..gmail.transport import _looks_corrupt_text
+from ..gmail.transport import GmailTimeoutError, GmailTransientNetworkError, _looks_corrupt_text, _looks_like_html_or_css_residue, readable_email_text
 from ..tools.email_tools import UnifiedEmailToolLayer
 from .inbox_triage import assess_inbound, clear_stale_human_review, recompute_contact_reply_state
 
 logger = logging.getLogger("gmail.sync")
+INITIAL_IMPORT_QUERY = "in:anywhere -in:spam -in:trash"
+INITIAL_IMPORT_BATCH_SIZE = 100
 
 
 def _parse_dt(s: Optional[str]) -> Optional[datetime]:
@@ -34,12 +36,39 @@ def _parse_dt(s: Optional[str]) -> Optional[datetime]:
 
 def sync_inbox(db, account, oauth, query: str = "", max_results: int = 50, include_spam_trash: bool = False) -> dict:
     tl = UnifiedEmailToolLayer(db, account, oauth)
-    threads, search_meta = _search_demo_relevant_threads(
+    threads, search_meta = _search_relevant_threads(
         db, tl, query=query, max_results=max_results, include_spam_trash=include_spam_trash
     )
+    stored = store_thread_batch(db, account, threads)
+    # update history id
+    try:
+        profile = tl._transport().get_profile()
+        if profile.get("historyId"):
+            account.history_id = profile["historyId"]
+    except Exception as e:
+        # A failed historyId update must not silently stall incremental sync —
+        # log it so the operator can see the cursor stopped advancing.
+        logger.warning("historyId update failed: %s", e)
+    db.flush()
+    return {
+        "threads": len(threads),
+        **stored,
+        **search_meta,
+    }
+
+
+def store_thread_batch(db, account, threads) -> dict:
+    """Idempotently persist one fetched Gmail thread batch.
+
+    This performs the existing local direction/reconciliation work only. It
+    does not run AI triage, create Contacts, create Drafts or send mail.
+    """
     created_threads = 0
     created_msgs = 0
     for tdto in threads:
+        # A database error must fail the whole page. The import worker commits
+        # the page token only after this batch succeeds, so a resumed import
+        # safely retries the same page instead of silently skipping a thread.
         ct, was_new = _upsert_thread(db, account, tdto)
         if was_new:
             created_threads += 1
@@ -65,30 +94,109 @@ def sync_inbox(db, account, oauth, query: str = "", max_results: int = 50, inclu
             _contact = db.query(models.Contact).filter_by(owner_id=account.user_id, email=ct.contact_email.lower()).first()
             if _contact is not None:
                 recompute_contact_reply_state(db, _contact)
-    # update history id
-    try:
-        profile = tl._transport().get_profile()
-        if profile.get("historyId"):
-            account.history_id = profile["historyId"]
-    except Exception as e:
-        # A failed historyId update must not silently stall incremental sync —
-        # log it so the operator can see the cursor stopped advancing.
-        logger.warning("historyId update failed: %s", e)
     db.flush()
     return {
-        "threads": len(threads),
         "new_threads": created_threads,
         "new_messages": created_msgs,
-        **search_meta,
+        "failures": 0,
     }
 
 
-def _search_demo_relevant_threads(db, tl, query: str, max_results: int, include_spam_trash: bool = False):
+def initial_import_completed(db, account_id: int) -> bool:
+    return db.query(models.GmailSyncRun.id).filter_by(
+        gmail_account_id=account_id, kind="initial_full", status="completed"
+    ).first() is not None
+
+
+def _history_thread_ids(events: list[dict]) -> list[str]:
+    """Extract unique affected thread IDs from all Gmail history event shapes."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+
+    def add(message):
+        if not isinstance(message, dict):
+            return
+        thread_id = message.get("threadId")
+        if thread_id and thread_id not in seen:
+            seen.add(thread_id)
+            ordered.append(thread_id)
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        for message in event.get("messages", []) or []:
+            add(message)
+        for key in ("messagesAdded", "messagesDeleted", "labelsAdded", "labelsRemoved"):
+            for wrapper in event.get(key, []) or []:
+                add(wrapper.get("message") if isinstance(wrapper, dict) else None)
+        # In-memory and narrow transport doubles may expose a direct threadId.
+        add(event)
+    return ordered
+
+
+def sync_history(db, account, oauth, start_history_id: str) -> dict:
+    """Replay Gmail History from a durable cursor and persist affected threads."""
+    if not start_history_id:
+        raise RuntimeError("initial_import_required")
+    tl = UnifiedEmailToolLayer(db, account, oauth)
+    page_token = None
+    latest_history_id = start_history_id
+    affected: list[str] = []
+    seen: set[str] = set()
+    history_pages = 0
+    while True:
+        events, latest, page_token = tl.list_history(
+            start_history_id, page_token=page_token, agent="system", is_primary=True
+        )
+        history_pages += 1
+        if latest:
+            latest_history_id = str(latest)
+        for thread_id in _history_thread_ids(events):
+            if thread_id not in seen:
+                seen.add(thread_id)
+                affected.append(thread_id)
+        if not page_token:
+            break
+
+    threads = []
+    failures = 0
+    for thread_id in affected:
+        try:
+            threads.append(tl.get_thread(thread_id, agent="system", is_primary=True))
+        except (GmailTimeoutError, GmailTransientNetworkError):
+            # Do not advance the durable history cursor after a transient
+            # network timeout; the next run must retry the same change set.
+            raise
+        except Exception:
+            failures += 1
+            logger.warning("Could not fetch changed Gmail thread %s", thread_id)
+    stored = store_thread_batch(db, account, threads)
+    account.history_id = latest_history_id
+    db.flush()
+    return {
+        "threads": len(threads),
+        "affected_threads": len(affected),
+        "history_pages": history_pages,
+        "history_id": latest_history_id,
+        "new_threads": stored["new_threads"],
+        "new_messages": stored["new_messages"],
+        "failures": failures + stored["failures"],
+    }
+
+
+def sync_incremental(db, account, oauth) -> dict:
+    """Run the normal post-baseline sync using Gmail History only."""
+    if not initial_import_completed(db, account.id):
+        raise RuntimeError("initial_import_required")
+    return sync_history(db, account, oauth, account.history_id)
+
+
+def _search_relevant_threads(db, tl, query: str, max_results: int, include_spam_trash: bool = False):
     """Fetch normal inbox/search results plus active campaign-contact threads.
 
-    A live demo often sends from the app first, then the prospect replies in that
-    same Gmail thread. Depending on labels and Gmail ordering, the blank query can
-    miss that thread during a short demo. We add narrow per-contact searches for
+    The application may send first, then receive a reply in the same Gmail
+    thread. Depending on labels and Gmail ordering, a narrow recent query can
+    miss that thread. Add focused per-contact searches for
     active campaign contacts so the "sent -> reply -> sync" path is visible.
     """
     seen: set[str] = set()
@@ -262,6 +370,40 @@ def _upsert_message(db, thread, mdto) -> bool:
         thread.last_agent_summary = None
         thread.pending_action = None
     return True
+
+
+def repair_stored_mail_bodies(db, *, limit: int = 10_000) -> int:
+    """Repair local display text polluted by HTML/CSS boilerplate.
+
+    The original HTML stays intact. This is idempotent and does not call Gmail,
+    so an upgraded Workspace can read historical mail safely without re-syncing.
+    """
+    repaired = 0
+    rows = (
+        db.query(models.EmailMessage)
+        .filter(models.EmailMessage.body_html.isnot(None))
+        .order_by(models.EmailMessage.id.asc())
+        .limit(limit)
+        .all()
+    )
+    for message in rows:
+        if not _looks_like_html_or_css_residue(message.body_text):
+            continue
+        readable = readable_email_text(message.body_text, message.body_html)
+        if not readable or readable == (message.body_text or ""):
+            continue
+        message.body_text = readable
+        if _looks_like_html_or_css_residue(message.snippet):
+            message.snippet = readable[:200]
+        db.add(models.AuditLog(
+            actor="system", action="gmail_html_body_repaired", entity="email_message",
+            entity_id=str(message.id),
+            detail=json.dumps({"source": "local_html", "display_text_repaired": True}), success=True,
+        ))
+        repaired += 1
+    if repaired:
+        db.commit()
+    return repaired
 
 
 def _normalise_mail_text(value: Optional[str]) -> str:

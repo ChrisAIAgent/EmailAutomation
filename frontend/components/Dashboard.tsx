@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Activity, BarChart3, Beaker, BookOpen, Bot, CalendarClock, Inbox as InboxIcon, Pause, Play, Send, Users } from "lucide-react";
+import { Activity, BarChart3, Beaker, BookOpen, Bot, CalendarClock, ChevronLeft, ChevronRight, Inbox as InboxIcon, Moon, Pause, Play, Send, Sun, Type, Users } from "lucide-react";
 import { api, API_BASE, Metrics } from "@/lib/api";
 import { useLang } from "@/lib/i18n";
 import ConfigBar from "./ConfigBar";
@@ -17,6 +17,7 @@ import AgentProfileView from "./AgentProfile";
 import TacWorkPanel from "./TacWorkPanel";
 import AgentTakeoverControl from "./AgentTakeoverControl";
 import AutomationView from "./Automation";
+import { useUiPreferences } from "@/lib/ui-preferences";
 
 type Tab = "overview" | "inbox" | "contacts" | "campaigns" | "approvals" | "agent_profile" | "knowledge" | "activity" | "agent_lab" | "automation";
 
@@ -35,6 +36,7 @@ const TAB_KEYS: Record<Tab, { labelKey: string; icon: any }> = {
 
 export default function Dashboard() {
   const { t, lang, setLang } = useLang();
+  const { theme, density, sidebarCollapsed, setTheme, setDensity, setSidebarCollapsed } = useUiPreferences();
   const [tab, setTab] = useState<Tab>("overview");
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [gmail, setGmail] = useState<any>(null);
@@ -140,14 +142,16 @@ export default function Dashboard() {
 
   return (
     <div className="h-screen flex overflow-hidden">
-      <aside className="h-full w-16 lg:w-60 shrink-0 border-r border-border bg-panel p-2 lg:p-4 flex flex-col gap-1 relative overflow-hidden transition-[width] duration-200">
+      <aside className={`h-full ${sidebarCollapsed ? "w-16" : "w-60"} shrink-0 border-r border-border bg-panel p-2 ${sidebarCollapsed ? "" : "lg:p-4"} flex flex-col gap-1 relative overflow-hidden transition-[width] duration-200`}>
         <div className="absolute -top-12 -right-12 h-28 w-28 rounded-full bg-accent/10 blur-2xl" />
-        <div className="flex items-center justify-center lg:justify-start mb-5 lg:px-2 relative">
-          <div className="min-w-0 text-center lg:text-left">
+        <div className={`flex items-center ${sidebarCollapsed ? "justify-center" : "justify-between"} mb-5 ${sidebarCollapsed ? "" : "px-2"} relative`}>
+          <div className={`min-w-0 ${sidebarCollapsed ? "text-center" : "text-left"}`}>
             <div className="font-black tracking-[0.24em] text-brand text-lg leading-none">TAC</div>
-            <div className="hidden lg:block text-[10px] uppercase tracking-[0.16em] text-muted mt-1 truncate">{t('dash_email_automation')}</div>
+            {!sidebarCollapsed && <div className="text-[10px] uppercase tracking-[0.16em] text-muted mt-1 truncate">{t('dash_email_automation')}</div>}
           </div>
+          {!sidebarCollapsed && <button type="button" className="btn !px-1.5 !py-1" onClick={() => setSidebarCollapsed(true)} title={lang === "zh" ? "收缩功能栏" : "Collapse navigation"}><ChevronLeft size={16} /></button>}
         </div>
+        {sidebarCollapsed && <button type="button" className="btn !px-1.5 !py-1 mb-2 self-center" onClick={() => setSidebarCollapsed(false)} title={lang === "zh" ? "展开功能栏" : "Expand navigation"}><ChevronRight size={16} /></button>}
         {(Object.entries(TAB_KEYS) as [Tab, typeof TAB_KEYS[Tab]][]).map(([id, cfg]) => {
           const Icon = cfg.icon;
           return (
@@ -156,29 +160,31 @@ export default function Dashboard() {
               onClick={() => setTab(id)}
               title={t(cfg.labelKey)}
               aria-label={t(cfg.labelKey)}
-              className={`flex items-center justify-center lg:justify-start gap-2 px-2 lg:px-3 py-2 rounded-lg text-left text-sm ${
+              className={`flex items-center ${sidebarCollapsed ? "justify-center" : "justify-start"} gap-2 px-2 ${sidebarCollapsed ? "" : "lg:px-3"} py-2 rounded-lg text-left text-sm ${
                 tab === id ? "bg-brand text-white shadow-[0_6px_18px_rgba(239,27,45,.2)]" : "text-muted hover:bg-panel2"
               }`}
             >
-              <Icon size={16} className="shrink-0" /> <span className="hidden lg:inline truncate">{t(cfg.labelKey)}</span>
+              <Icon size={16} className="shrink-0" /> {!sidebarCollapsed && <span className="truncate">{t(cfg.labelKey)}</span>}
             </button>
           );
         })}
         <div className="mt-auto" />
-        <AgentTakeoverControl paused={paused} onChanged={load} />
+        {!sidebarCollapsed && <AgentTakeoverControl paused={paused} onChanged={load} />}
         <button onClick={togglePause} className="btn flex items-center justify-center gap-2 text-xs px-2" title={paused ? (lang === 'zh' ? '恢复全部' : 'Resume All') : (lang === 'zh' ? '暂停全部' : 'Pause All')}>
           {paused ? <Play size={14} /> : <Pause size={14} />}
-          <span className="hidden lg:inline">{paused ? (lang === 'zh' ? '恢复全部' : 'Resume All') : (lang === 'zh' ? '暂停全部' : 'Pause All')}</span>
+          {!sidebarCollapsed && <span>{paused ? (lang === 'zh' ? '恢复全部' : 'Resume All') : (lang === 'zh' ? '暂停全部' : 'Pause All')}</span>}
         </button>
-        {/* language toggle */}
-        <button
-          onClick={() => setLang(lang === 'zh' ? 'en' : 'zh')}
-          className="mt-2 text-xs text-muted hover:text-foreground text-center border border-border rounded py-1 px-1"
-          title={lang === 'zh' ? 'Switch to English' : '切换到中文'}
-        >
-          <span className="lg:hidden">🌐</span>
-          <span className="hidden lg:inline">{lang === 'zh' ? '🌐 English' : '🌐 中文'}</span>
-        </button>
+        <div className={`mt-2 flex ${sidebarCollapsed ? "flex-col" : ""} gap-1`}>
+          <button type="button" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} className="text-xs text-muted hover:text-foreground text-center border border-border rounded py-1 px-1" title={theme === "dark" ? (lang === "zh" ? "切换浅色主题" : "Use light theme") : (lang === "zh" ? "切换深色主题" : "Use dark theme")}>
+            {theme === "dark" ? <Sun size={15} className="inline" /> : <Moon size={15} className="inline" />} {!sidebarCollapsed && <span>{theme === "dark" ? (lang === "zh" ? "浅色" : "Light") : (lang === "zh" ? "深色" : "Dark")}</span>}
+          </button>
+          <button type="button" onClick={() => setDensity(density === "standard" ? "large" : "standard")} className="text-xs text-muted hover:text-foreground text-center border border-border rounded py-1 px-1" title={density === "standard" ? (lang === "zh" ? "切换大字" : "Use large text") : (lang === "zh" ? "切换标准字" : "Use standard text")}>
+            <Type size={15} className="inline" /> {!sidebarCollapsed && <span>{density === "standard" ? (lang === "zh" ? "大字" : "Large text") : (lang === "zh" ? "标准字" : "Standard text")}</span>}
+          </button>
+          <button type="button" onClick={() => setLang(lang === 'zh' ? 'en' : 'zh')} className="text-xs text-muted hover:text-foreground text-center border border-border rounded py-1 px-1" title={lang === 'zh' ? 'Switch to English' : '切换到中文'}>
+            <span>🌐</span>{!sidebarCollapsed && <span>{lang === 'zh' ? ' English' : ' 中文'}</span>}
+          </button>
+        </div>
       </aside>
 
       <main className="min-w-0 flex-1 p-3 md:p-4 xl:p-6 overflow-auto relative">
@@ -197,7 +203,7 @@ export default function Dashboard() {
           {tab === "contacts" && <ContactsView onChanged={load} />}
           {tab === "campaigns" && <CampaignsView onChanged={load} onNavigate={(tgt: Tab) => setTab(tgt)} />}
           {tab === "approvals" && <ApprovalsView onChanged={load} />}
-          {tab === "agent_profile" && <AgentProfileView />}
+          {tab === "agent_profile" && <AgentProfileView onChanged={load} />}
           {tab === "knowledge" && <KnowledgeBaseView />}
           {tab === "activity" && <ActivityView />}
           {tab === "agent_lab" && <ComparisonView onChanged={load} agents={health} />}

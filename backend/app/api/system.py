@@ -189,7 +189,7 @@ def restart_services(force: bool = False, db: Session = Depends(get_db)):
        ``force=true``.
     2. Writes a marker file (audit + idempotency guard for the watcher).
     3. Spawns a detached watcher (``scripts/start-restart-watcher.ps1``) that
-       performs ``stop-demo.ps1`` + ``start-demo.ps1`` once the backend exits.
+       performs ``stop-stack.ps1`` + ``start-stack.ps1`` once the backend exits.
     4. Exits the current backend process gracefully after 1 second.
 
     Returns immediately; the actual restart takes ~10-20s. Agents should poll

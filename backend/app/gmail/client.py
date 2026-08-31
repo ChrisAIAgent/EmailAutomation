@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import logging
 import socket
+import ssl
 import time
 from typing import Optional
 
@@ -17,6 +18,7 @@ from ..security import Cipher
 from .auth import build_credentials, maybe_refresh
 from .transport import (
     GmailTimeoutError,
+    GmailTransientNetworkError,
     GmailTransport,
     MessageDTO,
     ThreadDTO,
@@ -35,6 +37,27 @@ _BACKOFF = 1.5
 # a retriable server error. These must NOT be retried forever; they surface as a
 # recognizable GmailTimeoutError so the worker can fail the run and move on.
 _TIMEOUT_EXC = (socket.timeout, TimeoutError)
+
+
+def _is_transient_transport_error(exc: Exception) -> bool:
+    """Bounded retry eligibility for interrupted TLS/proxy connections.
+
+    Do not retry certificate validation or OAuth errors.  EOF/reset failures
+    occur before Gmail returns an application response and are safe to replay.
+    """
+    message = str(exc).lower()
+    if "certificate verify" in message or "certificat" in message and "verify" in message:
+        return False
+    if isinstance(exc, (ssl.SSLError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+        return True
+    return any(marker in message for marker in (
+        "unexpected_eof_while_reading",
+        "eof occurred in violation of protocol",
+        "connection reset",
+        "connection aborted",
+        "remote end closed connection",
+        "remote disconnected",
+    ))
 
 
 class RealGmailTransport(GmailTransport):
@@ -121,6 +144,7 @@ class RealGmailTransport(GmailTransport):
 
     def _call(self, fn):
         last = None
+        last_transient = None
         for attempt in range(_MAX_RETRIES):
             try:
                 self._ensure_service()
@@ -150,7 +174,25 @@ class RealGmailTransport(GmailTransport):
                         raise e2
                 if _is_timeout(e):
                     raise GmailTimeoutError(f"gmail_timeout: {type(e).__name__}: {e}") from e
+                if _is_transient_transport_error(e):
+                    last_transient = e
+                    # Keep logs credential-free: the exception class and fixed
+                    # category are sufficient for diagnostics.
+                    logger.warning(
+                        "gmail_transient_transport_error category=tls_or_connection "
+                        "attempt=%s/%s type=%s",
+                        attempt + 1, _MAX_RETRIES, type(e).__name__,
+                    )
+                    self._service = None
+                    if attempt < _MAX_RETRIES - 1:
+                        time.sleep(_BACKOFF * (attempt + 1))
+                        continue
+                    break
                 raise
+        if last_transient is not None:
+            raise GmailTransientNetworkError(
+                f"gmail_transport_retry_exhausted: {type(last_transient).__name__}"
+            ) from last_transient
         raise last or RuntimeError("Gmail API retry exhausted")
 
     # --- interface ---
@@ -169,7 +211,7 @@ class RealGmailTransport(GmailTransport):
         for t in res.get("threads", []):
             try:
                 threads.append(self.get_thread(t["id"]))
-            except GmailTimeoutError:
+            except (GmailTimeoutError, GmailTransientNetworkError):
                 # A single thread fetch exceeded the network timeout. The whole
                 # list op is wedged; re-raise immediately so we do NOT keep
                 # fetching the remaining threads (each would wait up to
@@ -248,15 +290,17 @@ class RealGmailTransport(GmailTransport):
     def archive_thread(self, thread_id):
         self._call(lambda s: s.users().threads().modify(userId="me", id=thread_id, body={"removeLabelIds": ["INBOX"]}).execute())
 
-    def list_history(self, start_history_id, label_id=None):
+    def list_history(self, start_history_id, label_id=None, page_token=None):
         req = {"userId": "me", "startHistoryId": start_history_id, "maxResults": 100}
         if label_id:
             req["labelId"] = label_id
+        if page_token:
+            req["pageToken"] = page_token
         res = self._call(lambda s: s.users().history().list(**req).execute())
         events = res.get("history", [])
         nxt = res.get("nextPageToken")
         new_hist = res.get("historyId")
-        return events, (new_hist or start_history_id)
+        return events, (new_hist or start_history_id), nxt
 
 
 def _is_timeout(e: BaseException) -> bool:

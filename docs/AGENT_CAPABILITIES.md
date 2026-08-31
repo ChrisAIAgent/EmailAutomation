@@ -29,12 +29,23 @@ Approve / Reject / Agent Decide.
 | Review Approvals | `ea_list_approvals` | `GET /api/approvals` | Read-only |
 | Review Automations | `ea_list_automations` | `GET /api/automation` | Read-only |
 | Review operating state | `ea_dashboard` | readiness, metrics, Inbox stats, scheduler | Read-only |
-| Review Inbox queue | `ea_list_inbox` | `GET /api/inbox/threads` | `contact_admission_uncertain` is Contact admission; `content_uncertain` requires human message-context review |
+| Review Inbox queue | `ea_list_inbox` | `GET /api/inbox/threads` | `contact_admission_uncertain` is Contact admission; `content_uncertain` is no-action automatically for an existing Contact. Use Inbox `unprocessed` for actual untriaged work; legacy `triage_review` records are already analyzed even if their display category is `unsorted`. |
 | Review Agent Run | `ea_get_agent_run` | `GET /api/agent-runs/{id}` | Read-only |
 | Generate live report | `ea_agent_report` | current read endpoints | Read-only aggregation |
-| Sync Gmail | `ea_sync_gmail` | `POST /api/gmail/sync` | Writes local data; explicit authorization |
+| Check first import | `ea_gmail_import_status` | `GET /api/gmail/imports/current` | Read-only; reports required/running/completed and progress |
+| Start first import | `ea_start_gmail_import` | `POST /api/gmail/imports` | Explicit user authorization; all normal mail, no AI sort or send |
+| Control first import | `ea_control_gmail_import` | `POST /api/gmail/imports/{id}/{pause|resume|cancel}` | Explicit user authorization; no send |
+| Check first history triage | `ea_initial_triage_status` | `GET /api/inbox/initial-triage/current` | Read-only progress and classification counters |
+| Start first history triage | `ea_start_initial_triage` | `POST /api/inbox/initial-triage` | Explicit authorization after first import; fixed local snapshot, no Draft/Approval/send |
+| Control first history triage | `ea_control_initial_triage` | `POST /api/inbox/initial-triage/{id}/{pause|resume|cancel|retry-failed}` | Explicit authorization; no send |
+| Check daily triage | `ea_daily_triage_status` | `GET /api/inbox/daily-triage/current` | Read current/latest frozen incremental snapshot and progress |
+| Start daily triage | `ea_start_daily_triage` | `POST /api/inbox/daily-triage` | Processes all currently untriaged new/changed threads; 50 is worker batch size only |
+| Control daily triage | `ea_control_daily_triage` | `POST /api/inbox/daily-triage/{id}/{pause|resume|cancel|retry-failed}` | Resumable, no Draft/Approval/send |
+| Read latest triage result | `ea_recent_triage_result` | `GET /api/inbox/triage/recent` | Read-only summary, timestamps and snapshot scope |
+| Sync Gmail changes | `ea_sync_gmail` | `POST /api/gmail/sync` | History API incremental only after first import; explicit authorization. A temporary TLS/proxy interruption is retried within a fixed bound; exhausted retries leave the History cursor unchanged for a safe later retry. |
+| Legacy Inbox sort alias | `ea_sort_inbox` | `POST /api/inbox/sort` | Compatibility alias for daily triage; never a 50-thread total cap |
 | Create Contact | `ea_create_contact` | `POST /api/contacts` | Admitted direct business customers only; a real person alone is insufficient |
-| Resolve Inbox review | REST only | `POST /api/inbox/threads/{id}/human-review` | For Contact admission: Approve opens manual entry, Reject filters exact email, Agent Decide needs clear identity and business relevance. For an existing Contact's `content_uncertain`, only explicit no-action confirmation is valid. |
+| Resolve Inbox review | REST only | Sender detail + `POST /api/inbox/threads/{id}/human-review` | Contact-admission decisions resolve the sender's current non-opt-out reviews together. Reject filters the exact email durably. Existing Contacts never receive triage `content_uncertain` prompts; such threads are recorded as no-action. |
 | Create Contact from Inbox form | REST only | `POST /api/inbox/threads/{id}/contact` | Completes Approve; no reply/send side effect |
 | Review/revoke non-customer filter | REST only | `GET/DELETE /api/inbox/non-customer-filters[/{id}]` | Separate from outbound Suppression |
 | Preview/import Contacts | `ea_import_contacts` | `POST /api/contacts/import` | Workspace CSV/XLSX only |
@@ -52,7 +63,7 @@ Approve / Reject / Agent Decide.
 ## Mandatory rules
 
 - Call the three health/status tools before a write action.
-- Write tools require `user_authorized=true` after explicit user authorization.
+- Direct TACWork write tools require `user_authorized=true` after explicit user authorization. A valid, active Agent Takeover capability is standing authorization for its allowed operating tools, except Contact admission which always remains human-only.
 - Before `ea_confirm_run`, show exact recipients, subject and full frozen body.
 - In `human_review`, do not represent a prepared Run as sent: wait for a person to confirm the exact frozen plan. In `agent_review`, `full_auto` may dispatch after server safeguards; never use it as a harmless test.
 - HTTP 200, queued/running, Draft or Approval creation is not proof of sending.
@@ -60,8 +71,18 @@ Approve / Reject / Agent Decide.
 - Contact admission always precedes sales reply and follow-up. `full_auto` does not bypass an unresolved admission decision.
 - Reject is a reversible CRM/Inbox exclusion by exact sender email. It is not unsubscribe, does not create Suppression, and does not authorize any send.
 - Approval Reject cancels its unsent Draft; Invalidate expires an obsolete or already-sent pending Approval and also cancels its unsent Draft. Neither action sends email.
-- `contact_admission_uncertain` offers Approve / Reject / Agent Decide. `content_uncertain` means special content (for example job, forwarded, or scripted content) cannot be safely classified; it creates no reply or send. For an existing Contact, the operator may confirm no action while keeping the Contact. `opt_out_confirmation` is a stop-contact decision. `stale_review` is cleared locally; none of these is an instruction for a human to reply.
+- `contact_admission_uncertain` offers Approve / Reject / Agent Decide and is resolved at sender level. `content_uncertain` means special content (for example job, forwarded, or scripted content) cannot be safely classified; it creates no reply or send. For an existing Contact it is automatically recorded as no-action and never appears in the review queue. `opt_out_confirmation` remains a stop-contact decision. `stale_review` is cleared locally; none of these is an instruction for a human to reply.
 - The bridge never reads or returns `.env`, model keys, OAuth tokens or Gmail credentials.
+- The first mailbox import is a one-time, user-authorized local ingestion of all
+  accessible mail excluding Spam/Trash. Scheduled takeover cannot start it. Once
+  complete, `ea_sync_gmail` is truly incremental; `cursor_expired` requires a new
+  explicit recovery decision and must never trigger a silent full rescan.
+- First-history Inbox triage is a separate user-authorized background task after
+  import completion. It processes only its frozen local snapshot in 50-thread
+  batches, supports pause/resume/cancel/retry, and must never be started by
+  scheduled takeover. It only classifies mail, filters noise and applies Contact
+  admission; it never creates Drafts, Approvals or sends mail.
+- Gmail OAuth setup is guided, not performed by the bridge: instruct the operator to create a Google **Desktop app** client, download `credentials.json`, then import it through **Agent Settings → Gmail Customer-Owned OAuth** and select Connect Gmail. Do not request a local path or file contents. A Web application client, Authorized JavaScript origins, and Authorized redirect URIs are not part of this product flow; tell the operator to create a new Desktop app client instead.
 - Knowledge categories are customer-defined. The eight UI suggestions are optional
   organization aids, not an industry schema or a license for the Agent to infer
   missing facts. Only the current Workspace's published documents are customer
@@ -71,8 +92,8 @@ OpenCode starts `scripts/mcp_server.py` with bundled Python. The transition defa
 API is `http://127.0.0.1:18000`; Electron/launchers always provide the selected
 loopback address through `EMAIL_AUTOMATION_API_URL`.
 For scheduled Agent Takeover, the bridge accepts the short-lived takeover grant
-only for Gmail sync, Inbox sort, the owner's Global Inbox Run, and its Run poll;
-it does not authorize Campaign/Profile/Knowledge writes, deletion, Contact
-admission, or bypassing any server safety gate. `logs/mcp-server.log` is the
+for Gmail incremental sync, daily triage creation/control/monitoring and the
+owner's Global Inbox Run. Contact admission remains human-only; the grant never
+bypasses any server safety gate. `logs/mcp-server.log` is the
 minimal local diagnostic for bridge startup and tool/protocol errors. It must never
 contain a grant, API key, OAuth credential, recipient, or email content.

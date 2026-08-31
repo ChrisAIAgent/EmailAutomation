@@ -113,6 +113,53 @@ def clear_stale_human_review(db, thread, *, owner_id: int, actor: str) -> bool:
     return True
 
 
+def reconcile_existing_contact_reviews(db, *, owner_id: int, actor: str = "system") -> int:
+    """Close legacy non-opt-out review items belonging to an existing Contact.
+
+    Contact admission is a sender-level decision.  Once a sender is already a
+    Contact, historical triage data must not continue to surface a manual-review
+    card for that sender.  An opt-out remains deliberately excluded because it
+    is a separate, explicit stop-contact decision.
+    """
+    contacts = {
+        (contact.email or "").strip().lower(): contact.id
+        for contact in db.query(models.Contact).filter_by(owner_id=owner_id).all()
+        if (contact.email or "").strip()
+    }
+    if not contacts:
+        return 0
+    rows = (
+        db.query(models.EmailThread)
+        .join(models.GmailAccount, models.EmailThread.gmail_account_id == models.GmailAccount.id)
+        .filter(
+            models.GmailAccount.user_id == owner_id,
+            models.EmailThread.pending_action == "human_review",
+        )
+        .all()
+    )
+    cleared = 0
+    for thread in rows:
+        email = (thread.contact_email or "").strip().lower()
+        if email not in contacts or thread.intent in {"unsubscribe", "opt_out"}:
+            continue
+        thread.pending_action = "no_action"
+        if thread.intent == "triage_review":
+            thread.last_agent_summary = "Existing Contact; uncertain content was retained as no action."
+        db.add(models.AuditLog(
+            actor=actor,
+            action="existing_contact_review_reconciled",
+            entity="email_thread",
+            entity_id=str(thread.id),
+            detail=(
+                f"contact_id={contacts[email]}; contact_email={email}; "
+                "result=no_action; opt_out_preserved=true"
+            ),
+            success=True,
+        ))
+        cleared += 1
+    return cleared
+
+
 def sales_reply_required(intent: str | None, tags: list[str]) -> bool:
     """A verified person and a sales-reply task are intentionally distinct."""
     return not requires_human_review(tags) and intent in {
@@ -363,17 +410,37 @@ _PROTECTED_NEXT_ACTIONS = {"human_review"}
 _PROTECTED_STATUSES = {"unsubscribed", "not_interested", "bounced"}
 
 
+def contact_is_terminal(contact) -> bool:
+    """Whether a Contact is explicitly ineligible for any reply/follow-up action.
+
+    This is deliberately shared by the Inbox API, automation worker and CRM
+    update path.  A terminal Contact must not remain actionable merely because
+    a historical thread still carries ``pending_action=reply``.
+    """
+    return bool(contact and (
+        contact.lifecycle_stage in _PROTECTED_REPLY_STAGES
+        or contact.status in _PROTECTED_STATUSES | {"archived"}
+        or contact.category == "invalid"
+    ))
+
+
+def normalize_terminal_contact_state(contact) -> bool:
+    """Clear stale operational actions after an explicit terminal CRM decision."""
+    if not contact_is_terminal(contact):
+        return False
+    changed = contact.next_action != "none" or contact.next_follow_up_at is not None
+    contact.next_action = "none"
+    contact.next_follow_up_at = None
+    return changed
+
+
 def contact_needs_reply(db, contact) -> bool:
     """Pure check (no writes): does this Contact have any live thread that is still
     awaiting our reply?  Mirrors _thread_category so the live answer matches the
     Inbox UI.  Terminal/review states are treated as not-needs-reply."""
     if contact is None:
         return False
-    if (
-        contact.lifecycle_stage in _PROTECTED_REPLY_STAGES
-        or contact.next_action in _PROTECTED_NEXT_ACTIONS
-        or contact.status in _PROTECTED_STATUSES
-    ):
+    if contact_is_terminal(contact) or contact.next_action in _PROTECTED_NEXT_ACTIONS:
         return False
     for t in db.query(models.EmailThread).filter_by(contact_email=contact.email).all():
         if _thread_category(t) == "needs_reply":
@@ -391,11 +458,8 @@ def recompute_contact_reply_state(db, contact) -> bool:
     """
     if contact is None:
         return False
-    if (
-        contact.lifecycle_stage in _PROTECTED_REPLY_STAGES
-        or contact.next_action in _PROTECTED_NEXT_ACTIONS
-        or contact.status in _PROTECTED_STATUSES
-    ):
+    if contact_is_terminal(contact) or contact.next_action in _PROTECTED_NEXT_ACTIONS:
+        normalize_terminal_contact_state(contact)
         return False
     threads = db.query(models.EmailThread).filter_by(contact_email=contact.email).all()
     needs = any(_thread_category(t) == "needs_reply" for t in threads)

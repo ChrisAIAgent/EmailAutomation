@@ -36,6 +36,49 @@ def test_contact_partial_update_preserves_omitted_fields(client):
     assert updated["next_action"] == "reply"
 
 
+def test_terminal_contact_update_clears_stale_reply_action(client):
+    created = client.post("/api/contacts", json={
+        "email": "terminal@example.com", "first_name": "Terminal",
+        "category": "qualified", "next_action": "reply",
+    }).json()
+
+    response = client.put(
+        f"/api/contacts/{created['id']}",
+        json={"category": "invalid", "lifecycle_stage": "stopped"},
+    )
+
+    assert response.status_code == 200
+    updated = response.json()
+    assert updated["lifecycle_stage"] == "stopped"
+    assert updated["next_action"] == "none"
+
+
+def test_generate_reply_rejects_terminal_contact_before_agent_or_draft(client, db):
+    account = models.GmailAccount(user_id=1, email="owner@example.com", is_connected=True)
+    contact = models.Contact(
+        owner_id=1, email="terminal-reply@example.com", category="invalid",
+        lifecycle_stage="stopped", next_action="reply",
+    )
+    db.add_all([account, contact]); db.flush()
+    thread = models.EmailThread(
+        gmail_account_id=account.id, gmail_thread_id="terminal-reply-thread",
+        contact_email=contact.email, pending_action="reply",
+    )
+    db.add(thread); db.flush()
+    db.add(models.EmailMessage(
+        thread_id=thread.id, gmail_message_id="terminal-reply-message",
+        from_email=contact.email, to_email=account.email, subject="Re: Test",
+        body_text="Question", is_incoming=True,
+    ))
+    db.commit()
+
+    response = client.post(f"/api/inbox/threads/{thread.id}/generate-reply")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "contact_not_eligible_for_reply"
+    assert db.query(models.Approval).count() == 0
+
+
 def test_contextual_reply_preserves_subject_and_addresses_customer_questions():
     with patch(
         "app.agents.langgraph_agent._llm_reply",

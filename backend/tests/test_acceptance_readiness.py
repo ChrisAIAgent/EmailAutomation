@@ -131,6 +131,23 @@ def test_html_body_extracted_as_readable_text():
     assert dto.body_html and "<p>" in dto.body_html
 
 
+def test_html_body_extraction_omits_style_script_and_jsonld():
+    html_body = """
+    <html><head><style>@import url('https://fonts.example'); body { color: red; }</style>
+    <script type='application/ld+json'>{\"@type\":\"EmailMessage\"}</script></head>
+    <body><p>Hello <b>Customer</b></p><p>Useful update</p></body></html>
+    """
+    dto = parse_gmail_message(
+        _gmail_msg("B <b@test.com>", "A <a@test.com>", "html", html_body, html=True),
+        owner_email="a@test.com",
+    )
+    assert "Hello Customer" in dto.body_text
+    assert "Useful update" in dto.body_text
+    assert "@import" not in dto.body_text
+    assert "color: red" not in dto.body_text
+    assert "EmailMessage" not in dto.body_text
+
+
 def test_intent_heuristic_matches_qa_emails():
     cases = {
         "有兴趣，请发一下报价。": "interested",
