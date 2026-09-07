@@ -1,5 +1,25 @@
 # Agent Operations Manual
 
+## Gmail deployment recovery (2026-09-06)
+
+- Production Gmail operations fail with `gmail_credentials_unavailable` if
+  credentials cannot be used. Do not report an empty mailbox or successful
+  import in this case. Reconnect through the local OAuth UI. In-memory Gmail
+  is reserved for explicitly enabled offline tests/development.
+- Quota, authorization, server and parse failures preserve the durable sync
+  cursor. Retry the failed operation; never manually advance the cursor to
+  the latest profile value. A deleted thread (HTTP 404) may be skipped.
+- First-import status includes `phase=scanning|history_replay|completed`.
+  The final scan page commits `scan_completed` with its data. Resume the same
+  failed Run to replay History without re-scanning completed pages. Upgraded
+  legacy Runs without this marker conservatively scan again; do not infer
+  completeness from an empty page token.
+- Backend health includes `instance.install_root` and `instance.data_root`.
+  Startup recovery checks both plus process ownership. A healthy service in
+  another installation or data directory must be reported as a conflict, not
+  adopted. Older services without identity require an explicit controlled stop.
+
+
 > `AGENTS.md` is authoritative for modes, safety gates and send reporting. This
 > document contains procedures only; MCP mappings are in `AGENT_CAPABILITIES.md`.
 
@@ -359,6 +379,34 @@ logs/frontend-error.log
 ```
 
 不要通过删除记录、编辑数据库或修改 `.env` 修复运营问题。
+
+## 7.5 人工按需诊断（Manual on-demand diagnostics）
+
+诊断**只由用户主动触发**，当前 Agent 不自动调用诊断：
+
+- 前端「系统诊断」页：手动【开始体检】→ 异常项【诊断此项】；
+- Electron 启动失败页：【查看诊断报告】（本地取证 + 后端可达时合并结果）；
+- 没有任何定时诊断、页面挂载自动请求或 MCP 诊断工具
+  （`ea_diagnostics_status` / `ea_investigate_diagnostics` 未注册，REST 接口
+  仅为未来 Agent Native 接入预留）。
+
+诊断**只读，不自动修复**：
+
+- `GET /api/system/diagnostics` 回答"哪个环节坏了"；`POST /api/system/diagnostics/investigate`
+  回答"为什么坏"（11 个目标或 `system`）；
+- 不创建目录、不写探针文件、不改数据库/配置/Token/队列；不刷新 OAuth 令牌、
+  不调用 Gmail；`RESTRICTED_RECIPIENT_ALLOWLIST` 为空属允许配置，不是错误；
+- `remedies[].requires_confirmation=true` 仅表示"该建议需人工确认后由人执行"，
+  系统不会执行任何修复动作；
+- `unknown` 状态表示"无法确认根因，需要重试或查看日志"，绝不表示正常；
+- 证据统一脱敏（令牌/密钥/OAuth URL 参数 → `***REDACTED***`，邮箱/用户目录/
+  绝对路径掩码，不输出邮件正文、收件人列表和原始 launcher stderr）；
+- 唯一允许的诊断产物是落盘的脱敏报告
+  `%LOCALAPPDATA%\TAC AISolution\Email Automation\logs\diagnostics-report.json`；
+  落盘不代表执行了修复。
+
+排查某次请求级 Bug 时，带稳定 `X-Request-ID` 调用接口，再在诊断报告中查看
+同 `tid` 的后端日志行即可串联全链路。
 
 ## 8. 结果报告
 

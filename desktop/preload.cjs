@@ -6,4 +6,6 @@ contextBridge.exposeInMainWorld("emailAutomation", Object.freeze({
   quitAndStop: () => ipcRenderer.invoke("quit-and-stop"),
   reload: () => ipcRenderer.invoke("reload-window"),
   getRuntimeStatus: () => ipcRenderer.invoke("runtime-status"),
+  getDiagnostics: () => ipcRenderer.invoke("diagnostics"),
+  investigate: (target) => ipcRenderer.invoke("diagnostics-investigate", target || "system"),
 }));

@@ -498,6 +498,78 @@ tokens, credentials, recipients, or message bodies. MCP telemetry is best effort
 a telemetry failure is reportable but must not block an otherwise authorized
 Gmail-sync, Inbox-sort, Global-Run, or run-poll operation.
 
+**Diagnostics are on-demand only — never polled.** Automatic/periodic diagnostics
+are deliberately NOT implemented: they add recurring API load on customer machines
+without helping anyone locate a fault. Both diagnostic endpoints run exclusively
+when an operator clicks, and nothing may call them on a timer.
+
+**Manual health overview (`GET /api/system/diagnostics`).** One call returns a
+structured, real-data probe of every subsystem that can fail silently:
+runtime data dir, database, Huey consumer/queue, Gmail OAuth (token-expiry warn),
+AI/LLM config, scheduler loop (heartbeat age vs `interval*3`), enabled automations
+(stuck detection), TACWork/agent-takeover connection, knowledge retriever, sending
+safety (real-send + `RESTRICTED_RECIPIENT_ALLOWLIST`), and disk free space. Each item carries
+`status` (ok|warn|error|info), a `detail`, and an optional `remedy`; the aggregate
+`overall` is `error` if any error, `degraded` if any warn, `unknown` if the
+overview itself failed to execute, else `ok`. It answers
+"which link is broken?" only — the UI runs it from the **系统诊断 / Diagnostics**
+tab after the operator clicks the health-check button (there is no on-mount fetch).
+Diagnostics are **strictly read-only**: no directory creation, no write probes
+(the old `.ea_write_test` file is gone), no DB/config/token/queue mutation, and
+no Gmail API calls (token state is inspected from stored fields only; refresh is
+never triggered). An empty `RESTRICTED_RECIPIENT_ALLOWLIST` is a supported
+configuration, not an error.
+
+**Root-cause investigation (`POST /api/system/diagnostics/investigate`).** Given
+`{target, incident_id?}`, this answers "WHY is this link broken?". `target` is
+`"system"` (investigate every link the overview flags as error/warn) or one of the
+11 diagnostic item ids. Returns `reports[]`, each with `status`
+(confirmed|suspected|healthy|unknown), `root_cause`, `root_cause_label`,
+`confidence`, `summary`, `evidence[]` (source + finding, from heartbeats, process
+existence, log tails and config facts), `remedies[]` and `next_checks[]`. It is
+read-only, and never executes a repair: every remedy carries
+`requires_confirmation`, which only means "a human should confirm before doing
+this manually" — the system never performs the action itself. Passing an
+`X-Request-ID` also attaches that request's backend log lines as evidence, which
+is the fastest way to trace a specific bug.
+
+**Report redaction (backend + Electron share the same rules).** Evidence is
+redacted before it reaches a user or a report file: tokens, API keys, secrets
+and OAuth URL parameters (`code=`, `state=`, `access_token=`, …) become
+`***REDACTED***`; email addresses are masked (`pyx***@gmail.com`); Windows/POSIX
+user directories and absolute paths are masked (the data/app roots become
+`<dataRoot>`/`<appRoot>` placeholders, everything else `<path>`); raw launcher
+stderr is never emitted (only its existence and size); log tails, per-finding
+length and the total evidence count are all capped. `unknown` reports always
+mean "root cause could not be confirmed — retry or check the logs", never
+"healthy". `<dataDir>\logs\diagnostics-report.json` (the persisted, redacted
+report) is the ONLY diagnostic artifact; writing it does not constitute a repair.
+
+**Electron bootstrap failures** are a separate surface: when startup fails the
+backend is usually unreachable, so `desktop/main.cjs` performs a local
+investigation (`desktop.log` event sequence, launcher stderr presence, port
+occupancy, log tails) and the fatal screen offers **查看诊断报告 / View diagnostic
+report**. It merges backend results when the backend happens to be up, and writes
+`<dataDir>\logs\diagnostics-report.json`. A failed investigation keeps the
+previous report on screen and shows "本次调查失败".
+This chain reflects the **application backend only** — it does not cover the
+Electron bootstrap itself (runtime integrity check, PowerShell launch timeout),
+which still surfaces via `showFatal()` and `desktop.log`.
+
+**Agent boundary (current round).** The Agent does NOT call diagnostics on its
+own: no MCP tools (`ea_diagnostics_status`, `ea_investigate_diagnostics`, …) are
+registered, there is no scheduled/automatic diagnosis, and the two REST endpoints
+above are reserved as the future Agent-Native interface only. Diagnostics run
+exclusively when a human triggers them (Diagnostics page button, per-item
+investigation, or the Electron fatal-screen entry; the ErrorBoundary's
+"打开系统诊断" button only navigates — it never runs a check).
+
+**Request correlation.** Every backend log line carries `[tid=<trace_id>]`. The
+HTTP middleware reads an inbound `X-Request-ID` header (or mints a 12-hex id when
+absent), binds it to the request, and echoes it back on the response. When tracing
+a bug end-to-end, pass a stable `X-Request-ID` and grep `backend.log` for
+`tid=<that id>` to follow one request across every subsystem.
+
 The Agent Settings page configures Email Automation LangGraph's OpenAI-compatible Base URL, model and encrypted API key. TACWork conversation AI is currently configured separately in TACWork's own Web UI; do not claim that changing Email Agent Settings also configures TACWork. Read APIs return only configured status and never return keys. Restart the unified service after changing the Email provider before treating the new runtime configuration as active.
 
 - In the installed product, use `Email Automation.exe` as the single startup entry.

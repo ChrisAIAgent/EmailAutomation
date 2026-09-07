@@ -97,3 +97,15 @@ owner's Global Inbox Run. Contact admission remains human-only; the grant never
 bypasses any server safety gate. `logs/mcp-server.log` is the
 minimal local diagnostic for bridge startup and tool/protocol errors. It must never
 contain a grant, API key, OAuth credential, recipient, or email content.
+
+## Diagnostics: future Agent-Native interface (reserved, not implemented)
+
+Diagnostics are currently human-triggered only. The REST endpoints
+`GET /api/system/diagnostics` and `POST /api/system/diagnostics/investigate`
+are **reserved as the future Agent-Native interface**; no MCP diagnostic tools
+(`ea_diagnostics_status`, `ea_investigate_diagnostics`, …) are registered in
+this round, and the Agent must not call diagnostics on its own, on a schedule,
+or as part of takeover monitoring. If/when Agent Native diagnosis is introduced,
+it must reuse these endpoints, stay read-only, never auto-repair
+(`requires_confirmation` means "a human executes it"), and render every evidence
+item through the shared redaction rules.

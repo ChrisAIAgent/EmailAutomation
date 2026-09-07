@@ -1,5 +1,5 @@
 // Frontend API client. All data comes from the backend (DB + real runs).
-declare global { interface Window { __EMAIL_AUTOMATION_RUNTIME__?: { apiUrl?: string; tacworkUrl?: string; tacworkServerUrl?: string; version?: string }; emailAutomation?: { openExternal: (url: string) => Promise<unknown>; openLogs: () => Promise<unknown>; repair: () => Promise<unknown>; quitAndStop: () => Promise<unknown>; getRuntimeStatus: () => Promise<unknown> } } }
+declare global { interface Window { __EMAIL_AUTOMATION_RUNTIME__?: { apiUrl?: string; tacworkUrl?: string; tacworkServerUrl?: string; version?: string }; emailAutomation?: { openExternal: (url: string) => Promise<unknown>; openLogs: () => Promise<unknown>; repair: () => Promise<unknown>; quitAndStop: () => Promise<unknown>; getRuntimeStatus: () => Promise<unknown>; getDiagnostics: () => Promise<unknown> } } }
 const runtimeConfig = typeof window !== "undefined" ? window.__EMAIL_AUTOMATION_RUNTIME__ : undefined;
 export const API_BASE = runtimeConfig?.apiUrl || process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:18000";
 
@@ -213,6 +213,16 @@ export const api = {
   setPause: (paused: boolean) =>
     req<any>(`/api/system/pause?paused=${paused}`, { method: "POST" }),
 
+  // Diagnostics are strictly manual. Nothing may poll these endpoints.
+  // `diagnostics` is the health overview; `investigate` performs on-demand
+  // root-cause analysis of one broken link (or of every failing link).
+  diagnostics: () => req<DiagnosticReport>("/api/system/diagnostics", undefined, 15_000),
+  investigate: (target: string, incidentId?: string) =>
+    req<InvestigateReport>("/api/system/diagnostics/investigate", {
+      method: "POST",
+      body: JSON.stringify({ target, incident_id: incidentId || null }),
+    }, 60_000),
+
   agentTakeover: () => req<any>("/api/agent-takeover"),
   updateAgentTakeover: (enabled: boolean, intervalMinutes: number, displayTimezone?: string) =>
     req<any>("/api/agent-takeover", { method: "POST", body: JSON.stringify({ enabled, interval_minutes: intervalMinutes, display_timezone: displayTimezone }) }),
@@ -263,4 +273,54 @@ export type Metrics = {
   draft_only: boolean;
   openclaw_connected: boolean;
   langgraph_configured: boolean;
+};
+
+// Unified diagnostic chain (mirrors backend/app/diagnostics.py DiagnosticResult).
+export type DiagnosticItem = {
+  id: string;
+  category: string;
+  label: string;
+  status: "ok" | "warn" | "error" | "info";
+  detail: string;
+  remedy: string | null;
+  latency_ms: number;
+  ts: string;
+};
+
+export type DiagnosticReport = {
+  generated_at: string;
+  overall: "ok" | "degraded" | "error";
+  counts: { ok: number; warn: number; error: number; info: number };
+  items: DiagnosticItem[];
+  by_category?: Record<string, DiagnosticItem[]>;
+};
+
+// On-demand root-cause investigation (mirrors backend/app/diagnostics_investigate.py).
+export type InvestigateEvidence = { source: string; finding: string };
+export type InvestigateRemedy = {
+  action: string;
+  label: string;
+  risk: "low" | "medium" | "high";
+  requires_confirmation: boolean;
+};
+export type InvestigateItemReport = {
+  target: string;
+  status: "confirmed" | "suspected" | "healthy" | "unknown";
+  root_cause: string | null;
+  root_cause_label: string | null;
+  confidence: "high" | "medium" | "low" | null;
+  summary: string;
+  evidence: InvestigateEvidence[];
+  remedies: InvestigateRemedy[];
+  next_checks: string[];
+  // Client-side stamp of when this report was fetched (not sent by the backend).
+  investigated_at?: string;
+};
+export type InvestigateReport = {
+  incident_id: string;
+  target: string;
+  generated_at: string;
+  trace_id: string | null;
+  backend_up: boolean;
+  reports: InvestigateItemReport[];
 };
