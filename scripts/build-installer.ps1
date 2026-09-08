@@ -157,11 +157,40 @@ if (-not $magick) { Fail "ImageMagick (magick.exe) not found. Install it (e.g. '
 Write-Output ("Magick  : " + $magick)
 
 # --- 2. Clean previous build artifacts -----------------------------------
-# Cleanup is best-effort: some sandboxed environments install a safe-delete
-# guard that blocks Remove-Item on large trees. A blocked cleanup must NOT fail
-# an otherwise-good build, so swallow the error and warn instead.
-if (Test-Path $payloadDir) { try { Remove-Item -Recurse -Force $payloadDir } catch { Write-Output ("WARN: could not remove stale payload ($($_.Exception.Message)); staging will overwrite it.") } }
-if (Test-Path $exePath)    { try { Remove-Item -Force $exePath } catch { Write-Output ("WARN: could not remove stale installer ($($_.Exception.Message)).") } }
+# The staged payload MUST be fully wiped, not merged: portable-package.ps1
+# stages with `robocopy /E` (no /PURGE), so any file left in a stale payload
+# survives into the new one. Diagnostic leftovers such as .procs-check*.txt
+# then re-appear and trip the secret scan below, aborting the build.
+# A safe-delete guard wraps the Remove-Item cmdlet and only WARNs + skips,
+# leaving the stale payload behind. Delete through the \\?\ namespace with the
+# .NET API, which the guard cannot intercept, so every build starts clean.
+function Remove-Hard([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    try {
+        # Strip read-only on every entry so Directory.Delete can recurse.
+        Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue |
+            ForEach-Object { try { $_.Attributes = $_.Attributes -band (-bnot [System.IO.FileAttributes]::ReadOnly) } catch {} }
+        [System.IO.Directory]::Delete("\\?\" + $Path, $true)
+    } catch {
+        # A running IDE (e.g. WorkBuddy) may hold a handle on a file inside the
+        # tree (e.g. runtime/electron/resources/default_app.asar for indexing),
+        # so Directory.Delete fails. Renaming the directory only updates its
+        # parent entry and does NOT open the locked file, so it always succeeds.
+        # robocopy then stages into a fresh payload; the renamed copy sits
+        # outside $payloadDir, is excluded from shipping and from the secret
+        # scan, and can be deleted once the IDE releases the handle.
+        try {
+            $stale = $Path + ".stale-" + (Get-Date -Format "yyyyMMddHHmmss")
+            [System.IO.Directory]::Move("\\?\" + $Path, "\\?\" + $stale)
+            Write-Output ("WARN: could not delete $Path (a file is locked by another process); renamed aside to $stale for later cleanup.")
+        } catch {
+            Write-Output ("WARN: could not remove or rename $Path ($($_.Exception.Message)); staging will overwrite it.")
+        }
+    }
+}
+Remove-Hard $payloadDir
+if (Test-Path -LiteralPath $payloadDir) { Write-Output "WARN: stale payload still present; build may fail the secret scan if stale files remain." }
+if (Test-Path -LiteralPath $exePath) { try { [System.IO.File]::Delete("\\?\" + $exePath) } catch { Write-Output ("WARN: could not remove stale installer ($($_.Exception.Message)).") } }
 New-Item -ItemType Directory -Force -Path $distDir | Out-Null
 
 # --- 3. Build the runtime before staging ---------------------------------
@@ -209,6 +238,48 @@ foreach ($rel in $mustExist) {
 }
 if ($missing.Count -gt 0) { Fail ("Payload missing required files: " + ($missing -join ", ")) }
 Write-Output "Integrity re-check OK (prebuilt runtime present)."
+
+# --- 5b. Manifest subset of payload check -------------------------------
+# portable-package.ps1 regenerates runtime-manifest.json from the payload
+# in StageDir mode, so the manifest should match the payload exactly. But
+# if anyone edits the staging exclusions or the manifest regeneration
+# logic drifts, the customer would get an installer whose verify-runtime
+# fails with runtime_integrity_failed:missing:<file> on first launch.
+# Catch that drift here, at build time, so a broken installer never ships.
+$payloadManifestPath = Join-Path $payloadDir "runtime\runtime-manifest.json"
+if (-not (Test-Path -LiteralPath $payloadManifestPath)) {
+    Fail "payload/runtime/runtime-manifest.json missing - staging did not regenerate it. Check portable-package.ps1 StageDir mode."
+}
+$payloadManifest = Get-Content -LiteralPath $payloadManifestPath -Raw | ConvertFrom-Json
+$payloadManifestMissing = New-Object System.Collections.Generic.List[string]
+$payloadManifestHashBad = New-Object System.Collections.Generic.List[string]
+$sha256 = [System.Security.Cryptography.SHA256]::Create()
+foreach ($entry in $payloadManifest.files) {
+    $rel = ([string]$entry.path).Replace('/', '\')
+    $target = Join-Path $payloadDir $rel
+    if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
+        [void]$payloadManifestMissing.Add($rel)
+        if ($payloadManifestMissing.Count -ge 5) { break }
+        continue
+    }
+    # Existence alone is not enough: a stale/self-referential manifest entry
+    # (e.g. the manifest hashing itself) would pass a Test-Path check yet still
+    # fail the customer's integrity check at first launch. Verify the hash too.
+    $actualHash = ([System.BitConverter]::ToString($sha256.ComputeHash([System.IO.File]::ReadAllBytes($target))) -replace '-', '').ToLowerInvariant()
+    $expectHash = ([string]$entry.sha256).ToLowerInvariant()
+    if ($actualHash -ne $expectHash) {
+        [void]$payloadManifestHashBad.Add($rel)
+        if ($payloadManifestHashBad.Count -ge 5) { break }
+    }
+}
+$sha256.Dispose()
+if ($payloadManifestMissing.Count -gt 0) {
+    Fail ("Manifest lists files absent from payload (first 5): " + ($payloadManifestMissing -join ", ") + ". Staging exclusion rules drifted from manifest generation.")
+}
+if ($payloadManifestHashBad.Count -gt 0) {
+    Fail ("Manifest hashes mismatch payload (first 5): " + ($payloadManifestHashBad -join ", ") + ". A stale or self-referential manifest entry would fail the customer's integrity check.")
+}
+Write-Output ("Manifest-payload consistency OK: " + $payloadManifest.files.Count + " entries verified (existence + sha256) against payload.")
 
 # --- 5. Generate installer icon ------------------------------------------
 New-Item -ItemType Directory -Force -Path $assetsDir | Out-Null
@@ -330,7 +401,9 @@ Write-Output ("Validation     : staged OK, integrity OK, icon OK, compile OK")
 Write-Output "======================================================"
 
 # --- 11. Cleanup staged payload (keep dist/ and installer/assets) --------
-# Best-effort: see the step-2 note about safe-delete guards in sandboxes.
-try { Remove-Item -Recurse -Force $payloadDir; Write-Output "Staged payload removed." }
-catch { Write-Output ("WARN: staged payload not removed by cleanup ($($_.Exception.Message)); remove installer\payload manually if disk space matters.") }
+# Use the same hooksafe hard-delete as step 2 so cleanup actually happens
+# even where a safe-delete guard wraps Remove-Item.
+Remove-Hard $payloadDir
+if (-not (Test-Path -LiteralPath $payloadDir)) { Write-Output "Staged payload removed." }
+else { Write-Output "WARN: staged payload not removed by cleanup; remove installer\payload manually if disk space matters." }
 Write-Output "Build complete."

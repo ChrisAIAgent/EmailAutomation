@@ -15,8 +15,12 @@ function Test-WorkspaceProcess {
     if (-not $ProcessId) { return $false }
     $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
     if (-not $proc) { return $false }
-    $identity = "{0} {1}" -f $proc.ExecutablePath, $proc.CommandLine
-    return $identity -like "*$rootPath*"
+    $prefix = $rootPath.TrimEnd('\', '/') + '\'
+    if ($proc.ExecutablePath -and ([string]$proc.ExecutablePath).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+    $pattern = '(?i)(?:^|["\s])' + [regex]::Escape($prefix)
+    return [bool]($proc.CommandLine -and ([string]$proc.CommandLine -match $pattern))
 }
 
 if (Test-Path $pidPath) {
@@ -61,7 +65,8 @@ foreach ($entry in $groupPorts) {
     if (-not $proc) { continue }
     $identity = ("{0} {1}" -f $proc.ExecutablePath, $proc.CommandLine)
     $expectedDataRoot = $global:DataRoot
-    if ($identity -like "*$rootPath*" -and ($identity -like "*$expectedDataRoot*" -or $identity -like "*EMAIL_AUTOMATION_DATA_DIR*")) {
+    $dataPattern = '(?i)(?:^|["\s=])' + [regex]::Escape($expectedDataRoot.TrimEnd('\', '/')) + '(?:[\\/"\s]|$)'
+    if ((Test-WorkspaceProcess $listenerPid) -and ($identity -match $dataPattern)) {
         Stop-Process -Id $listenerPid -Force -ErrorAction SilentlyContinue
         Write-Output "Stopped stale own service ($($entry.Name)): pid=$listenerPid name=$($proc.Name)"
     }

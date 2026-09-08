@@ -33,7 +33,7 @@ def _thread(index: int) -> ThreadDTO:
 def _account(db):
     account = models.GmailAccount(
         id=1, user_id=1, email="owner@example.com", is_connected=True,
-        history_id="1000",
+        history_id="900",
     )
     db.add(account)
     db.flush()
@@ -105,7 +105,7 @@ def test_incremental_history_pages_fetch_only_unique_affected_threads(db, monkey
     account = _account(db)
     db.add(models.GmailSyncRun(
         owner_id=1, gmail_account_id=account.id, kind="initial_full",
-        status="completed", start_history_id="900", latest_history_id="1000",
+        status="completed", start_history_id="900", latest_history_id="900",
     ))
     db.commit()
 
@@ -166,3 +166,36 @@ def test_initial_import_api_is_resumable_and_single_inflight(client, db, monkeyp
     cancelled = client.post(f"/api/gmail/imports/{run_id}/cancel").json()
     assert cancelled["run"]["status"] == "cancelled"
     assert sync_svc.initial_import_completed(db, account.id) is False
+
+
+def test_populated_import_replay_failure_does_not_duplicate_scan(db, monkeypatch):
+    account = _account(db)
+    run = models.GmailSyncRun(owner_id=1, gmail_account_id=account.id,
+                             kind="initial_full", status="queued")
+    db.add(run)
+    db.commit()
+    pages = []
+    replay_calls = []
+    class Layer(PagedToolLayer):
+        def search_threads(self, *args, **kwargs):
+            pages.append(kwargs.get("page_token"))
+            return super().search_threads(*args, **kwargs)
+        def list_history(self, *args, **kwargs):
+            replay_calls.append(1)
+            if len(replay_calls) == 1:
+                raise RuntimeError("simulated_replay_failure")
+            return super().list_history(*args, **kwargs)
+    monkeypatch.setattr(tasks, "UnifiedEmailToolLayer", Layer)
+    monkeypatch.setattr(sync_svc, "UnifiedEmailToolLayer", Layer)
+    assert not tasks.execute_gmail_initial_import.call_local(run.id)["ok"]
+    db.expire_all()
+    assert run.scan_completed and run.threads_scanned == 205
+    assert account.history_id == "900"
+    run.status = "queued"
+    db.commit()
+    assert tasks.execute_gmail_initial_import.call_local(run.id)["ok"]
+    db.expire_all()
+    assert pages == [None, "100", "200"]
+    assert run.threads_scanned == 205 and run.new_messages == 205
+    assert db.query(models.EmailMessage).count() == 205
+    assert account.history_id == "2000"

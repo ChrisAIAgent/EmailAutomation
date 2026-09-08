@@ -233,9 +233,8 @@ def _load_or_create_security(config_dir: Path) -> dict:
     return data
 
 
-@lru_cache
-def get_settings() -> Settings:
-    s = Settings()
+def _load_desktop_oauth_into(s: Settings) -> None:
+    """Apply Desktop OAuth configuration without creating local credentials."""
     # Installed runtimes read customer-owned Desktop OAuth configuration from
     # the same current-user DPAPI store used by Backend and Consumer.
     try:
@@ -249,6 +248,24 @@ def get_settings() -> Settings:
         # Status endpoints surface credential_key_unavailable; application import
         # remains available so the user can repair or re-authorize.
         pass
+
+
+def get_diagnostic_settings() -> Settings:
+    """Return a configuration snapshot suitable for strictly read-only probes.
+
+    Normal startup intentionally initializes the per-user DPAPI security store
+    when it is absent. Manual diagnostics must report that state without
+    creating ``credentials.dat`` merely because an operator opened a report.
+    """
+    s = Settings()
+    _load_desktop_oauth_into(s)
+    return s
+
+
+@lru_cache
+def get_settings() -> Settings:
+    s = Settings()
+    _load_desktop_oauth_into(s)
     keys = _load_or_create_security(_DATA.config)
     if not s.APP_ENCRYPTION_KEY and keys.get("encryption_key"):
         s.APP_ENCRYPTION_KEY = keys["encryption_key"]

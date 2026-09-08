@@ -14,7 +14,7 @@ from .. import models
 from ..config import _DATA, get_settings, is_gmail_configured
 from ..errors import ApiError
 from ..events import publish
-from ..gmail import auth
+from ..gmail import auth, clear_transport_cache
 from ..security import Cipher, redact_for_log
 from ..services import sync as sync_svc
 from .. import oauth_config as oauth_config_svc
@@ -186,6 +186,11 @@ def oauth_callback(code: str = Query(...), state: str = Query(...), db: Session 
         detail="enabled_by_verified_gmail_oauth_connection",
     ))
     db.commit()
+    # Drop any transport cached before this connection. Without this, a
+    # long-lived process keeps reusing the in-memory demo double that was
+    # cached while the account was disconnected, and the app persists its fake
+    # historyId (1000) as if Gmail had reported it.
+    clear_transport_cache(account.id)
     logger.info("Gmail connected: %s (access %s)", email, redact_for_log(result.access_token))
     return HTMLResponse(
         "<!doctype html><meta charset='utf-8'><title>Gmail connected</title>"
@@ -203,6 +208,9 @@ def _sync_run_out(run: models.GmailSyncRun | None, db: Session, account_id: int 
     return {
         "run": {
             "id": run.id, "kind": run.kind, "status": run.status,
+            "phase": "completed" if run.status == "completed" else (
+                "history_replay" if run.scan_completed else "scanning"
+            ),
             "threads_scanned": run.threads_scanned,
             "new_threads": run.new_threads, "new_messages": run.new_messages,
             "failures": run.failures, "error": run.error,
@@ -345,12 +353,23 @@ def sync(db: Session = Depends(get_db), full_scan: bool = False):
         db.rollback()
         run = db.get(models.GmailSyncRun, run.id)
         message = str(e)
-        cursor_expired = "404" in message or "historyid" in message.lower() and "invalid" in message.lower()
+        # A demo/stale cursor was persisted before OAuth completed. It cannot be
+        # replayed (Gmail 404s it), so surface an explicit "re-import required"
+        # instead of the generic failure path, and do not poison the run's
+        # status with a fabricated cursor_expired that would loop forever.
+        needs_import = "initial_import_required" in message.lower()
+        cursor_expired = (not needs_import) and (
+            "404" in message or ("historyid" in message.lower() and "invalid" in message.lower())
+        )
         run.status = "cursor_expired" if cursor_expired else "failed"
-        run.error = "gmail_history_cursor_expired" if cursor_expired else message[:1000]
+        run.error = ("gmail_history_cursor_expired" if cursor_expired else message[:1000])
         run.finished_at = datetime.now(timezone.utc)
         db.commit()
         logger.warning("Gmail sync failed: %s", e)
+        if needs_import:
+            raise ApiError(409, "INITIAL_IMPORT_REQUIRED",
+                           "The saved Gmail history cursor is invalid (stale pre-connection value). "
+                           "Run a full mailbox import to re-establish a valid cursor.")
         code = "GMAIL_HISTORY_CURSOR_EXPIRED" if cursor_expired else "GMAIL_SYNC_FAILED"
         raise ApiError(409 if cursor_expired else 502, code,
                        "Gmail incremental cursor expired; a user-authorized history import is required."

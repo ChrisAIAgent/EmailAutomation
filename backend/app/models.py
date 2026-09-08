@@ -148,6 +148,9 @@ class GmailSyncRun(TimestampMixin, Base):
     query = Column(String(500), nullable=True)
     include_spam_trash = Column(Boolean, default=False, nullable=False)
     page_token = Column(Text, nullable=True)
+    # NULL on upgraded rows is conservatively treated as not yet scanned.
+    # Commit with the final page so replay recovery never redoes the sweep.
+    scan_completed = Column(Boolean, default=False, nullable=True)
     start_history_id = Column(String(50), nullable=True)
     latest_history_id = Column(String(50), nullable=True)
     threads_scanned = Column(Integer, default=0, nullable=False)

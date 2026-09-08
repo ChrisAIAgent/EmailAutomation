@@ -5,11 +5,23 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-# Some terminal hosts inject both Path and PATH. Windows treats them as the
-# same variable, but Windows PowerShell 5.1 Start-Process rejects the duplicate.
-$processPath = [Environment]::GetEnvironmentVariable("Path", "Process")
-[Environment]::SetEnvironmentVariable("PATH", $null, "Process")
-[Environment]::SetEnvironmentVariable("Path", $processPath, "Process")
+# Some terminal hosts inject case-insensitive duplicate environment variables
+# (e.g. both http_proxy and HTTP_PROXY, or both Path and PATH). Windows treats
+# them as the same variable, but Windows PowerShell 5.1 Start-Process copies
+# the environment through a case-sensitive dictionary and throws
+# "An item with the same key has already been added" on the duplicate.
+# Normalize the WHOLE process environment (not just Path/PATH) by collapsing
+# each case-insensitive group to a single canonical spelling before any child
+# process is launched. This mirrors build-runtime.ps1 but is generalized and
+# must run here because this is the real service-launch path.
+$dupGroups = [Environment]::GetEnvironmentVariables("Process").Keys | Group-Object { [string]$_.ToLowerInvariant() } | Where-Object { $_.Count -gt 1 }
+foreach ($group in $dupGroups) {
+    $names = @($group.Group | ForEach-Object { [string]$_ })
+    $keeper = if ($names -contains 'Path') { 'Path' } else { $names[0] }
+    $keepValue = [string][Environment]::GetEnvironmentVariable($keeper, "Process")
+    foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $null, "Process") }
+    [Environment]::SetEnvironmentVariable($keeper, $keepValue, "Process")
+}
 
 $rootPath = (Resolve-Path $Root).Path
 
@@ -18,12 +30,33 @@ function Test-WorkspaceProcess {
     if (-not $ProcessId) { return $false }
     $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
     if (-not $proc) { return $false }
-    $identity = "{0} {1}" -f $proc.ExecutablePath, $proc.CommandLine
-    return $identity -like "*$rootPath*"
+    # Require a directory boundary, not a substring (App-old is not App).
+    # Process metadata unavailable means ownership is unproven.
+    $prefix = $rootPath.TrimEnd('\', '/') + '\'
+    if ($proc.ExecutablePath -and ([string]$proc.ExecutablePath).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+    $pattern = '(?i)(?:^|["\s])' + [regex]::Escape($prefix)
+    return [bool]($proc.CommandLine -and ([string]$proc.CommandLine -match $pattern))
 }
 
 . (Join-Path $PSScriptRoot "data-dir.ps1") -Mode $(if ($Development) { 'Development' } else { 'Formal' })
+if ($global:DataMode -eq 'legacy') {
+    # Legacy mode stores data in backend\app.db and run state in
+    # backend\logs\run\services.json — a second state root the Electron shell
+    # never reads. Every stack started this way cannot be recognised or adopted
+    # by a later launcher run and collides on the shared port group.
+    Write-Warning ("Data directory resolved to LEGACY mode (" + $global:DataRoot + "). " +
+        "This splits state from the Electron shell's per-user data root and breaks stack adoption. " +
+        "Set EMAIL_AUTOMATION_DATA_DIR to '%LOCALAPPDATA%\TAC AISolution\Email Automation' (start-stack.bat does this).")
+}
 . (Join-Path $PSScriptRoot "runtime-ports.ps1")
+function Test-BackendIdentity {
+    param([object]$Health)
+    return [bool]($Health.instance -and
+        $Health.instance.install_root -eq $rootPath -and
+        $Health.instance.data_root -eq $global:DataRoot)
+}
 . (Join-Path $PSScriptRoot "tacwork-runtime.ps1")
 
 # Unified TACWork config: the Email frontend must reach the SAME ports the
@@ -126,16 +159,16 @@ if ($recordedPids.Count -eq 0) {
     $recovered = @{}
     $backendPid = $listeners[$script:BackendPort]
     $frontendPid = if ($SkipFrontend) { $null } else { $listeners[$script:FrontendPort] }
-    if ($backendPid) {
+    if ($backendPid -and (Test-WorkspaceProcess $backendPid)) {
         try {
             $h = Invoke-RestMethod "http://127.0.0.1:$script:BackendPort/api/health" -TimeoutSec 3
-            if ($h.status -eq "ok" -and $null -ne $h.consumer) {
+            if ($h.status -eq "ok" -and $null -ne $h.consumer -and (Test-BackendIdentity $h)) {
                 $recovered.backend = $backendPid
-                if ($h.consumer.pid) { $recovered.consumer = $h.consumer.pid }
+                if (Test-WorkspaceProcess $h.consumer.pid) { $recovered.consumer = $h.consumer.pid }
             }
         } catch {}
     }
-    if (-not $SkipFrontend -and $frontendPid) {
+    if (-not $SkipFrontend -and $frontendPid -and (Test-WorkspaceProcess $frontendPid)) {
         try {
             $r = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$script:FrontendPort" -TimeoutSec 3
             if ($r.StatusCode -eq 200 -and $r.Content -match "Email Automation") {
@@ -148,7 +181,7 @@ if ($recordedPids.Count -eq 0) {
             $th = Get-TacWorkHealth $rootPath
             # ready=true already proves server + web + engine + workspace match
             # ours; register BOTH TACWork listeners so the adopt path can act.
-            if ($th.ready) {
+            if ($th.ready -and (Test-WorkspaceProcess $listeners[$script:TacWorkServerPort]) -and (Test-WorkspaceProcess $listeners[$script:TacWorkWebPort])) {
                 $recovered.tacwork_server = $listeners[$script:TacWorkServerPort]
                 $recovered.tacwork_web = $listeners[$script:TacWorkWebPort]
             }
@@ -197,6 +230,8 @@ if ($allOursUp) {
 
     $isHealthyStack = (
         $existingHealth.status -eq "ok" -and
+        (Test-BackendIdentity $existingHealth) -and
+        (Test-WorkspaceProcess $existingHealth.consumer.pid) -and
         $existingHealth.consumer.healthy -eq $true -and
         $existingFrontendReady -and (Get-TacWorkHealth $rootPath).ready
     )
@@ -252,16 +287,30 @@ $consumer = Start-Process -FilePath $pythonPath `
     -WindowStyle Hidden -PassThru
 
 $frontend = $null
+$frontendSkippedReason = $null
 if (-not $SkipFrontend) {
-    $frontendArgs = if ($Development) { ('"{0}" dev --hostname 127.0.0.1 --port {1}' -f $frontendDevServer, $script:FrontendPort) } else { ('"{0}"' -f $frontendServer) }
-    $frontendWorkingDirectory = if ($Development) { Join-Path $rootPath "frontend" } else { Join-Path $rootPath "runtime\frontend" }
-    $frontend = Start-Process -FilePath $nodePath `
-    -ArgumentList $frontendArgs `
-    -WorkingDirectory $frontendWorkingDirectory `
-    -RedirectStandardOutput (Join-Path $logsPath "frontend.log") `
-    -RedirectStandardError (Join-Path $logsPath "frontend-error.log") `
-    -WindowStyle Hidden -PassThru
+    # The standalone server reads its distDir (".next-prod") from server.js.
+    # That directory is deliberately stripped from the shipped runtime (only the
+    # static export runtime/frontend-static is packaged), so launching the
+    # standalone server would fail with "Could not find a production build".
+    # When the build dir is absent but the static export exists, skip the web
+    # server instead of failing — the Electron shell serves the UI directly.
+    $frontendDistDir = Join-Path $rootPath "runtime\frontend\.next-prod"
+    $staticIndex = Join-Path $rootPath "runtime\frontend-static\index.html"
+    if (-not $Development -and -not (Test-Path $frontendDistDir) -and (Test-Path $staticIndex)) {
+        $frontendSkippedReason = "runtime/frontend/.next-prod is not shipped in this runtime; skipping the bundled web server."
+    } else {
+        $frontendArgs = if ($Development) { ('"{0}" dev --hostname 127.0.0.1 --port {1}' -f $frontendDevServer, $script:FrontendPort) } else { ('"{0}"' -f $frontendServer) }
+        $frontendWorkingDirectory = if ($Development) { Join-Path $rootPath "frontend" } else { Join-Path $rootPath "runtime\frontend" }
+        $frontend = Start-Process -FilePath $nodePath `
+        -ArgumentList $frontendArgs `
+        -WorkingDirectory $frontendWorkingDirectory `
+        -RedirectStandardOutput (Join-Path $logsPath "frontend.log") `
+        -RedirectStandardError (Join-Path $logsPath "frontend-error.log") `
+        -WindowStyle Hidden -PassThru
+    }
 }
+if ($frontendSkippedReason) { Write-Output ("Frontend: " + $frontendSkippedReason) }
 
 $tacwork = Start-TacWorkRuntime -WorkspaceRoot $rootPath -LogsPath $logsPath -RunPath $runPath -PythonPath $pythonPath -PnpmPath $null
 

@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from app import diagnostics, redact
+from app.api import system as system_api
 from app.config import _DATA, get_settings
 from app.models import GmailAccount, OAuthCredential
 import app.diagnostics_investigate as di
@@ -201,6 +202,16 @@ def test_no_write_probe_in_sources():
         assert ".write_text(" not in src
         assert "mkdir(parents=True" not in src
         assert "unlink()" not in src
+
+
+def test_legacy_packaging_diagnose_writability_hint_creates_no_files(tmp_path):
+    """The compatibility endpoint must not resurrect the old write probe."""
+    missing = tmp_path / "does-not-exist"
+    before = {str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*")}
+    assert system_api._is_writable(str(missing)) is False
+    assert system_api._is_writable(str(tmp_path)) in {True, False}
+    after = {str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*")}
+    assert before == after
 
 
 def test_investigation_creates_no_files(db, tmp_path, monkeypatch):

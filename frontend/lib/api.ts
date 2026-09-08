@@ -289,8 +289,8 @@ export type DiagnosticItem = {
 
 export type DiagnosticReport = {
   generated_at: string;
-  overall: "ok" | "degraded" | "error";
-  counts: { ok: number; warn: number; error: number; info: number };
+  overall: "ok" | "degraded" | "error" | "unknown";
+  counts: { ok: number; warn: number; error: number; info: number; unknown?: number };
   items: DiagnosticItem[];
   by_category?: Record<string, DiagnosticItem[]>;
 };

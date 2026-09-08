@@ -4,7 +4,7 @@
 ;          and calls ISCC on this file)
 
 #define MyAppName "Email Automation"
-#define MyAppVersion "1.2.2"
+#define MyAppVersion "1.2.3"
 #define MyAppPublisher "TAC AISolution"
 #define MyAppId "B8C9D0F2-2E6D-4C89-9A1D-EMAILAUTOMATION"
 
@@ -76,8 +76,27 @@ Filename: "{app}\runtime\electron\Email Automation.exe"; Description: "Launch {#
 [Code]
 procedure CurStepChanged(CurStep: TSetupStep);
 var
+  UninstallKey, UninstallString: string;
+  ResultCode: Integer;
   RepairDir, RepairExe: string;
 begin
+  // Upgrade path: stop the running stack before files are replaced. This MUST
+  // run from CurStepChanged (NOT InitializeSetup) because {app} is only valid
+  // after the wizard has resolved the destination directory. Calling
+  // ExpandConstant('{app}') inside InitializeSetup raises
+  // "An attempt was made to expand the 'app' constant before it was initialized"
+  // and aborts the install mid-wizard. ssInstall fires after the user clicks
+  // Install (the destination is resolved, so {app} is valid) but before any
+  // file extraction, so we stop the old stack before its files are replaced.
+  if CurStep = ssInstall then begin
+    UninstallKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppId}_is1';
+    if (RegQueryStringValue(HKLM, UninstallKey, 'UninstallString', UninstallString)) or
+       (RegQueryStringValue(HKCU, UninstallKey, 'UninstallString', UninstallString)) then begin
+      if FileExists(ExpandConstant('{app}\stop-stack.bat')) then begin
+        Exec('cmd.exe', '/c "{app}\stop-stack.bat"', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      end;
+    end;
+  end;
   if CurStep = ssPostInstall then begin
     RepairDir := ExpandConstant('{app}\repair');
     RepairExe := RepairDir + '\Email-Automation-Repair.exe';
@@ -85,24 +104,6 @@ begin
     CopyFile(ExpandConstant('{srcexe}'), RepairExe, False);
   end;
 end;
-
-function InitializeSetup(): Boolean;
-var
-  UninstallKey, UninstallString: string;
-  ResultCode: Integer;
-begin
-  Result := True;
-  // Upgrade path: if a previous build is installed, stop its running services
-  // before files are replaced, so we never overwrite a live stack.
-  UninstallKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppId}_is1';
-  if (RegQueryStringValue(HKLM, UninstallKey, 'UninstallString', UninstallString)) or
-     (RegQueryStringValue(HKCU, UninstallKey, 'UninstallString', UninstallString)) then begin
-    if FileExists(ExpandConstant('{app}\stop-stack.bat')) then begin
-      Exec('cmd.exe', '/c "{app}\stop-stack.bat"', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
-    end;
-  end;
-end;
-
 function IsSilentUninstall(): Boolean;
 var
   i: Integer;
@@ -139,4 +140,3 @@ begin
     end;
   end;
 end;
-

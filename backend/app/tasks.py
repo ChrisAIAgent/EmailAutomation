@@ -238,7 +238,7 @@ def execute_gmail_initial_import(run_id: int) -> dict:
                 raise RuntimeError("gmail_history_id_missing")
             db.commit()
 
-        while True:
+        while not run.scan_completed:
             db.refresh(run)
             if run.status in {"paused", "cancelled"}:
                 return {"ok": True, "status": run.status, "run_id": run.id}
@@ -255,10 +255,14 @@ def execute_gmail_initial_import(run_id: int) -> dict:
             run.new_messages += stored["new_messages"]
             run.failures += stored["failures"]
             run.page_token = next_page
+            run.scan_completed = not bool(next_page)
             db.commit()
             if not next_page:
                 break
 
+        db.refresh(run)
+        if run.status in {"paused", "cancelled"}:
+            return {"ok": True, "status": run.status, "run_id": run.id}
         replay = sync_svc.sync_history(db, account, account.oauth, run.start_history_id)
         run.latest_history_id = replay["history_id"]
         run.threads_scanned += replay["threads"]

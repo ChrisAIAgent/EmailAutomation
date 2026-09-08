@@ -46,7 +46,14 @@ Write-Output ("Packaging portable workspace from: " + $root)
 $staging = Join-Path $root ".portable_stage"
 if ($StageDir) {
     # Installer mode: stage straight into the caller-supplied directory.
-    $payload = $StageDir
+    # Normalize to a canonical long-path form: callers (or $env:TEMP) may
+    # pass an 8.3 short-name path (e.g. C:\Users\ADMINI~1\...), but
+    # Get-ChildItem.FullName returns the fully-qualified long form. A
+    # Substring($payload.Length + 1) on a short-name base against a
+    # long-name FullName silently produces malformed relative paths
+    # (truncated prefixes like "159/runtime/..."). GetFullPath delegates
+    # to the Windows API GetFullPathName, which resolves 8.3 segments.
+    $payload = [System.IO.Path]::GetFullPath($StageDir)
 } else {
     $payload = Join-Path $staging "Email Automation"
 }
@@ -293,6 +300,52 @@ if (-not $IncludeData) {
 
 # --- Installer mode: no archive, caller owns the staged directory --------
 if ($StageDir) {
+    # Regenerate runtime-manifest.json FROM the staged payload, so the
+    # manifest strictly equals what the customer actually receives.
+    # build-runtime.ps1 generates the manifest against runtime/ on the
+    # build machine (where runtime/frontend/.next-prod/ exists, because
+    # it is produced by `next build` and kept in runtime/ for local dev).
+    # The staging exclusions above deliberately strip .next-prod,
+    # .frontend-build, .frontend-repair-*, etc. from the payload.
+    # Shipping a manifest that lists files the payload does not contain
+    # makes verify-runtime.ps1 fail on the customer machine with
+    # runtime_integrity_failed:missing:<file>. Regenerating from the
+    # payload closes that gap permanently: any future drift between
+    # staging exclusions and the manifest is caught at build time (M3)
+    # instead of discovered at customer startup.
+    $payloadRuntimeDir = Join-Path $payload "runtime"
+    $payloadManifest = Join-Path $payloadRuntimeDir "runtime-manifest.json"
+    if (Test-Path -LiteralPath $payloadManifest) {
+        $payloadVersion = (Get-Content -Raw (Join-Path $root "VERSION")).Trim()
+        $regenManifest = [ordered]@{
+            version = $payloadVersion
+            built_at = [DateTime]::UtcNow.ToString("o")
+            python = "tools/python/python.exe"
+            python_packages = "runtime/python-packages"
+            frontend_server = "runtime/frontend/server.js"
+            frontend_static = "runtime/frontend-static/index.html"
+            desktop_executable = "runtime/electron/Email Automation.exe"
+            files = @(
+                Get-ChildItem -LiteralPath $payloadRuntimeDir -Recurse -File -Force -ErrorAction SilentlyContinue |
+                    Where-Object { $_.FullName -ne $payloadManifest } |
+                    ForEach-Object {
+                        [ordered]@{
+                            path = $_.FullName.Substring($payload.Length + 1).Replace("\", "/")
+                            sha256 = ([System.BitConverter]::ToString(
+                                [System.Security.Cryptography.SHA256]::Create().ComputeHash(
+                                    [System.IO.File]::ReadAllBytes($_.FullName)
+                                )
+                            ) -replace '-', '')
+                            bytes = $_.Length
+                        }
+                    }
+            )
+        }
+        $regenManifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $payloadManifest -Encoding UTF8
+        Write-Output ("Re-generated runtime-manifest.json from payload: " + $regenManifest.files.Count + " files (strictly equals customer payload).")
+    } else {
+        Write-Output "WARN: payload/runtime/runtime-manifest.json not found - skipped regeneration. Staging rules may have stripped it."
+    }
     Write-Output ""
     Write-Output ("Staged payload (installer mode): " + $payload)
     if (-not $IncludeData) {

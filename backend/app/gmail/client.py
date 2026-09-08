@@ -33,10 +33,31 @@ logger = logging.getLogger("gmail.client")
 _MAX_RETRIES = 4
 _BACKOFF = 1.5
 
+# Gmail's per-minute quota ("Units per minute per user") resets on a ~60s
+# window, so a second-scale backoff can never clear it. Use a minute-scale
+# wait for quota errors, otherwise the initial import's history tail fails
+# outright on every run that followed a large search sweep.
+_RATE_LIMIT_BACKOFF = 65.0
+
 # Network exceptions that mean "the request did not return in time" rather than
 # a retriable server error. These must NOT be retried forever; they surface as a
 # recognizable GmailTimeoutError so the worker can fail the run and move on.
 _TIMEOUT_EXC = (socket.timeout, TimeoutError)
+
+
+def _is_rate_limit(exc: HttpError) -> bool:
+    """True for Gmail quota errors, which may be returned as 403 or 429.
+
+    Google reports per-minute quota exhaustion with HTTP 403, not 429, so a
+    status-code-only retry check misses it entirely and the error propagates
+    unverified into the sync run. Detect it from the response body instead.
+    """
+    if exc.status_code not in (403, 429):
+        return False
+    content = exc.content
+    if isinstance(content, bytes):
+        content = content.decode("utf-8", "ignore")
+    return "rateLimitExceeded" in content or "usageLimits" in content
 
 
 def _is_transient_transport_error(exc: Exception) -> bool:
@@ -150,9 +171,17 @@ class RealGmailTransport(GmailTransport):
                 self._ensure_service()
                 return fn(self._service)
             except HttpError as e:
-                if e.status_code in (429, 500, 502, 503, 504):
+                rate_limited = _is_rate_limit(e)
+                if rate_limited or e.status_code in (429, 500, 502, 503, 504):
                     last = e
-                    time.sleep(_BACKOFF * (attempt + 1))
+                    if rate_limited:
+                        logger.warning(
+                            "gmail_quota_backoff attempt=%s/%s wait=%ss status=%s",
+                            attempt + 1, _MAX_RETRIES, _RATE_LIMIT_BACKOFF, e.status_code,
+                        )
+                        time.sleep(_RATE_LIMIT_BACKOFF)
+                    else:
+                        time.sleep(_BACKOFF * (attempt + 1))
                     self._service = None
                     continue
                 raise
@@ -219,10 +248,11 @@ class RealGmailTransport(GmailTransport):
                 # ~50x that long). This is a recognizable, fatal signal -- the
                 # worker must fail the run and move on, not serially time out.
                 raise
-            except Exception:
-                # Other per-thread errors (e.g. a malformed thread) are
-                # non-fatal; skip the bad thread and continue with the rest.
-                continue
+            except HttpError as exc:
+                # A deleted thread cannot be fetched again. All other errors
+                # must fail this page so the worker preserves its checkpoint.
+                if exc.status_code != 404:
+                    raise
         return threads, res.get("nextPageToken")
 
     def get_thread(self, thread_id) -> ThreadDTO:

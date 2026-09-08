@@ -86,14 +86,16 @@ def diagnostics_investigate(
 
 
 def _is_writable(path: str) -> bool:
-    """Best-effort writability probe for a directory (runbook Section 8)."""
+    """Return a read-only writability hint without changing the target path.
+
+    ``/api/system/diagnose`` is a legacy packaging diagnostic, but it must
+    uphold the same no-write guarantee as the unified manual diagnostics API.
+    Windows ACLs can still make this an approximation; callers expose it as a
+    hint rather than proof.
+    """
     try:
         p = Path(path)
-        p.mkdir(parents=True, exist_ok=True)
-        probe = p / ".ea_write_test"
-        probe.write_text("ok")
-        probe.unlink()
-        return True
+        return bool(p.is_dir() and os.access(p, os.W_OK))
     except Exception:
         return False
 

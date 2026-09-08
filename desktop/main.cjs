@@ -174,10 +174,10 @@ const ROOT_CAUSE_REMEDIES = {
   runtime_version_mismatch: [{ action: "reinstall", risk: "medium", requires_confirmation: true }],
   runtime_manifest_invalid: [{ action: "repair", risk: "low", requires_confirmation: true }],
   port_group_occupied: [{ action: "free_ports", risk: "low", requires_confirmation: true }],
-  launcher_failed: [{ action: "inspect_launcher_stderr", risk: "low", requires_confirmation: false }],
-  backend_unreachable: [{ action: "inspect_backend_logs", risk: "low", requires_confirmation: false }],
+  launcher_failed: [{ action: "inspect_launcher_stderr", risk: "low", requires_confirmation: true }],
+  backend_unreachable: [{ action: "inspect_backend_logs", risk: "low", requires_confirmation: true }],
   frontend_load_failed: [{ action: "reload", risk: "low", requires_confirmation: true }],
-  unknown: [{ action: "open_logs", risk: "low", requires_confirmation: false }],
+  unknown: [{ action: "open_logs", risk: "low", requires_confirmation: true }],
 };
 
 const REMEDY_LABEL = {

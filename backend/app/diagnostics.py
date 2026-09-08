@@ -29,7 +29,7 @@ from typing import Optional
 
 from sqlalchemy import inspect, text
 
-from .config import _DATA, get_settings, is_gmail_configured, is_llm_configured
+from .config import _DATA, get_diagnostic_settings, is_gmail_configured, is_llm_configured
 from .consumer_status import read_consumer_status
 from .models import Automation, GmailAccount, OAuthCredential
 from .redact import mask_email
@@ -96,7 +96,7 @@ def _tacwork_health(settings) -> tuple[bool, str]:
 
 
 def _run_diagnostics_inner(db) -> dict:
-    s = get_settings()
+    s = get_diagnostic_settings()
     now = datetime.now(timezone.utc)
     items: list[DiagnosticResult] = []
 

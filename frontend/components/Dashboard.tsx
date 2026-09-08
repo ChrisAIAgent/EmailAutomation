@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Activity, BarChart3, Beaker, BookOpen, Bot, CalendarClock, ChevronLeft, ChevronRight, Inbox as InboxIcon, Moon, Pause, Play, Send, Sun, Type, Users } from "lucide-react";
+import { Activity, BarChart3, Beaker, BookOpen, Bot, CalendarClock, ChevronLeft, ChevronRight, Inbox as InboxIcon, Moon, Pause, Play, Send, Stethoscope, Sun, Type, Users } from "lucide-react";
 import { api, API_BASE, Metrics } from "@/lib/api";
 import { useLang } from "@/lib/i18n";
 import ConfigBar from "./ConfigBar";
@@ -17,9 +17,10 @@ import AgentProfileView from "./AgentProfile";
 import TacWorkPanel from "./TacWorkPanel";
 import AgentTakeoverControl from "./AgentTakeoverControl";
 import AutomationView from "./Automation";
+import DiagnosticsView from "./Diagnostics";
 import { useUiPreferences } from "@/lib/ui-preferences";
 
-type Tab = "overview" | "inbox" | "contacts" | "campaigns" | "approvals" | "agent_profile" | "knowledge" | "activity" | "agent_lab" | "automation";
+type Tab = "overview" | "inbox" | "contacts" | "campaigns" | "approvals" | "agent_profile" | "knowledge" | "activity" | "agent_lab" | "automation" | "diagnostics";
 
 const TAB_KEYS: Record<Tab, { labelKey: string; icon: any }> = {
   overview:  { labelKey: "nav_dashboard",   icon: BarChart3 },
@@ -32,6 +33,7 @@ const TAB_KEYS: Record<Tab, { labelKey: string; icon: any }> = {
   activity:  { labelKey: "nav_activity",    icon: Activity },
   agent_lab: { labelKey: "nav_agent_lab",   icon: Beaker },
   automation: { labelKey: "nav_automation", icon: CalendarClock },
+  diagnostics: { labelKey: "nav_diagnostics", icon: Stethoscope },
 };
 
 export default function Dashboard() {
@@ -208,6 +210,7 @@ export default function Dashboard() {
           {tab === "activity" && <ActivityView />}
           {tab === "agent_lab" && <ComparisonView onChanged={load} agents={health} />}
           {tab === "automation" && <AutomationView onChanged={load} onNavigate={(tgt) => setTab(tgt)} />}
+          {tab === "diagnostics" && <DiagnosticsView />}
         </div>
       </main>
       <TacWorkPanel />

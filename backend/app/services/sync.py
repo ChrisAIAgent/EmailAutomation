@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+from googleapiclient.errors import HttpError
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -134,9 +135,25 @@ def _history_thread_ids(events: list[dict]) -> list[str]:
     return ordered
 
 
+def _looks_like_gmail_history_id(value: str | int | None) -> bool:
+    """Gmail historyId is a uint64 (in practice a large integer, typically 9+
+    digits). The in-memory demo double hard-codes 1000, and replaying that stale
+    value always yields HTTP 404 -> misread as cursor_expired. Treat the known
+    demo sentinel (and any empty/non-numeric value) as "no valid cursor"."""
+    if value is None or value == "":
+        return False
+    s = str(value).strip()
+    if not s.isdigit():
+        return False
+    n = int(s)
+    if n == 1000:
+        return False
+    return n > 0
+
+
 def sync_history(db, account, oauth, start_history_id: str) -> dict:
     """Replay Gmail History from a durable cursor and persist affected threads."""
-    if not start_history_id:
+    if not _looks_like_gmail_history_id(start_history_id):
         raise RuntimeError("initial_import_required")
     tl = UnifiedEmailToolLayer(db, account, oauth)
     page_token = None
@@ -167,9 +184,12 @@ def sync_history(db, account, oauth, start_history_id: str) -> dict:
             # Do not advance the durable history cursor after a transient
             # network timeout; the next run must retry the same change set.
             raise
-        except Exception:
-            failures += 1
-            logger.warning("Could not fetch changed Gmail thread %s", thread_id)
+        except HttpError as exc:
+            # Preserve the cursor on quota/auth/server failures. Only a thread
+            # deleted since the History event is safe to skip.
+            if exc.status_code != 404:
+                raise
+            logger.info("Changed Gmail thread is no longer available")
     stored = store_thread_batch(db, account, threads)
     account.history_id = latest_history_id
     db.flush()
@@ -187,6 +207,12 @@ def sync_history(db, account, oauth, start_history_id: str) -> dict:
 def sync_incremental(db, account, oauth) -> dict:
     """Run the normal post-baseline sync using Gmail History only."""
     if not initial_import_completed(db, account.id):
+        raise RuntimeError("initial_import_required")
+    # A demo-layer cursor (historyId=1000) that was persisted before OAuth
+    # would otherwise be replayed forever and 404 on every attempt. Fail with
+    # the same signal as a missing cursor so the caller triggers a fresh,
+    # user-authorized history import instead of looping on cursor_expired.
+    if not _looks_like_gmail_history_id(account.history_id):
         raise RuntimeError("initial_import_required")
     return sync_history(db, account, oauth, account.history_id)
 

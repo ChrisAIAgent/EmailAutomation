@@ -28,7 +28,7 @@ from typing import Any, Optional
 
 from sqlalchemy import inspect, text
 
-from .config import _DATA, get_settings, is_gmail_configured, is_llm_configured
+from .config import _DATA, get_diagnostic_settings, is_gmail_configured, is_llm_configured
 from .consumer_status import read_consumer_status
 from .diagnostics import run_diagnostics
 from .models import Automation, GmailAccount
@@ -728,7 +728,7 @@ def investigate(db, target: str = "system", trace_id: Optional[str] = None, inci
     else:
         targets = [target]
 
-    settings = get_settings()
+    settings = get_diagnostic_settings()
     reports = []
     for name in targets:
         collector = _COLLECTORS.get(name)
