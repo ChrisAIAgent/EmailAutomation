@@ -73,7 +73,10 @@ v1.2.3 是稳定性收敛版本，**不引入新业务功能**。范围限于三
 ## 四、已知限制
 
 1. **`portable-diagnose.ps1` 端口检查——更正（2026-09-08 核实）**：早前记录的「仍检查 8000/3000 导致端口冲突假绿灯」**对本安装包不成立**。该脚本自 2026-09-04 起已改为 dot-source `scripts/runtime-ports.ps1`，检查真实协调端口组 **18000/18001/18002/18003**，发布前实测四个端口全部正确识别。打包 staging 按 robocopy 从磁盘整拷 `scripts/`，因此本安装包内即为修复版。
-   **附带披露**：`portable-diagnose.ps1` 被 `.gitignore`（Portable packaging chain 段）排除、不在 tag `v1.2.3` 内——从 tag 全新克隆重建安装包时 payload 将**缺少**便携诊断链（`portable-diagnose.ps1`、`portable-bootstrap.bat` 等）。在本构建机工作区重建不受影响（文件在磁盘上）；跨机器/全新克隆重建前必须先恢复这批文件。
+   **附带披露（可复现性缺口，不影响本包）**：这 4 个文件被 `.gitignore`（Portable packaging chain 段）排除、不在 tag `v1.2.3` 内——`scripts\portable-diagnose.ps1`、`scripts\portable-start-unified.ps1`、`portable-bootstrap.bat`、`portable-start.bat`。
+   - **本包不受影响**：构建时 4 个文件均在磁盘上，staging 按 robocopy 整拷 `scripts/`、`.iss` 以 `recursesubdirs` 安装全部子目录；且 `scripts\portable-start-unified.ps1` 已列入 `build-installer.ps1` 与 `portable-package.ps1` 的 `$mustExist` 闸门并校验通过。
+   - **全新克隆重建的后果是「构建失败」而非「静默坏包」**：上述 4 个中有 3 个在 `$mustExist` 清单内，缺失时构建直接 `Fail: Payload missing required files`；仅 `scripts\portable-diagnose.ps1` 不在任何闸门内、会静默缺失（只影响运维人员手动执行的独立预检脚本，不影响安装版运行时）。
+   - 建议：从 tag 重建前先恢复这 4 个文件；若要彻底关闭静默缺口，可在 `$mustExist` 增列 `scripts\portable-diagnose.ps1` 一行。
 2. `backend/app/services/sync.py` 带 UTF-8 BOM：裸 `ast.parse` 会报 U+FEFF（既有现象），`import` 不受影响。
 3. 数据目录迁移产生的备份文件（`*.legacy-archived-*` / `*.preshell-*`）仍在数据目录内，确认稳定后可手动清理，不会自动删除。
 4. 本版**不含**自动更新/补丁能力。仓库中的 `UPDATE-PLAN.md` 是一份**尚未实现**的前瞻规划（含 §5.2、§14 两处待决策项与 P0.5 签字门禁），不作为本版交付内容。
