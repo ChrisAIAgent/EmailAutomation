@@ -72,7 +72,8 @@ v1.2.3 是稳定性收敛版本，**不引入新业务功能**。范围限于三
 
 ## 四、已知限制
 
-1. **`portable-diagnose.ps1:96` 端口检查仍用 8000/3000，而真实端口组是 18000–18003** → 端口冲突检测会出**假绿灯**，而 `port_conflict` 正是客户机真实故障之一。本版未修（不在本轮清单），已记录待办。
+1. **`portable-diagnose.ps1` 端口检查——更正（2026-09-08 核实）**：早前记录的「仍检查 8000/3000 导致端口冲突假绿灯」**对本安装包不成立**。该脚本自 2026-09-04 起已改为 dot-source `scripts/runtime-ports.ps1`，检查真实协调端口组 **18000/18001/18002/18003**，发布前实测四个端口全部正确识别。打包 staging 按 robocopy 从磁盘整拷 `scripts/`，因此本安装包内即为修复版。
+   **附带披露**：`portable-diagnose.ps1` 被 `.gitignore`（Portable packaging chain 段）排除、不在 tag `v1.2.3` 内——从 tag 全新克隆重建安装包时 payload 将**缺少**便携诊断链（`portable-diagnose.ps1`、`portable-bootstrap.bat` 等）。在本构建机工作区重建不受影响（文件在磁盘上）；跨机器/全新克隆重建前必须先恢复这批文件。
 2. `backend/app/services/sync.py` 带 UTF-8 BOM：裸 `ast.parse` 会报 U+FEFF（既有现象），`import` 不受影响。
 3. 数据目录迁移产生的备份文件（`*.legacy-archived-*` / `*.preshell-*`）仍在数据目录内，确认稳定后可手动清理，不会自动删除。
 4. 本版**不含**自动更新/补丁能力。仓库中的 `UPDATE-PLAN.md` 是一份**尚未实现**的前瞻规划（含 §5.2、§14 两处待决策项与 P0.5 签字门禁），不作为本版交付内容。
