@@ -20,7 +20,9 @@ $fileName = [string]$manifest.file
 $exePath = Join-Path $prereqDir $fileName
 if (-not $fileName -or -not (Test-Path -LiteralPath $exePath)) { throw "Official VC++ x64 redistributable is missing: $exePath" }
 if (-not $manifest.sha256 -or $manifest.sha256 -notmatch '^[A-Fa-f0-9]{64}$') { throw "VC++ prerequisite manifest must contain a fixed SHA-256." }
-$hash = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash
+$sha = [System.Security.Cryptography.SHA256]::Create()
+try { $hash = ([System.BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($exePath))) -replace '-', '') }
+finally { $sha.Dispose() }
 if ($hash -ne $manifest.sha256.ToUpperInvariant()) { throw "VC++ redistributable SHA-256 does not match the pinned manifest." }
 $signature = Get-AuthenticodeSignature -FilePath $exePath
 if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate -or $signature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
