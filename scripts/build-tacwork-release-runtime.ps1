@@ -12,7 +12,8 @@
 param(
     [string]$TacWorkRoot = $env:TACWORK_ROOT,
     [string]$ExpectedCommit = "a8a6156",
-    [string]$ExpectedBranch = "Dev"
+    [string]$ExpectedBranch = "Dev",
+    [string]$PnpmStore = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,6 +21,7 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $root = Split-Path -Parent $scriptDir
 if (-not $TacWorkRoot) { $TacWorkRoot = Join-Path (Split-Path -Parent $root) "TACWork" }
 $TacWorkRoot = (Resolve-Path -LiteralPath $TacWorkRoot).Path
+if (-not $PnpmStore) { $PnpmStore = Join-Path $root "offline-cache\npm-cache\tacwork-pnpm-store" }
 $prepare = Join-Path $scriptDir "prepare-tacwork-runtime.ps1"
 
 $resolvedCommit = (& git -C $TacWorkRoot rev-parse ($ExpectedCommit + "^{commit}") 2>$null | Select-Object -First 1).Trim()
@@ -45,7 +47,7 @@ try {
     # operator's working checkout.
     Push-Location $tempRoot
     try {
-        & $pnpm install --frozen-lockfile --offline
+        & $pnpm install --frozen-lockfile --offline --store-dir $PnpmStore
         if ($LASTEXITCODE -ne 0) { throw "TACWork offline dependency install failed in the clean worktree." }
         & $pnpm --filter "openwork-server" build:bin
         if ($LASTEXITCODE -ne 0) { throw "TACWork server binary build failed in the clean worktree." }
