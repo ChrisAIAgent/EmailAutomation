@@ -39,7 +39,8 @@ param(
     [string]$PreviousReleaseTag = "v1.2.3",
     [string]$SigningCertificateThumbprint = $env:EMAIL_AUTOMATION_SIGNING_CERT_THUMBPRINT,
     [string]$TimestampUrl = $env:EMAIL_AUTOMATION_TIMESTAMP_URL,
-    [switch]$AcceptanceCandidate
+    [switch]$AcceptanceCandidate,
+    [switch]$ReuseVerifiedRuntime
 )
 
 $ErrorActionPreference = "Stop"
@@ -104,6 +105,9 @@ $buildGitTag = (& git -C $root tag --points-at HEAD 2>$null | Where-Object { $_ 
 $buildGitDirty = [bool](& git -C $root status --porcelain 2>$null)
 if ($AcceptanceCandidate -and $AllowUncommitted) {
     Fail "AcceptanceCandidate still requires a clean committed source; do not combine it with -AllowUncommitted."
+}
+if ($ReuseVerifiedRuntime -and -not $AcceptanceCandidate) {
+    Fail "ReuseVerifiedRuntime is permitted only for an internal acceptance candidate."
 }
 if (-not $AllowUncommitted -and $buildGitDirty) {
     Fail "Release and acceptance-candidate builds require a clean working tree. Commit or remove unrelated changes first."
@@ -243,19 +247,25 @@ if (Test-Path -LiteralPath $exePath) { try { [System.IO.File]::Delete("\\?\" + $
 New-Item -ItemType Directory -Force -Path $distDir | Out-Null
 
 # --- 3. Build the runtime before staging ---------------------------------
-Write-Output "Preparing TACWork runtime from approved clean worktree..."
-& $tacWorkRuntimeScript -TacWorkRoot $TacWorkRoot -ExpectedCommit $TacWorkCommit
-if (-not $?) { Fail "TACWork runtime preparation failed." }
 $tacworkManifestPath = Join-Path $root "tacwork-runtime\runtime-manifest.json"
+if (-not $ReuseVerifiedRuntime) {
+    Write-Output "Preparing TACWork runtime from approved clean worktree..."
+    & $tacWorkRuntimeScript -TacWorkRoot $TacWorkRoot -ExpectedCommit $TacWorkCommit
+    if (-not $?) { Fail "TACWork runtime preparation failed." }
+}
 if (-not (Test-Path -LiteralPath $tacworkManifestPath)) { Fail "TACWork runtime manifest is missing." }
 $tacworkManifest = Get-Content -LiteralPath $tacworkManifestPath -Raw | ConvertFrom-Json
 if ($tacworkManifest.source_commit -notlike ($TacWorkCommit + "*") -or $tacworkManifest.source_dirty -ne $false) {
     Fail "TACWork runtime provenance is not the approved clean source."
 }
-Write-Output "Building prebuilt runtime (customer startup will not use pip/npm)..."
-& $runtimeScript -Clean
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $root "runtime\runtime-manifest.json"))) {
-    Fail "Prebuilt runtime build failed."
+if (-not $ReuseVerifiedRuntime) {
+    Write-Output "Building prebuilt runtime (customer startup will not use pip/npm)..."
+    & $runtimeScript -Clean
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $root "runtime\runtime-manifest.json"))) {
+        Fail "Prebuilt runtime build failed."
+    }
+} else {
+    Write-Output "Reusing freshly verified runtime for this internal acceptance candidate."
 }
 & (Join-Path $root "scripts\verify-runtime.ps1") -Root $root
 if (-not $?) { Fail "Runtime SHA-256 verification failed." }
