@@ -47,6 +47,12 @@ $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $root       = Split-Path -Parent $scriptDir
 function Fail($msg) { throw ("[BUILD ABORTED] " + $msg) }
+function Get-Sha256([string]$Path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([System.BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($Path))) -replace '-', '')
+    } finally { $sha.Dispose() }
+}
 
 # --- Version source of truth & cross-check ---------------------------------
 # The root VERSION file is the single source of product version. The build must
@@ -440,7 +446,7 @@ $exeSizeMB = [math]::Round($installerBytes / 1MB, 1)
 $payloadFiles = (Get-ChildItem $payloadDir -Recurse -Force -File -ErrorAction SilentlyContinue).Count
 $pyVer = & (Join-Path $payloadDir "tools\python\python.exe") --version 2>&1
 $nodeVer = & (Join-Path $payloadDir "tools\node\node.exe") --version 2>&1
-$installerSha256 = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash
+$installerSha256 = Get-Sha256 $exePath
 $shaPath = $exePath + ".sha256"
 ($installerSha256 + " *" + $exeName) | Set-Content -LiteralPath $shaPath -Encoding ASCII
 $gitCommit = $buildGitCommit

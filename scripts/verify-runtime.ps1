@@ -6,6 +6,12 @@ if (-not (Test-Path -LiteralPath $manifestPath)) { throw "runtime_integrity_fail
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 $version = (Get-Content -LiteralPath (Join-Path $Root "VERSION") -Raw).Trim()
 if ($manifest.version -ne $version) { throw "stale_runtime:manifest_version_mismatch" }
+function Get-Sha256([string]$Path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([System.BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($Path))) -replace '-', '')
+    } finally { $sha.Dispose() }
+}
 
 # Accumulate up to 5 missing and 5 hash-mismatched files before failing,
 # so the customer sees the full set of broken files in a single error
@@ -24,7 +30,7 @@ foreach ($item in $manifest.files) {
         if ($missing.Count -lt 5) { [void]$missing.Add($relative) }
         continue
     }
-    if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ne $item.sha256) {
+    if ((Get-Sha256 $target) -ne $item.sha256) {
         if ($hashMismatch.Count -lt 5) { [void]$hashMismatch.Add($relative) }
     }
 }
