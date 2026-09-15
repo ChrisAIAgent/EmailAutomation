@@ -18,7 +18,9 @@ business data remains under `%LOCALAPPDATA%` and is not replaced by the installe
 - Electron loads `app://email-automation`; the packaged `.next-prod` transition
   Web runtime remains available only for `start-stack.bat` compatibility.
 - Formal builds require a clean exact `v1.2.4` tag, a verified VC++ asset and a
-  valid Authenticode signature. Unsigned output is not a release artifact.
+  valid Authenticode signature. For controlled Win10/Win11 acceptance only,
+  `build-installer.ps1 -AcceptanceCandidate` permits an unsigned clean build
+  without the release tag and marks its report as internal-only.
 - File deletes and renames are release-gated through
   `installer/obsolete-files-1.2.4.txt`; no broad install-directory cleanup is
   used during upgrades.

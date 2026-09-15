@@ -38,7 +38,8 @@ param(
     [string]$TacWorkCommit = "a8a6156",
     [string]$PreviousReleaseTag = "v1.2.3",
     [string]$SigningCertificateThumbprint = $env:EMAIL_AUTOMATION_SIGNING_CERT_THUMBPRINT,
-    [string]$TimestampUrl = $env:EMAIL_AUTOMATION_TIMESTAMP_URL
+    [string]$TimestampUrl = $env:EMAIL_AUTOMATION_TIMESTAMP_URL,
+    [switch]$AcceptanceCandidate
 )
 
 $ErrorActionPreference = "Stop"
@@ -95,7 +96,13 @@ if (Test-Path $mcpPath) {
 $buildGitCommit = (& git -C $root rev-parse HEAD 2>$null | Select-Object -First 1)
 $buildGitTag = (& git -C $root tag --points-at HEAD 2>$null | Where-Object { $_ -eq ("v" + $expectedVersion) } | Select-Object -First 1)
 $buildGitDirty = [bool](& git -C $root status --porcelain 2>$null)
-if (-not $AllowUncommitted -and ($buildGitDirty -or $buildGitTag -ne ("v" + $expectedVersion))) {
+if ($AcceptanceCandidate -and $AllowUncommitted) {
+    Fail "AcceptanceCandidate still requires a clean committed source; do not combine it with -AllowUncommitted."
+}
+if (-not $AllowUncommitted -and $buildGitDirty) {
+    Fail "Release and acceptance-candidate builds require a clean working tree. Commit or remove unrelated changes first."
+}
+if (-not $AcceptanceCandidate -and -not $AllowUncommitted -and $buildGitTag -ne ("v" + $expectedVersion)) {
     Fail ("Formal release builds require a clean exact tag v" + $expectedVersion + ". Commit/review/tag first, or use -AllowUncommitted for a non-release development build.")
 }
 $installerDir = Join-Path $root "installer"
@@ -145,6 +152,7 @@ Write-Output " Email Automation - Windows installer build"
 Write-Output (" Version : " + $Version + "  (source: root VERSION file)")
 Write-Output (" Root    : " + $root)
 Write-Output (" TACWork : " + $TacWorkCommit + " from clean temporary worktree")
+if ($AcceptanceCandidate) { Write-Output " Mode    : INTERNAL ACCEPTANCE CANDIDATE (unsigned, no release tag required)" }
 Write-Output "=================================================================="
 
 # --- 1. Locate Inno Setup compiler ---------------------------------------
@@ -403,16 +411,21 @@ Write-Output "Compiling installer with Inno Setup..."
 if ($LASTEXITCODE -ne 0) { Fail ("ISCC compilation failed (exit " + $LASTEXITCODE + ").") }
 if (-not (Test-Path $exePath)) { Fail ("ISCC did not produce " + $exePath + ".") }
 
-# A formal installer cannot be released unsigned. The certificate is selected
-# by thumbprint from the protected build-machine certificate store; its private
-# material is never read from or written to this repository.
-if (-not $SigningCertificateThumbprint) { Fail "Formal build requires EMAIL_AUTOMATION_SIGNING_CERT_THUMBPRINT (or -SigningCertificateThumbprint)." }
-$signingCert = Get-ChildItem -Path ("Cert:\CurrentUser\My\" + $SigningCertificateThumbprint) -ErrorAction SilentlyContinue
-if (-not $signingCert -or -not $signingCert.HasPrivateKey) { Fail "Configured signing certificate is unavailable or lacks a private key." }
-$signArgs = @{ FilePath = $exePath; Certificate = $signingCert; HashAlgorithm = 'SHA256' }
-if ($TimestampUrl) { $signArgs.TimestampServer = $TimestampUrl }
-$signResult = Set-AuthenticodeSignature @signArgs
-if ($signResult.Status -ne 'Valid') { Fail ("Authenticode signing failed: " + $signResult.Status) }
+# A formal installer cannot be released unsigned. An acceptance candidate is
+# intentionally the one exception: it is for controlled cross-machine testing,
+# remains clean/reproducible, and its report is marked so it cannot be confused
+# with a signed public release.
+if ($AcceptanceCandidate) {
+    $signResult = [pscustomobject]@{ Status = "NotSigned_InternalAcceptanceCandidate" }
+} else {
+    if (-not $SigningCertificateThumbprint) { Fail "Formal build requires EMAIL_AUTOMATION_SIGNING_CERT_THUMBPRINT (or -SigningCertificateThumbprint)." }
+    $signingCert = Get-ChildItem -Path ("Cert:\CurrentUser\My\" + $SigningCertificateThumbprint) -ErrorAction SilentlyContinue
+    if (-not $signingCert -or -not $signingCert.HasPrivateKey) { Fail "Configured signing certificate is unavailable or lacks a private key." }
+    $signArgs = @{ FilePath = $exePath; Certificate = $signingCert; HashAlgorithm = 'SHA256' }
+    if ($TimestampUrl) { $signArgs.TimestampServer = $TimestampUrl }
+    $signResult = Set-AuthenticodeSignature @signArgs
+    if ($signResult.Status -ne 'Valid') { Fail ("Authenticode signing failed: " + $signResult.Status) }
+}
 
 # Refuse a deceptively successful compile that omitted the staged runtime payload.
 $payloadBytes = (Get-ChildItem $payloadDir -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
@@ -439,6 +452,7 @@ $largestFiles = @(Get-ChildItem $payloadDir -Recurse -Force -File | Sort-Object 
 })
 $report = [ordered]@{
     version=$Version; git_commit=($gitCommit | Select-Object -First 1); git_tag=($gitTag | Select-Object -First 1); git_dirty=$gitDirty
+    artifact_type=$(if ($AcceptanceCandidate) { "internal_acceptance_candidate" } else { "formal_release" })
     build_time_utc=[DateTime]::UtcNow.ToString("o"); installer=$exeName; installer_sha256=$installerSha256
     installer_bytes=$installerBytes; payload_files=$payloadFiles; payload_bytes=$payloadBytes
     python_runtime=($pyVer -join " "); node_runtime=($nodeVer -join " "); runtime_manifest_valid=$true; secret_scan="clean"
@@ -451,7 +465,7 @@ $report = [ordered]@{
 $reportJson = Join-Path $distDir ("build-report-" + $Version + ".json")
 $reportMd = Join-Path $distDir ("build-report-" + $Version + ".md")
 $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $reportJson -Encoding UTF8
-@("# Email Automation $Version build report", "", "- Git commit: ``$($report.git_commit)``", "- Git tag: ``$($report.git_tag)``", "- Working tree dirty: ``$gitDirty``", "- Installer: ``$exeName``", "- Installer SHA-256: ``$installerSha256``", "- Authenticode: ``$($report.authenticode_status)``", "- TACWork source: ``$($report.tacwork_source_commit)`` (dirty=``$($report.tacwork_source_dirty)``)", "- Electron version: ``$($report.electron_version)``", "- TACWork server version: ``$($report.tacwork_server_version)``", "- Native dependency: ``$($report.native_dependency_status)``", "- Frontend mode: ``$($report.frontend_mode)``", "- Installer bytes: ``$installerBytes``", "- Payload files: ``$payloadFiles``", "- Runtime manifest: valid", "- Secret scan: clean") | Set-Content -LiteralPath $reportMd -Encoding UTF8
+@("# Email Automation $Version build report", "", "- Artifact type: ``$($report.artifact_type)``", "- Git commit: ``$($report.git_commit)``", "- Git tag: ``$($report.git_tag)``", "- Working tree dirty: ``$gitDirty``", "- Installer: ``$exeName``", "- Installer SHA-256: ``$installerSha256``", "- Authenticode: ``$($report.authenticode_status)``", "- TACWork source: ``$($report.tacwork_source_commit)`` (dirty=``$($report.tacwork_source_dirty)``)", "- Electron version: ``$($report.electron_version)``", "- TACWork server version: ``$($report.tacwork_server_version)``", "- Native dependency: ``$($report.native_dependency_status)``", "- Frontend mode: ``$($report.frontend_mode)``", "- Installer bytes: ``$installerBytes``", "- Payload files: ``$payloadFiles``", "- Runtime manifest: valid", "- Secret scan: clean") | Set-Content -LiteralPath $reportMd -Encoding UTF8
 Write-Output ""
 Write-Output "==================== BUILD REPORT ===================="
 Write-Output ("Build time     : " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
