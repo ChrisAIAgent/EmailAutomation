@@ -11,6 +11,10 @@ def _campaign_and_automation(client, db):
     db.flush()
     db.add(models.CampaignContact(campaign_id=campaign["id"], contact_id=contact.id, status="queued"))
     db.commit()
+    # Campaign generation is intentionally limited to active Campaigns. The
+    # automation fixture represents an operator-started Campaign lifecycle.
+    started = client.post(f"/api/campaigns/{campaign['id']}/start")
+    assert started.status_code == 200, started.text
     plan = {
         "execution_mode": "semi_auto", "tick_interval_minutes": 60,
         "daily_send_limit": 1, "stop_on_intents": ["unsubscribe", "opt_out", "bounce"],

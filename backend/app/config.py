@@ -73,20 +73,8 @@ def resolve_data_dir():
     for p in sub.values():
         p.mkdir(parents=True, exist_ok=True)
 
-    # Migrate a legacy backend/app.db left beside the program (fresh installs
-    # exclude it, but a copied folder may contain one). Copy (never Move) so a
-    # read-only source is never corrupted; skip if the target already exists.
-    if mode == "app":
-        legacy_db = Path(_BACKEND_DIR) / "app.db"
-        target_db = sub["database"] / "app.db"
-        if legacy_db.exists() and not target_db.exists():
-            try:
-                import shutil
-
-                shutil.copy2(legacy_db, target_db)
-            except OSError:
-                pass
-
+    # Legacy data migration is intentionally explicit; a fresh app-mode directory
+    # must never inherit business data from the source/install tree.
     return type("DataDir", (), {**sub, "mode": mode, "root": root})()
 
 
@@ -105,8 +93,8 @@ class Settings(BaseSettings):
     # --- Core ---
     APP_NAME: str = "Gmail Outreach Agent"
     APP_ENV: str = "development"
-    APP_URL: str = "http://127.0.0.1:3000"
-    API_URL: str = "http://127.0.0.1:8000"
+    APP_URL: str = "http://127.0.0.1:18001"
+    API_URL: str = "http://127.0.0.1:18000"
     # Database URL. Local default uses an absolute SQLite path under backend/;
     # provide postgresql://... (or sqlite:///...) via env for prod.
     DATABASE_URL: str = _DEFAULT_SQLITE
@@ -115,7 +103,7 @@ class Settings(BaseSettings):
     # --- Google OAuth ---
     GOOGLE_CLIENT_ID: Optional[str] = None
     GOOGLE_CLIENT_SECRET: Optional[str] = None
-    GOOGLE_REDIRECT_URI: str = "http://127.0.0.1:8000/api/gmail/oauth/callback"
+    GOOGLE_REDIRECT_URI: str = "http://127.0.0.1:18000/api/gmail/oauth/callback"
 
     # --- LLM (LangGraph) ---
     LLM_PROVIDER: str = "openai"
@@ -160,6 +148,7 @@ class Settings(BaseSettings):
     INTERNAL_TEST_EMAILS: str = ""
     DEFAULT_TIMEZONE: str = "Asia/Shanghai"
     ENABLE_REAL_SEND: bool = False  # MUST default to False
+    ALLOW_INMEMORY_GMAIL: bool = False  # unit tests / explicit dev injection only
 
     # --- Gmail network timeout ---
     # Hard socket timeout (seconds) applied to EVERY real Gmail API request and
@@ -180,13 +169,13 @@ class Settings(BaseSettings):
     # Loopback-only TACWork server used by the unified desktop runtime.  The
     # fixed client token is the same local collaboration token passed by
     # scripts/tacwork-runtime.ps1; deployments may override both values.
-    TACWORK_SERVER_URL: str = "http://127.0.0.1:8787"
+    TACWORK_SERVER_URL: str = "http://127.0.0.1:18002"
     TACWORK_CLIENT_TOKEN: str = "email-automation-local-v1"
     TACWORK_HTTP_TIMEOUT_SECONDS: int = 15
 
     # --- App ---
     SECRET_KEY: str = "dev-insecure-secret-change-me"
-    CORS_ORIGINS: str = "http://127.0.0.1:3000"
+    CORS_ORIGINS: str = "app://email-automation,http://127.0.0.1:18001,http://localhost:18001"
 
     @property
     def recipient_allowlist(self) -> set[str]:
@@ -209,21 +198,27 @@ def _load_or_create_security(config_dir: Path) -> dict:
     """Load or persist encryption/secret keys (runbook Section 5.7).
 
     In legacy mode we never persist (keeps dev/tests side-effect free); the
-    in-memory defaults from Settings are used. In app mode the keys are written
-    once to ``config/security.json`` so they survive restarts and upgrades.
-    Lost keys are reported (not silently rotated) so the operator can re-authorize
-    Gmail.
+    in-memory defaults from Settings are used. In Windows app mode the keys are
+    protected in the same current-user DPAPI store as OAuth configuration.
+    A legacy ``security.json`` is imported once but never deleted automatically.
+    Lost/unreadable DPAPI credentials are reported rather than silently rotated.
     """
     if _DATA.mode == "legacy":
         return {
             "encryption_key": os.environ.get("APP_ENCRYPTION_KEY"),
             "secret_key": os.environ.get("SECRET_KEY"),
         }
-    path = Path(config_dir) / "security.json"
-    if path.exists():
+    from . import credential_store
+    stored = credential_store.load(Path(config_dir))
+    protected = stored.get("runtime_security")
+    if isinstance(protected, dict) and protected.get("encryption_key") and protected.get("secret_key"):
+        return protected
+    legacy_path = Path(config_dir) / "security.json"
+    if legacy_path.exists():
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(legacy_path.read_text(encoding="utf-8"))
             if data.get("encryption_key") and data.get("secret_key"):
+                credential_store.update(Path(config_dir), {"runtime_security": data})
                 return data
         except (ValueError, OSError):
             pass
@@ -234,20 +229,43 @@ def _load_or_create_security(config_dir: Path) -> dict:
         or _secrets.token_urlsafe(32),
         "secret_key": os.environ.get("SECRET_KEY") or _secrets.token_urlsafe(32),
     }
-    try:
-        path.write_text(json.dumps(data), encoding="utf-8")
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-    except OSError:
-        pass
+    credential_store.update(Path(config_dir), {"runtime_security": data})
     return data
+
+
+def _load_desktop_oauth_into(s: Settings) -> None:
+    """Apply Desktop OAuth configuration without creating local credentials."""
+    # Installed runtimes read customer-owned Desktop OAuth configuration from
+    # the same current-user DPAPI store used by Backend and Consumer.
+    try:
+        from .oauth_config import load as load_desktop_oauth, redirect_uri
+        desktop_oauth = load_desktop_oauth(_DATA.config)
+        if desktop_oauth:
+            s.GOOGLE_CLIENT_ID = desktop_oauth.get("client_id")
+            s.GOOGLE_CLIENT_SECRET = desktop_oauth.get("client_secret")
+            s.GOOGLE_REDIRECT_URI = redirect_uri(s.API_URL)
+    except RuntimeError:
+        # Status endpoints surface credential_key_unavailable; application import
+        # remains available so the user can repair or re-authorize.
+        pass
+
+
+def get_diagnostic_settings() -> Settings:
+    """Return a configuration snapshot suitable for strictly read-only probes.
+
+    Normal startup intentionally initializes the per-user DPAPI security store
+    when it is absent. Manual diagnostics must report that state without
+    creating ``credentials.dat`` merely because an operator opened a report.
+    """
+    s = Settings()
+    _load_desktop_oauth_into(s)
+    return s
 
 
 @lru_cache
 def get_settings() -> Settings:
     s = Settings()
+    _load_desktop_oauth_into(s)
     keys = _load_or_create_security(_DATA.config)
     if not s.APP_ENCRYPTION_KEY and keys.get("encryption_key"):
         s.APP_ENCRYPTION_KEY = keys["encryption_key"]

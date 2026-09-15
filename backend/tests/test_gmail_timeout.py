@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import threading
 import time
+import ssl
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
@@ -22,9 +23,9 @@ import pytest
 from google.oauth2.credentials import Credentials
 
 from app import models
-from app.gmail.auth import maybe_refresh
+from app.gmail.auth import build_credentials, maybe_refresh
 from app.gmail.client import RealGmailTransport
-from app.gmail.transport import GmailTimeoutError, GmailTransport, InMemoryGmailTransport
+from app.gmail.transport import GmailTimeoutError, GmailTransientNetworkError, GmailTransport, InMemoryGmailTransport
 from app.tasks import execute_automation_run
 
 
@@ -46,7 +47,8 @@ class _StubCipher:
 
 
 def _make_connected_account(db):
-    acct = models.GmailAccount(id=1, user_id=1, email="tac.aisolution@gmail.com", is_connected=True)
+    acct = models.GmailAccount(id=1, user_id=1, email="tac.aisolution@gmail.com", is_connected=True,
+                               history_id="1")
     db.add(acct)
     db.flush()
     oauth = models.OAuthCredential(
@@ -56,6 +58,10 @@ def _make_connected_account(db):
         token_expiry=datetime(2999, 1, 1, tzinfo=timezone.utc),
     )
     db.add(oauth)
+    db.add(models.GmailSyncRun(
+        owner_id=1, gmail_account_id=acct.id, kind="initial_full",
+        status="completed", start_history_id="1", latest_history_id="1",
+    ))
     db.flush()
     return acct, oauth
 
@@ -115,7 +121,38 @@ class _TimeoutTransport(GmailTransport):
         raise NotImplementedError
 
     def list_history(self, *a, **k):
-        raise NotImplementedError
+        time.sleep(0.3)
+        raise GmailTimeoutError("gmail_timeout: simulated socket timeout")
+
+
+def test_transient_tls_eof_is_retried_within_bound(monkeypatch):
+    """A proxy/TLS EOF is replayed without leaking credentials into logs."""
+    transport = RealGmailTransport.__new__(RealGmailTransport)
+    transport._service = object()
+    transport._ensure_service = lambda: None
+    monkeypatch.setattr("app.gmail.client.time.sleep", lambda _: None)
+    attempts = {"count": 0}
+
+    def call(_service):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise ssl.SSLEOFError(8, "EOF occurred in violation of protocol")
+        return {"ok": True}
+
+    assert transport._call(call) == {"ok": True}
+    assert attempts["count"] == 3
+
+
+def test_exhausted_tls_eof_is_recognizable_and_durable(monkeypatch):
+    transport = RealGmailTransport.__new__(RealGmailTransport)
+    transport._service = object()
+    transport._ensure_service = lambda: None
+    monkeypatch.setattr("app.gmail.client.time.sleep", lambda _: None)
+
+    with pytest.raises(GmailTransientNetworkError, match="gmail_transport_retry_exhausted"):
+        transport._call(lambda _service: (_ for _ in ()).throw(
+            ssl.SSLEOFError(8, "EOF occurred in violation of protocol")
+        ))
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +189,87 @@ def test_gmail_transport_builds_with_http_timeout_not_credentials():
     assert "credentials" not in captured, f"build() must NOT receive credentials=, got {list(captured)}"
     assert timeouts, "httplib2.Http must be constructed with a timeout"
     assert timeouts[-1] == _StubSettings.GMAIL_HTTP_TIMEOUT_SECONDS
+
+
+def test_update_draft_passes_id_as_gmail_request_parameter():
+    transport = RealGmailTransport.__new__(RealGmailTransport)
+    service = MagicMock()
+    transport._service = service
+    transport._ensure_service = lambda: None
+    service.users.return_value.drafts.return_value.update.return_value.execute.return_value = {
+        "id": "draft-42"
+    }
+
+    result = transport.update_draft(
+        "draft-42", "lead@example.com", "Subject", "Body", "",
+    )
+
+    assert result["id"] == "draft-42"
+    request = service.users.return_value.drafts.return_value.update
+    assert request.call_args.kwargs["id"] == "draft-42"
+    assert "id" not in request.call_args.kwargs["body"]
+
+
+def test_build_credentials_preserves_utc_expiry_for_preflight_refresh():
+    """A persisted expiry must reach google-auth so maybe_refresh can run
+    before the first Gmail API request rather than waiting for a 401."""
+    expired_at = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    creds = build_credentials("access", "refresh", expired_at.timestamp(), _StubSettings())
+
+    assert creds.expiry == expired_at.replace(tzinfo=None)
+    assert creds.expired is True
+
+
+def test_expired_persisted_token_is_refreshed_and_saved_before_gmail_call(monkeypatch):
+    """The normal transport path must save a successful preflight refresh.
+
+    This is entirely mocked: it proves the persistence hand-off without making
+    an OAuth or Gmail network request.
+    """
+    monkeypatch.setattr("app.gmail.client.build", lambda *args, **kwargs: MagicMock())
+    monkeypatch.setattr("app.gmail.client.Cipher", _StubCipher)
+    monkeypatch.setattr("app.gmail.client.get_settings", lambda: _StubSettings())
+
+    def refresh(creds, timeout):
+        assert creds.expired is True
+        creds.token = "fresh-access-token"
+        creds.expiry = datetime(2999, 1, 1)
+        return True
+
+    monkeypatch.setattr("app.gmail.client.maybe_refresh", refresh)
+    acct = models.GmailAccount(id=1, user_id=1, email="me@example.com", is_connected=True)
+    oauth = models.OAuthCredential(
+        gmail_account_id=1, access_token_enc="old-access", refresh_token_enc="refresh",
+        token_expiry=datetime(2000, 1, 1, tzinfo=timezone.utc),
+    )
+    transport = RealGmailTransport(acct, oauth)
+    persisted = []
+    transport._persist_refreshed = lambda creds: persisted.append((creds.token, creds.expiry))
+
+    transport._ensure_service()
+
+    assert persisted == [("fresh-access-token", datetime(2999, 1, 1))]
+    assert transport._persisted_access_token == "fresh-access-token"
+
+
+def test_post_401_refresh_is_persisted_after_successful_call():
+    """AuthorizedHttp can refresh in-memory after a server-side 401; retain
+    that token for later requests rather than repeating the refresh."""
+    transport = RealGmailTransport.__new__(RealGmailTransport)
+    transport._service = object()
+    transport._ensure_service = lambda: None
+    transport._persisted_access_token = "old"
+    transport._creds = MagicMock(token="old")
+    persisted = []
+    transport._persist_refreshed = lambda creds: persisted.append(creds.token)
+
+    def call(_service):
+        transport._creds.token = "refreshed-after-401"
+        return {"ok": True}
+
+    assert transport._call(call) == {"ok": True}
+    assert persisted == ["refreshed-after-401"]
+    assert transport._persisted_access_token == "refreshed-after-401"
 
 
 # ---------------------------------------------------------------------------

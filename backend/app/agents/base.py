@@ -13,6 +13,7 @@ from ..schemas import (
     AgentDecision,
     AgentHealth,
     EmailProposal,
+    ApprovalRevisionInput,
     AnalyzeMessageInput,
     GenerateOutreachInput,
     GenerateFollowUpInput,
@@ -31,6 +32,9 @@ class AgentAdapter(ABC):
 
     @abstractmethod
     def generate_follow_up(self, inp: GenerateFollowUpInput) -> Optional[EmailProposal]: ...
+
+    @abstractmethod
+    def revise_approval(self, inp: ApprovalRevisionInput) -> Optional[EmailProposal]: ...
 
     @abstractmethod
     def plan_next_action(self, inp: PlanNextActionInput) -> Optional[AgentDecision]: ...

@@ -2,16 +2,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from .. import models
 from ..errors import ApiError
-from ..schemas import ApprovalDecision, ApprovalInvalidation, ApprovalOut
+from ..schemas import ApprovalDecision, ApprovalInvalidation, ApprovalOut, ApprovalRevision
 from ..services import approvals as approval_svc
 from ..services import automation as automation_svc
-from .deps import get_db
+from .deps import ensure_owner, get_db
 
 router = APIRouter(prefix="/api/approvals", tags=["approvals"])
 
@@ -137,6 +138,30 @@ def invalidate(approval_id: int, payload: ApprovalInvalidation, db: Session = De
     ))
     db.commit()
     return {"ok": True, "id": approval.id, "status": approval.status}
+
+
+@router.post("/{approval_id}/revise")
+def revise(approval_id: int, payload: ApprovalRevision, db: Session = Depends(get_db)):
+    """Revise one existing pending Approval and Gmail Draft without sending."""
+    owner_id = ensure_owner(db)
+    try:
+        result = approval_svc.revise_pending_approval(
+            db, approval_id, payload.instruction,
+            editor_email=payload.editor_email, owner_id=owner_id,
+        )
+    except approval_svc.ApprovalRevisionError as exc:
+        # Keep an auditable failure outcome without storing the operator's
+        # instruction or any email body.  This route is no-send, so committing
+        # this audit record cannot dispatch the linked Draft.
+        db.add(models.AuditLog(
+            actor=(payload.editor_email or "agent").strip() or "agent",
+            action="approval_revision_failed", entity="approval", entity_id=str(approval_id),
+            detail=json.dumps({"reason": exc.reason}), success=False,
+        ))
+        db.commit()
+        raise HTTPException(status_code=exc.status_code, detail=exc.reason) from exc
+    db.commit()
+    return result
 
 @router.post("/{approval_id}/decision")
 def decide(approval_id: int, payload: ApprovalDecision, db: Session = Depends(get_db)):

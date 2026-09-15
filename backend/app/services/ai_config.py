@@ -32,14 +32,26 @@ class EmailAIConfig:
     api_key: str
 
 
-def _read_flag(db: Session, key: str) -> dict | None:
+def _read_flag_with_state(db: Session, key: str) -> tuple[dict | None, bool, str | None]:
     row = db.get(models.SystemFlag, key)
     if not row or not row.value:
-        return None
+        return None, False, None
     try:
-        return json.loads(get_cipher().decrypt(row.value) or "{}")
+        decrypted = get_cipher().decrypt(row.value)
+        if not decrypted:
+            return None, False, "credential_unreadable"
+        value = json.loads(decrypted)
+        if not isinstance(value, dict):
+            return None, False, "credential_unreadable"
+        return value, True, None
     except Exception:
-        return None
+        # A value encrypted by another runtime/key is not a configured
+        # credential here. Never expose or attempt to recover it.
+        return None, False, "credential_unreadable"
+
+
+def _read_flag(db: Session, key: str) -> dict | None:
+    return _read_flag_with_state(db, key)[0]
 
 
 def _write_flag(db: Session, key: str, value: dict) -> None:
@@ -77,17 +89,36 @@ def _migrate_legacy(db: Session) -> None:
 
 
 def load_email(db: Session) -> EmailAIConfig:
-    _migrate_legacy(db)
-    raw = _read_flag(db, EMAIL_FLAG)
+    config, _state = email_config_state(db, migrate_legacy=True)
+    return config
+
+
+def email_config_state(db: Session, *, migrate_legacy: bool = False) -> tuple[EmailAIConfig, dict]:
+    """Resolve the effective config and an API-safe source/readability state."""
+    if migrate_legacy:
+        _migrate_legacy(db)
+    raw, readable, error_code = _read_flag_with_state(db, EMAIL_FLAG)
+    db_present = db.get(models.SystemFlag, EMAIL_FLAG) is not None
     if raw and raw.get("api_key") and raw.get("model"):
-        return EmailAIConfig(**raw)
+        return EmailAIConfig(**raw), {
+            "source": "db", "db_config_present": db_present,
+            "db_config_readable": True, "usable": True, "error_code": None,
+        }
     settings = get_settings()
-    return EmailAIConfig(
+    config = EmailAIConfig(
         provider_name=settings.LLM_PROVIDER or "openai-compatible",
         base_url=settings.LLM_BASE_URL or "https://api.openai.com/v1",
         model=settings.effective_llm_model,
         api_key=settings.effective_llm_api_key or "",
     )
+    usable = bool(config.api_key and config.model)
+    return config, {
+        "source": "env" if usable else "none",
+        "db_config_present": db_present,
+        "db_config_readable": readable if db_present else None,
+        "usable": usable,
+        "error_code": error_code or ("credential_incomplete" if db_present and readable else None),
+    }
 
 
 def peek_email_config(db: Session) -> Optional[EmailAIConfig]:
@@ -107,11 +138,19 @@ def save_email(db: Session, config: EmailAIConfig) -> None:
     _write_flag(db, EMAIL_FLAG, asdict(config))
 
 
-def public_email(config: EmailAIConfig) -> dict:
+def public_email(config: EmailAIConfig, state: dict | None = None) -> dict:
     return {
         "provider_name": config.provider_name,
         "base_url": config.base_url,
         "model": config.model,
         "api_key_configured": bool(config.api_key),
-        "restart_required": True,
+        # This DB-backed configuration is resolved for every new LangGraph
+        # operation. Claiming a restart was required left the UI stale after a
+        # successful encrypted save.
+        "restart_required": False,
+        "applies_to_next_run": True,
+        **(state or {
+            "source": "db", "db_config_present": True, "db_config_readable": True,
+            "usable": bool(config.api_key and config.model), "error_code": None,
+        }),
     }

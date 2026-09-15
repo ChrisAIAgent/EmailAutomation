@@ -1,10 +1,10 @@
-; Email Automation - Windows installer (Inno Setup 6)
+﻿; Email Automation - Windows installer (Inno Setup 6)
 ; Build:  powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1 -Version "1.0.0"
 ;         (which stages the payload, generates the icon, injects the version
 ;          and calls ISCC on this file)
 
 #define MyAppName "Email Automation"
-#define MyAppVersion "1.1.3"
+#define MyAppVersion "1.2.3"
 #define MyAppPublisher "TAC AISolution"
 #define MyAppId "B8C9D0F2-2E6D-4C89-9A1D-EMAILAUTOMATION"
 
@@ -61,37 +61,49 @@ Source: "assets\EmailAutomation.ico"; DestDir: "{app}\branding"; Flags: ignoreve
 
 [Icons]
 ; Start-menu group
-Name: "{group}\{#MyAppName}"; Filename: "{app}\start-stack.bat"; WorkingDir: "{app}"
+Name: "{group}\{#MyAppName}"; Filename: "{app}\runtime\electron\Email Automation.exe"; WorkingDir: "{app}"
 Name: "{group}\停止 {#MyAppName}"; Filename: "{app}\stop-stack.bat"; WorkingDir: "{app}"
-Name: "{group}\打开 {#MyAppName}"; Filename: "{win}\explorer.exe"; Parameters: "http://127.0.0.1:3000"; WorkingDir: "{app}"
 Name: "{group}\健康检查"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -File ""{app}\scripts\agent-health.ps1"""; WorkingDir: "{app}"
 ; Desktop (optional task)
-Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\start-stack.bat"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\runtime\electron\Email Automation.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
 ; Optional launch after install. start-stack.bat starts only the prebuilt
 ; runtime and opens Web Setup/Dashboard after every service is healthy.
 ; The installer never triggers Gmail sync / drafts / approvals / sends / automations.
-Filename: "{app}\start-stack.bat"; Description: "启动 {#MyAppName}"; Flags: postinstall nowait skipifsilent
+Filename: "{app}\runtime\electron\Email Automation.exe"; Description: "Launch {#MyAppName}"; Flags: postinstall nowait skipifsilent
 
 [Code]
-function InitializeSetup(): Boolean;
+procedure CurStepChanged(CurStep: TSetupStep);
 var
   UninstallKey, UninstallString: string;
   ResultCode: Integer;
+  RepairDir, RepairExe: string;
 begin
-  Result := True;
-  // Upgrade path: if a previous build is installed, stop its running services
-  // before files are replaced, so we never overwrite a live stack.
-  UninstallKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppId}_is1';
-  if (RegQueryStringValue(HKLM, UninstallKey, 'UninstallString', UninstallString)) or
-     (RegQueryStringValue(HKCU, UninstallKey, 'UninstallString', UninstallString)) then begin
-    if FileExists(ExpandConstant('{app}\stop-stack.bat')) then begin
-      Exec('cmd.exe', '/c "{app}\stop-stack.bat"', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // Upgrade path: stop the running stack before files are replaced. This MUST
+  // run from CurStepChanged (NOT InitializeSetup) because {app} is only valid
+  // after the wizard has resolved the destination directory. Calling
+  // ExpandConstant('{app}') inside InitializeSetup raises
+  // "An attempt was made to expand the 'app' constant before it was initialized"
+  // and aborts the install mid-wizard. ssInstall fires after the user clicks
+  // Install (the destination is resolved, so {app} is valid) but before any
+  // file extraction, so we stop the old stack before its files are replaced.
+  if CurStep = ssInstall then begin
+    UninstallKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppId}_is1';
+    if (RegQueryStringValue(HKLM, UninstallKey, 'UninstallString', UninstallString)) or
+       (RegQueryStringValue(HKCU, UninstallKey, 'UninstallString', UninstallString)) then begin
+      if FileExists(ExpandConstant('{app}\stop-stack.bat')) then begin
+        Exec('cmd.exe', '/c "{app}\stop-stack.bat"', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      end;
     end;
   end;
+  if CurStep = ssPostInstall then begin
+    RepairDir := ExpandConstant('{app}\repair');
+    RepairExe := RepairDir + '\Email-Automation-Repair.exe';
+    ForceDirectories(RepairDir);
+    CopyFile(ExpandConstant('{srcexe}'), RepairExe, False);
+  end;
 end;
-
 function IsSilentUninstall(): Boolean;
 var
   i: Integer;

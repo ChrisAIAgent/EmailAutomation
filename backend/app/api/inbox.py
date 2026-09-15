@@ -11,10 +11,12 @@ from __future__ import annotations
 import logging
 import json
 import re
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.exc import IntegrityError
 
 from .. import models
 from ..config import is_internal_test_email
@@ -27,6 +29,7 @@ from ..services.inbox_triage import (
     assess_inbound,
     clear_stale_human_review,
     contact_needs_reply,
+    contact_is_terminal,
     intent_tags,
     recompute_contact_reply_state,
     requires_human_review,
@@ -34,6 +37,9 @@ from ..services.inbox_triage import (
 )
 from ..services.thread_context import build_thread_context
 from ..events import publish
+from ..services.sync import initial_import_completed
+from ..gmail.transport import readable_email_text
+from .. import tasks
 from .deps import get_db, ensure_owner
 
 logger = logging.getLogger("api.inbox")
@@ -425,6 +431,41 @@ def _thread_summary(db: Session, t: models.EmailThread) -> dict:
     }
 
 
+def _thread_summary_prefetched(
+    t: models.EmailThread,
+    contact: models.Contact | None,
+    outreach_status: str | None,
+) -> dict:
+    """Build the public thread shape without issuing per-thread queries.
+
+    The contact-centric Inbox can contain a customer's complete mail history.
+    Its list endpoint therefore preloads messages, Contacts and campaign
+    membership once and passes those values here.  Keep this payload identical
+    to ``_thread_summary`` so callers do not need a separate client contract.
+    """
+    category = _thread_category(t)
+    return {
+        "id": t.id,
+        "campaign_id": t.campaign_id,
+        "subject": t.subject,
+        "contact_email": t.contact_email,
+        "intent": t.intent,
+        "category": category,
+        "category_label": CATEGORY_LABELS.get(category, "unsorted"),
+        "pending_action": _thread_pending_action(t),
+        "review_kind": _review_kind(t, contact),
+        "snippet": t.snippet,
+        "updated_at": t.updated_at,
+        "latest_message_at": _latest_message_at(t),
+        "has_human_reply": bool(t.has_human_reply and t.campaign_id),
+        "outreach_status": outreach_status,
+        "message_count": len(t.messages),
+        "processed": bool(t.intent),
+        "contact_id": contact.id if contact else None,
+        "is_contact": contact is not None,
+    }
+
+
 def _contact_identity(contact: models.Contact | None, email: str) -> dict:
     return {
         "contact_id": contact.id if contact else None,
@@ -455,10 +496,11 @@ def _review_kind(t: models.EmailThread, contact: models.Contact | None) -> str |
         return None
     if t.intent in {"unsubscribe", "opt_out"}:
         return "opt_out_confirmation"
-    # A known Contact does not repeat Contact admission, but special content
-    # still needs a message-level human decision.
+    # Special content from an unknown sender remains a Contact-admission
+    # decision.  A known Contact is reconciled to no-action before it can
+    # reach this display path.
     if t.intent == "triage_review":
-        return "content_uncertain"
+        return "content_uncertain" if contact is not None else "contact_admission_uncertain"
     latest = max(t.messages, key=_message_time, default=None)
     if contact is not None or (latest is not None and not latest.is_incoming):
         return "stale_review"
@@ -499,6 +541,13 @@ def _review_guidance(t: models.EmailThread, contact: models.Contact | None) -> d
     tags = set(_tags_json(contact.tags)) if contact else set()
     latest_text = "\n".join(filter(None, [t.subject or ""] + [m.body_text or m.snippet or "" for m in t.messages[-2:]])).lower()
     title = "是否将此发件人创建为联系人？"
+    if t.intent == "triage_review":
+        return {
+            "kind": "contact_admission_uncertain",
+            "title": title,
+            "reason": t.last_agent_summary or "该发件人的邮件内容无法确认是否属于客户关系。",
+            "recommendation": "如确认这是有效客户，请点「Approve」并填写联系人资料；否则点「Reject」过滤该邮箱。不会生成回复或发送邮件。",
+        }
     if "job_application" in tags or any(word in latest_text for word in ("job application", "resume", "求职", "应聘")):
         return {"kind": "job_application", "title": title, "reason": "Agent 识别为求职/招聘来信，不属于当前销售客户链路。", "recommendation": "建议拒绝进入联系人；如确需保留，可由你人工录入。"}
     if "scripted_content" in tags or "test" in latest_text or "测试" in latest_text:
@@ -508,11 +557,37 @@ def _review_guidance(t: models.EmailThread, contact: models.Contact | None) -> d
     return {"kind": "ambiguous", "title": title, "reason": t.last_agent_summary or "Agent 无法安全确认该发件人是否为业务客户。", "recommendation": "身份明确时可交给 Agent 建联；否则请人工录入或拒绝。"}
 
 
+def _owner_sender_threads(db: Session, owner_id: int, email: str) -> list[models.EmailThread]:
+    return (
+        db.query(models.EmailThread)
+        .join(models.GmailAccount, models.GmailAccount.id == models.EmailThread.gmail_account_id)
+        .options(selectinload(models.EmailThread.messages))
+        .filter(
+            models.GmailAccount.user_id == owner_id,
+            models.EmailThread.contact_email == email,
+        )
+        .all()
+    )
+
+
+def _clear_sender_reviews(rows: list[models.EmailThread], *, summary: str, actor: str, action: str) -> int:
+    """Close current non-opt-out review items for one sender after a sender decision."""
+    cleared = 0
+    for row in rows:
+        if _thread_pending_action(row) != "human_review" or row.intent in {"unsubscribe", "opt_out"}:
+            continue
+        row.pending_action = "no_action"
+        row.last_agent_summary = summary
+        cleared += 1
+    return cleared
+
+
 @router.get("/customers")
 def list_inbox_customers(db: Session = Depends(get_db)):
     """Contact-centric Inbox: one row per sender, with all Gmail threads grouped."""
     threads = (
         db.query(models.EmailThread)
+        .options(selectinload(models.EmailThread.messages))
         .filter(models.EmailThread.contact_email.isnot(None))
         .all()
     )
@@ -523,17 +598,62 @@ def list_inbox_customers(db: Session = Depends(get_db)):
             grouped.setdefault(email, []).append(thread)
 
     owner_id = ensure_owner(db)
-    result = []
-    for email, rows in grouped.items():
-        rows.sort(key=_latest_message_at, reverse=True)
-        contact = db.query(models.Contact).filter_by(owner_id=owner_id, email=email).first()
-        latest = rows[0]
-        categories = [_thread_category(row) for row in rows]
-        campaign_ids = {row.campaign_id for row in rows if row.campaign_id}
-        campaigns = (
+    emails = list(grouped)
+    contacts_by_email = {
+        contact.email.strip().lower(): contact
+        for contact in (
+            db.query(models.Contact)
+            .filter(models.Contact.owner_id == owner_id, models.Contact.email.in_(emails))
+            .all()
+            if emails else []
+        )
+    }
+    review_rules_by_email = {
+        rule.email.strip().lower(): rule
+        for rule in (
+            db.query(models.InboxReviewRule)
+            .filter(
+                models.InboxReviewRule.owner_id == owner_id,
+                models.InboxReviewRule.email.in_(emails),
+                models.InboxReviewRule.review_kind == "content_uncertain",
+                models.InboxReviewRule.action == "no_action",
+            )
+            .all()
+            if emails else []
+        )
+    }
+    campaign_ids = {thread.campaign_id for thread in threads if thread.campaign_id}
+    campaigns_by_id = {
+        campaign.id: campaign
+        for campaign in (
             db.query(models.Campaign).filter(models.Campaign.id.in_(campaign_ids)).all()
             if campaign_ids else []
         )
+    }
+    outreach_status_by_thread_key: dict[tuple[int, str], str] = {}
+    if campaign_ids and emails:
+        membership_rows = (
+            db.query(models.CampaignContact.campaign_id, models.CampaignContact.status, models.Contact.email)
+            .join(models.Contact, models.Contact.id == models.CampaignContact.contact_id)
+            .filter(
+                models.CampaignContact.campaign_id.in_(campaign_ids),
+                models.Contact.owner_id == owner_id,
+                models.Contact.email.in_(emails),
+            )
+            .all()
+        )
+        outreach_status_by_thread_key = {
+            (campaign_id, email.strip().lower()): status
+            for campaign_id, status, email in membership_rows
+        }
+    result = []
+    for email, rows in grouped.items():
+        rows.sort(key=_latest_message_at, reverse=True)
+        contact = contacts_by_email.get(email)
+        latest = rows[0]
+        categories = [_thread_category(row) for row in rows]
+        row_campaign_ids = {row.campaign_id for row in rows if row.campaign_id}
+        campaigns = [campaigns_by_id[campaign_id] for campaign_id in row_campaign_ids if campaign_id in campaigns_by_id]
         identity = _contact_identity(contact, email)
         category = _thread_category(latest)
         if not contact and category == "filtered":
@@ -543,6 +663,14 @@ def list_inbox_customers(db: Session = Depends(get_db)):
             identity["lifecycle_stage"] = "awaiting_reply"
             identity["next_action"] = "none"
         needs_reply = bool(contact and contact.lifecycle_stage == "needs_reply" and contact.next_action == "reply")
+        review_thread_count = sum(_thread_pending_action(row) == "human_review" for row in rows)
+        review_counts = {}
+        for row in rows:
+            kind = _review_kind(row, contact)
+            if kind:
+                review_counts[kind] = review_counts.get(kind, 0) + 1
+        filtered_thread_count = sum(_thread_category(row) == "filtered" for row in rows)
+        unprocessed_thread_count = sum(not row.intent for row in rows)
         stopped = bool(contact and (
             contact.lifecycle_stage == "stopped"
             or contact.status in ("not_interested", "unsubscribed", "bounced", "archived")
@@ -569,9 +697,21 @@ def list_inbox_customers(db: Session = Depends(get_db)):
             "thread_count": len(rows),
             "message_count": sum(len(row.messages) for row in rows),
             "needs_reply": needs_reply,
+            "review_thread_count": review_thread_count,
+            "review_counts": review_counts,
+            "content_review_ignore_enabled": email in review_rules_by_email,
+            "filtered_thread_count": filtered_thread_count,
+            "unprocessed_thread_count": unprocessed_thread_count,
             "priority": priority,
             "campaigns": [{"id": c.id, "name": c.name} for c in campaigns],
-            "threads": [_thread_summary(db, row) for row in rows],
+            "threads": [
+                _thread_summary_prefetched(
+                    row,
+                    contact,
+                    outreach_status_by_thread_key.get((row.campaign_id, email)) if row.campaign_id else None,
+                )
+                for row in rows
+            ],
         })
     return sorted(result, key=lambda row: (row["priority"], row["last_activity_at"]), reverse=True)
 
@@ -593,15 +733,29 @@ def list_threads(
 @router.get("/stats")
 def inbox_stats(db: Session = Depends(get_db)):
     """Counts per category + unprocessed total, for the smart-inbox sidebar."""
-    threads = db.query(models.EmailThread).all()
+    # _thread_category is direction-aware and reads the latest message.  Load
+    # messages in batches so a large first-history import does not turn this
+    # lightweight status endpoint into one query per Gmail thread.
+    threads = db.query(models.EmailThread).options(selectinload(models.EmailThread.messages)).all()
     counts: dict[str, int] = {}
     unprocessed = 0
+    review_senders: set[str] = set()
+    review_threads = 0
     for t in threads:
         cat = _thread_category(t)
         counts[cat] = counts.get(cat, 0) + 1
         if not t.intent:
             unprocessed += 1
-    return {"counts": counts, "unprocessed": unprocessed, "total": len(threads)}
+        if _thread_pending_action(t) == "human_review":
+            review_threads += 1
+            email = (t.contact_email or "").strip().lower()
+            if email:
+                review_senders.add(email)
+    return {
+        "counts": counts, "unprocessed": unprocessed, "total": len(threads),
+        "human_review_threads": review_threads,
+        "human_review_senders": len(review_senders),
+    }
 
 
 @router.get("/threads/{thread_id}")
@@ -645,7 +799,8 @@ def thread_detail(thread_id: int, db: Session = Depends(get_db)):
         "messages": [
             {
                 "id": m.id, "from_email": m.from_email, "to_email": m.to_email,
-                "subject": m.subject, "snippet": m.snippet, "body_text": m.body_text,
+                "subject": m.subject, "snippet": m.snippet,
+                "body_text": readable_email_text(m.body_text, m.body_html),
                 "is_incoming": m.is_incoming, "received_at": m.received_at,
                 "attachments": _atts(m.attachments_meta),
             }
@@ -743,7 +898,7 @@ def resolve_human_review(thread_id: int, payload: HumanReviewDecisionBody, db: S
                 reason=(payload.reason or guidance.get("kind") or "operator_rejected")[:200],
                 source="inbox_review", created_by="user",
             ))
-        for row in db.query(models.EmailThread).filter_by(contact_email=email).all():
+        for row in _owner_sender_threads(db, owner_id, email):
             row.intent = "filtered_non_customer"
             row.pending_action = "no_action"
             row.has_human_reply = False
@@ -782,11 +937,67 @@ def resolve_human_review(thread_id: int, payload: HumanReviewDecisionBody, db: S
                 next_action="review", source="inbox_agent_decide", status="new",
             )
             db.add(contact)
-        t.pending_action = "no_action"
         result = "contact_created_by_agent"
+        _clear_sender_reviews(
+            _owner_sender_threads(db, owner_id, email),
+            summary="Contact admission completed for this sender.", actor="agent", action="contact_admission_resolved",
+        )
     db.add(models.AuditLog(actor="user" if payload.decision == "reject" else "agent", action="contact_admission_resolved", entity="email_thread", entity_id=str(t.id), detail=json.dumps({"decision": payload.decision, "review_kind": guidance.get("kind", "ambiguous"), "result": result, "send_or_draft_created": False}, ensure_ascii=False), success=True))
     db.commit()
     return {**_thread_summary(db, t), "resolved": True, "result": result, "message": "Contact-admission decision saved. No reply, Draft, Approval, or Gmail operation was created."}
+
+
+@router.post("/senders/{sender_email}/content-review/ignore")
+def ignore_sender_content_reviews(sender_email: str, db: Session = Depends(get_db)):
+    """Keep a Contact but stop prompting for its future content-uncertain mail."""
+    owner_id = ensure_owner(db)
+    email = sender_email.strip().lower()
+    contact = db.query(models.Contact).filter_by(owner_id=owner_id, email=email).first()
+    if not contact:
+        raise HTTPException(status_code=409, detail="content_review_rule_requires_contact")
+    rule = db.query(models.InboxReviewRule).filter_by(
+        owner_id=owner_id, email=email, review_kind="content_uncertain"
+    ).first()
+    if not rule:
+        rule = models.InboxReviewRule(
+            owner_id=owner_id, email=email, review_kind="content_uncertain", action="no_action", created_by="user",
+        )
+        db.add(rule)
+    rows = _owner_sender_threads(db, owner_id, email)
+    resolved = 0
+    for row in rows:
+        if _thread_pending_action(row) == "human_review" and row.intent == "triage_review":
+            row.pending_action = "no_action"
+            row.last_agent_summary = "Operator enabled long-term no-action handling for uncertain non-sales content."
+            db.add(models.AuditLog(
+                actor="user", action="inbox_content_review_ignore_enabled", entity="email_thread", entity_id=str(row.id),
+                detail=json.dumps({"email": email, "review_kind": "content_uncertain", "result": "no_action"}, ensure_ascii=False), success=True,
+            ))
+            resolved += 1
+    db.add(models.AuditLog(
+        actor="user", action="inbox_content_review_rule_enabled", entity="inbox_review_rule", entity_id=email,
+        detail=json.dumps({"review_kind": "content_uncertain", "action": "no_action", "resolved_threads": resolved}, ensure_ascii=False), success=True,
+    ))
+    db.commit()
+    return {"enabled": True, "email": email, "review_kind": "content_uncertain", "resolved_threads": resolved}
+
+
+@router.delete("/senders/{sender_email}/content-review/ignore")
+def remove_sender_content_review_ignore(sender_email: str, db: Session = Depends(get_db)):
+    owner_id = ensure_owner(db)
+    email = sender_email.strip().lower()
+    rule = db.query(models.InboxReviewRule).filter_by(
+        owner_id=owner_id, email=email, review_kind="content_uncertain"
+    ).first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="content_review_rule_not_found")
+    db.delete(rule)
+    db.add(models.AuditLog(
+        actor="user", action="inbox_content_review_rule_removed", entity="inbox_review_rule", entity_id=email,
+        detail=json.dumps({"review_kind": "content_uncertain"}, ensure_ascii=False), success=True,
+    ))
+    db.commit()
+    return {"deleted": True, "email": email}
 
 
 class AddThreadContactBody(BaseModel):
@@ -819,7 +1030,10 @@ def add_thread_contact(thread_id: int, payload: AddThreadContactBody, db: Sessio
         source="inbox", status="replied" if t.has_human_reply else "new",
     )
     db.add(contact); db.flush()
-    t.pending_action = "no_action"
+    _clear_sender_reviews(
+        _owner_sender_threads(db, owner_id, (t.contact_email or "").lower()),
+        summary="Contact admission completed for this sender.", actor="user", action="contact_admission_resolved",
+    )
     db.add(models.AuditLog(
         actor="user", action="contact_admission_resolved", entity="email_thread",
         entity_id=str(t.id), detail=json.dumps({"decision": "approve", "result": "contact_created_manually", "contact_id": contact.id, "send_or_draft_created": False}, ensure_ascii=False), success=True,
@@ -952,15 +1166,21 @@ def _analyze_thread(db: Session, t: models.EmailThread) -> dict:
         db.commit()
         return _thread_summary(db, t)
     if requires_human_review(triage.tags):
-        # Special content is not safe to auto-filter from a heuristic tag alone.
-        # Only definite system, advertising, and spam mail reaches the automatic
-        # filtered branch above; uncertain content stays visible for review.
+        # A Contact has already passed the sender-level admission decision.
+        # Special/forwarded/scripted historical content must not reopen that
+        # decision or send the Contact back to the human-review queue.  It is
+        # retained locally as no-action.  Opt-out remains separately detected
+        # below by the Agent decision path and is never auto-cleared here.
+        contact_completed = existing_contact is not None
         t.intent = "triage_review"
-        t.last_agent_summary = triage.reason or "Content requires a human business-context decision."
-        t.pending_action = "human_review"
+        t.last_agent_summary = (
+            "Existing Contact; uncertain non-sales content was retained as no action."
+            if contact_completed else (triage.reason or "Content requires a human business-context decision.")
+        )
+        t.pending_action = "no_action" if contact_completed else "human_review"
         t.has_human_reply = False
         db.add(models.AuditLog(
-            actor="agent", action="inbox_content_review_required", entity="email_thread",
+            actor="agent", action="existing_contact_content_no_action" if contact_completed else "inbox_content_review_required", entity="email_thread",
             entity_id=str(t.id), detail=f"tags={','.join(sorted(triage.tags))}", success=True,
         ))
         db.commit()
@@ -1103,32 +1323,320 @@ def clear_stale_review(thread_id: int, db: Session = Depends(get_db)):
     return _thread_summary(db, t)
 
 
+_TRIAGE_INFLIGHT = {"queued", "running", "paused", "recovery_pending"}
+_INITIAL_TRIAGE_INFLIGHT = _TRIAGE_INFLIGHT  # compatibility for existing callers/tests
+
+
+def _triage_run_out(db: Session, run: models.InboxTriageRun | None) -> dict:
+    if run is None:
+        return {"run": None}
+    terminal = run.processed_threads + run.skipped_threads + run.failed_threads
+    total_batches = (run.total_threads + run.batch_size - 1) // run.batch_size if run.batch_size else 0
+    source_import_threads = None
+    if run.gmail_sync_run_id and run.kind == "initial_history":
+        source_import = db.get(models.GmailSyncRun, run.gmail_sync_run_id)
+        source_import_threads = source_import.threads_scanned if source_import else None
+    return {
+        "run": {
+            "id": run.id,
+            "kind": run.kind,
+            "created_at": run.created_at,
+            "status": run.status,
+            "total_threads": run.total_threads,
+            "processed_threads": run.processed_threads,
+            "auto_filtered": run.auto_filtered,
+            "human_review": run.human_review,
+            "business_threads": run.business_threads,
+            "no_action": run.no_action,
+            "skipped_threads": run.skipped_threads,
+            "failed_threads": run.failed_threads,
+            "terminal_threads": terminal,
+            "remaining_threads": max(run.total_threads - terminal, 0),
+            "progress_percent": round((terminal / run.total_threads) * 100, 1) if run.total_threads else 100.0,
+            "batch_size": run.batch_size,
+            "current_batch": run.current_batch,
+            "total_batches": total_batches,
+            "started_at": run.started_at,
+            "finished_at": run.finished_at,
+            "last_progress_at": run.last_progress_at,
+            "error": run.error,
+            "source_import_threads": source_import_threads,
+            "can_pause": run.status in {"queued", "running"},
+            "can_resume": run.status in {"paused", "failed", "recovery_pending"},
+            "can_cancel": run.status in _TRIAGE_INFLIGHT,
+            "can_retry_failed": run.status in {"completed", "failed"} and run.failed_threads > 0,
+        }
+    }
+
+
+def _latest_triage(db: Session, owner_id: int, kind: str) -> models.InboxTriageRun | None:
+    return (
+        db.query(models.InboxTriageRun)
+        .filter_by(owner_id=owner_id, kind=kind)
+        .order_by(models.InboxTriageRun.id.desc())
+        .first()
+    )
+
+
+def _latest_initial_triage(db: Session, owner_id: int) -> models.InboxTriageRun | None:
+    return _latest_triage(db, owner_id, "initial_history")
+
+
+def _active_triage(db: Session, owner_id: int) -> models.InboxTriageRun | None:
+    return (
+        db.query(models.InboxTriageRun)
+        .filter(models.InboxTriageRun.owner_id == owner_id,
+                models.InboxTriageRun.status.in_(_TRIAGE_INFLIGHT))
+        .order_by(models.InboxTriageRun.id.desc())
+        .first()
+    )
+
+
+def _initial_triage_run_out(run: models.InboxTriageRun | None, db: Session | None = None) -> dict:
+    """Compatibility adapter used by existing tests and first-history handlers."""
+    if db is None:
+        raise RuntimeError("db is required for triage output")
+    return _triage_run_out(db, run)
+
+
+@router.get("/initial-triage/current")
+def initial_triage_current(db: Session = Depends(get_db)):
+    return _triage_run_out(db, _latest_initial_triage(db, ensure_owner(db)))
+
+
+@router.get("/daily-triage/current")
+def daily_triage_current(db: Session = Depends(get_db)):
+    return _triage_run_out(db, _latest_triage(db, ensure_owner(db), "daily_incremental"))
+
+
+@router.get("/triage/recent")
+def recent_triage_result(db: Session = Depends(get_db)):
+    owner_id = ensure_owner(db)
+    run = (
+        db.query(models.InboxTriageRun)
+        .filter_by(owner_id=owner_id)
+        .order_by(models.InboxTriageRun.id.desc())
+        .first()
+    )
+    return _triage_run_out(db, run)
+
+
+@router.post("/initial-triage")
+def start_initial_triage(db: Session = Depends(get_db)):
+    """Create a frozen local snapshot for the one-time post-import triage."""
+    owner_id = ensure_owner(db)
+    completed_import = (
+        db.query(models.GmailSyncRun)
+        .filter_by(owner_id=owner_id, kind="initial_full", status="completed")
+        .order_by(models.GmailSyncRun.id.desc())
+        .first()
+    )
+    if completed_import is None or not initial_import_completed(db, completed_import.gmail_account_id):
+        raise HTTPException(status_code=409, detail="INITIAL_IMPORT_REQUIRED")
+    inflight = _active_triage(db, owner_id)
+    if inflight is not None:
+        return {"ok": True, "created": False, **_triage_run_out(db, inflight)}
+
+    thread_ids = [
+        row[0] for row in (
+            db.query(models.EmailThread.id)
+            .join(models.GmailAccount, models.GmailAccount.id == models.EmailThread.gmail_account_id)
+            .filter(models.GmailAccount.user_id == owner_id, models.EmailThread.intent.is_(None))
+            .order_by(models.EmailThread.id.asc())
+            .all()
+        )
+    ]
+    run = models.InboxTriageRun(
+        owner_id=owner_id,
+        gmail_sync_run_id=completed_import.id,
+        kind="initial_history",
+        status="queued",
+        batch_size=50,
+        total_threads=len(thread_ids),
+    )
+    db.add(run)
+    try:
+        db.flush()
+        db.add_all([
+            models.InboxTriageRunItem(triage_run_id=run.id, email_thread_id=thread_id, status="queued")
+            for thread_id in thread_ids
+        ])
+        db.add(models.AuditLog(
+            actor="user", action="initial_inbox_triage_started",
+            entity="inbox_triage_run", entity_id=str(run.id),
+            detail=f"snapshot_threads={len(thread_ids)};source_import={completed_import.id};batch_size=50",
+        ))
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        existing = _active_triage(db, owner_id)
+        if existing is not None:
+            return {"ok": True, "created": False, **_triage_run_out(db, existing)}
+        raise
+    tasks.enqueue_initial_inbox_triage(run.id)
+    return {"ok": True, "created": True, **_triage_run_out(db, run)}
+
+
+@router.post("/initial-triage/{run_id}/retry-failed")
+def retry_initial_triage_failures(run_id: int, db: Session = Depends(get_db)):
+    owner_id = ensure_owner(db)
+    run = db.get(models.InboxTriageRun, run_id)
+    if run is None or run.owner_id != owner_id or run.kind != "initial_history":
+        raise HTTPException(status_code=404, detail="initial_triage_not_found")
+    if run.status not in {"completed", "failed"} or run.failed_threads <= 0:
+        raise HTTPException(status_code=409, detail="initial_triage_no_failed_items")
+    retried = db.query(models.InboxTriageRunItem).filter_by(
+        triage_run_id=run.id, status="failed"
+    ).update({"status": "queued", "outcome": None, "error": None}, synchronize_session=False)
+    run.failed_threads = max(run.failed_threads - retried, 0)
+    run.status = "queued"
+    run.error = None
+    run.finished_at = None
+    run.last_progress_at = datetime.now(timezone.utc)
+    db.add(models.AuditLog(
+        actor="user", action="initial_inbox_triage_retry_failed",
+        entity="inbox_triage_run", entity_id=str(run.id), detail=f"items={retried};no_send",
+    ))
+    db.commit()
+    tasks.enqueue_initial_inbox_triage(run.id)
+    return {"ok": True, "retried": retried, **_triage_run_out(db, run)}
+
+
+@router.post("/initial-triage/{run_id}/{action}")
+def control_initial_triage(run_id: int, action: str, db: Session = Depends(get_db)):
+    owner_id = ensure_owner(db)
+    run = db.get(models.InboxTriageRun, run_id)
+    if run is None or run.owner_id != owner_id or run.kind != "initial_history":
+        raise HTTPException(status_code=404, detail="initial_triage_not_found")
+    if action == "pause":
+        if run.status not in {"queued", "running"}:
+            raise HTTPException(status_code=409, detail=f"initial_triage_is_{run.status}")
+        run.status = "paused"
+    elif action == "resume":
+        if run.status not in {"paused", "failed", "recovery_pending"}:
+            raise HTTPException(status_code=409, detail=f"initial_triage_is_{run.status}")
+        db.query(models.InboxTriageRunItem).filter_by(triage_run_id=run.id, status="running").update(
+            {"status": "queued"}, synchronize_session=False
+        )
+        run.status = "queued"
+        run.error = None
+        run.finished_at = None
+    elif action == "cancel":
+        if run.status not in _INITIAL_TRIAGE_INFLIGHT:
+            raise HTTPException(status_code=409, detail=f"initial_triage_is_{run.status}")
+        run.status = "cancelled"
+        run.finished_at = datetime.now(timezone.utc)
+    else:
+        raise HTTPException(status_code=404, detail="initial_triage_action_not_found")
+    run.last_progress_at = datetime.now(timezone.utc)
+    db.add(models.AuditLog(
+        actor="user", action=f"initial_inbox_triage_{action}",
+        entity="inbox_triage_run", entity_id=str(run.id), detail="no_send",
+    ))
+    db.commit()
+    if action == "resume":
+        tasks.enqueue_initial_inbox_triage(run.id)
+    publish("inbox", {"action": f"initial_triage_{action}", "run_id": run.id})
+    return {"ok": True, **_triage_run_out(db, run)}
+
+
+@router.post("/daily-triage")
+def start_daily_triage(db: Session = Depends(get_db)):
+    """Freeze every currently untriaged thread for one resumable daily run.
+
+    The worker still takes 50-thread safety batches internally; this endpoint
+    intentionally has no user-facing total limit.
+    """
+    owner_id = ensure_owner(db)
+    completed_import = (
+        db.query(models.GmailSyncRun)
+        .filter_by(owner_id=owner_id, kind="initial_full", status="completed")
+        .order_by(models.GmailSyncRun.id.desc()).first()
+    )
+    if completed_import is None or not initial_import_completed(db, completed_import.gmail_account_id):
+        raise HTTPException(status_code=409, detail="INITIAL_IMPORT_REQUIRED")
+    inflight = _active_triage(db, owner_id)
+    if inflight is not None:
+        return {"ok": True, "created": False, "reason": "TRIAGE_RUN_ACTIVE", **_triage_run_out(db, inflight)}
+    thread_ids = [row[0] for row in (
+        db.query(models.EmailThread.id)
+        .join(models.GmailAccount, models.GmailAccount.id == models.EmailThread.gmail_account_id)
+        .filter(models.GmailAccount.user_id == owner_id, models.EmailThread.intent.is_(None))
+        .order_by(models.EmailThread.id.asc()).all()
+    )]
+    if not thread_ids:
+        return {"ok": True, "created": False, "reason": "NO_UNTRIAGED_THREADS", "run": None}
+    run = models.InboxTriageRun(
+        owner_id=owner_id, kind="daily_incremental", status="queued",
+        batch_size=50, total_threads=len(thread_ids),
+    )
+    db.add(run)
+    try:
+        db.flush()
+        db.add_all([models.InboxTriageRunItem(triage_run_id=run.id, email_thread_id=thread_id, status="queued") for thread_id in thread_ids])
+        db.add(models.AuditLog(
+            actor="user", action="daily_inbox_triage_started", entity="inbox_triage_run",
+            entity_id=str(run.id), detail=f"snapshot_threads={len(thread_ids)};batch_size=50;no_send",
+        ))
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        existing = _active_triage(db, owner_id)
+        if existing is not None:
+            return {"ok": True, "created": False, "reason": "TRIAGE_RUN_ACTIVE", **_triage_run_out(db, existing)}
+        raise
+    tasks.enqueue_daily_inbox_triage(run.id)
+    return {"ok": True, "created": True, **_triage_run_out(db, run)}
+
+
+@router.post("/daily-triage/{run_id}/retry-failed")
+def retry_daily_triage_failures(run_id: int, db: Session = Depends(get_db)):
+    owner_id = ensure_owner(db)
+    run = db.get(models.InboxTriageRun, run_id)
+    if run is None or run.owner_id != owner_id or run.kind != "daily_incremental":
+        raise HTTPException(status_code=404, detail="daily_triage_not_found")
+    if run.status not in {"completed", "failed"} or run.failed_threads <= 0:
+        raise HTTPException(status_code=409, detail="daily_triage_no_failed_items")
+    retried = db.query(models.InboxTriageRunItem).filter_by(triage_run_id=run.id, status="failed").update(
+        {"status": "queued", "outcome": None, "error": None}, synchronize_session=False)
+    run.failed_threads = max(run.failed_threads - retried, 0)
+    run.status, run.error, run.finished_at, run.last_progress_at = "queued", None, None, datetime.now(timezone.utc)
+    db.commit()
+    tasks.enqueue_daily_inbox_triage(run.id)
+    return {"ok": True, "retried": retried, **_triage_run_out(db, run)}
+
+
+@router.post("/daily-triage/{run_id}/{action}")
+def control_daily_triage(run_id: int, action: str, db: Session = Depends(get_db)):
+    owner_id = ensure_owner(db)
+    run = db.get(models.InboxTriageRun, run_id)
+    if run is None or run.owner_id != owner_id or run.kind != "daily_incremental":
+        raise HTTPException(status_code=404, detail="daily_triage_not_found")
+    if action == "pause" and run.status in {"queued", "running"}:
+        run.status = "paused"
+    elif action == "resume" and run.status in {"paused", "failed", "recovery_pending"}:
+        db.query(models.InboxTriageRunItem).filter_by(triage_run_id=run.id, status="running").update({"status": "queued"}, synchronize_session=False)
+        run.status, run.error, run.finished_at = "queued", None, None
+    elif action == "cancel" and run.status in _TRIAGE_INFLIGHT:
+        run.status, run.finished_at = "cancelled", datetime.now(timezone.utc)
+    else:
+        raise HTTPException(status_code=409, detail=f"daily_triage_is_{run.status}")
+    run.last_progress_at = datetime.now(timezone.utc)
+    db.commit()
+    if action == "resume":
+        tasks.enqueue_daily_inbox_triage(run.id)
+    publish("inbox", {"action": f"daily_triage_{action}", "kind": run.kind, "run_id": run.id})
+    return {"ok": True, **_triage_run_out(db, run)}
+
+
 @router.post("/sort")
 def sort_inbox(db: Session = Depends(get_db), limit: int = 50):
-    """Agent one-click sort: classify every unprocessed thread in the inbox.
+    """Compatibility alias for the resumable, unbounded daily snapshot Run.
 
-    Only threads without an intent yet are (re)analyzed, so re-running is cheap
-    and idempotent. Eligible inbound senders are also promoted into Contacts;
-    irrelevant/unknown/marketing mail is excluded.
+    ``limit`` is intentionally ignored.  Fifty remains the worker's safe batch
+    size, never the number of newly synced conversations a user may process.
     """
-    threads = (
-        db.query(models.EmailThread)
-        .filter(models.EmailThread.intent.is_(None))
-        .order_by(models.EmailThread.updated_at.desc())
-        .limit(limit)
-        .all()
-    )
-    results = []
-    failed = 0
-    for t in threads:
-        try:
-            results.append(_analyze_thread(db, t))
-        except HTTPException as e:
-            logger.warning("sort failed for thread %s: %s", t.id, e.detail)
-            failed += 1
-            continue
-    publish("inbox", {"action": "sort", "sorted": len(results), "failed": failed})
-    return {"sorted": len(results), "failed": failed, "results": results}
+    return start_daily_triage(db)
 
 
 class ReplyBody(BaseModel):
@@ -1178,6 +1686,8 @@ def generate_reply(thread_id: int, db: Session = Depends(get_db)):
             if db.get(models.GmailAccount, t.gmail_account_id) else None
         )
         contact = db.query(models.Contact).filter_by(owner_id=owner_id, email=t.contact_email).first()
+    if contact_is_terminal(contact):
+        raise HTTPException(status_code=409, detail="contact_not_eligible_for_reply")
     cc = None
     if contact is not None and campaign is not None and t.campaign_id == campaign.id:
         cc = db.query(models.CampaignContact).filter_by(campaign_id=campaign.id, contact_id=contact.id).first()

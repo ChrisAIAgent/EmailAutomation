@@ -6,5 +6,5 @@ param(
 $ErrorActionPreference = "Stop"
 $rootPath = (Resolve-Path $Root).Path
 Write-Output "Portable workspace root: $rootPath"
-& (Join-Path $PSScriptRoot "start-demo.ps1") -Root $rootPath
+& (Join-Path $PSScriptRoot "start-stack.ps1") -Root $rootPath
 exit $LASTEXITCODE

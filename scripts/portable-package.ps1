@@ -46,7 +46,14 @@ Write-Output ("Packaging portable workspace from: " + $root)
 $staging = Join-Path $root ".portable_stage"
 if ($StageDir) {
     # Installer mode: stage straight into the caller-supplied directory.
-    $payload = $StageDir
+    # Normalize to a canonical long-path form: callers (or $env:TEMP) may
+    # pass an 8.3 short-name path (e.g. C:\Users\ADMINI~1\...), but
+    # Get-ChildItem.FullName returns the fully-qualified long form. A
+    # Substring($payload.Length + 1) on a short-name base against a
+    # long-name FullName silently produces malformed relative paths
+    # (truncated prefixes like "159/runtime/..."). GetFullPath delegates
+    # to the Windows API GetFullPathName, which resolves 8.3 segments.
+    $payload = [System.IO.Path]::GetFullPath($StageDir)
 } else {
     $payload = Join-Path $staging "Email Automation"
 }
@@ -84,6 +91,7 @@ $xdNames = @(
     ".venv",
     ".pytest_cache",
     ".pytest-tmp",
+    ".tmp-*",
     ".next",
     ".next-dev",
     ".next-prod",
@@ -108,6 +116,7 @@ $xdPaths = @(
     # original build machine's absolute paths - they must never ship.
     (Join-Path $root "backend\logs"),
     (Join-Path $root "reports"),
+    (Join-Path $root "audit"),
     (Join-Path $root "qa-e2e"),
     (Join-Path $root "qa_scripts"),
     (Join-Path $root ".pytest-final-all"),
@@ -119,8 +128,8 @@ $xdPaths = @(
     # Stray pytest temp dir left by local test runs (no secret, just noise).
     (Join-Path $root "backend\.pytest-temp"),
     # Local test suite + fixtures are not part of the customer deliverable.
-    (Join-Path $root "backend\tests")
-    (Join-Path $root "offline-cache")
+    (Join-Path $root "backend\tests"),
+    (Join-Path $root "offline-cache"),
     (Join-Path $root "runtime\.frontend-build")
 )
 if (-not $IncludeData) {
@@ -139,6 +148,7 @@ if (-not $IncludeData) {
 # The project's own frontend deps are renewable (rebuilt by portable-bootstrap).
 # robocopy /XD does NOT accept wildcards inside a full path, so resolve the real
 # directory names now - this also catches leftovers like node_modules.broken-e-drive.
+$xdPaths += (Join-Path $root "desktop\node_modules")
 Get-ChildItem (Join-Path $root "frontend") -Directory -Force -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -like "node_modules*" } |
     ForEach-Object { $xdPaths += $_.FullName }
@@ -155,7 +165,7 @@ if ($StageDir) {
 # "nul"/"con"/"aux"/"prn" are reserved Windows device names. A stray file with
 # such a name cannot be deleted or extracted by normal tooling, so it must never
 # enter the archive.
-$xf = @("nul", "con", "aux", "prn", "*.log", "*.bak", "*.pyc", "*.zip", "*.docx", "debug_*.py", "_procs.txt", "_start_out.txt", ".env", ".env.local", "smoke*.db", "test.db", "*.tsbuildinfo")
+$xf = @("nul", "con", "aux", "prn", "*.log", "*.bak", "*.pyc", "*.zip", "*.docx", "debug_*.py", "_procs.txt", "_start_out.txt", ".env", ".env.local", "smoke*.db", "test.db", "*.tsbuildinfo", "REMAINING-PLAN.md")
 if (-not $IncludeData) { $xf += @("app.db*", "huey.db*", "*.sqlite", "*.sqlite3") }
 
 # Keep the robocopy log under logs/ (which is itself excluded from the archive),
@@ -179,6 +189,15 @@ if ($LASTEXITCODE -ge 8) {
     throw ("robocopy staging failed (exit $LASTEXITCODE). See the details above and $rcLog.")
 }
 
+# Ship only customer-facing neutral templates/runbooks from audit; never package
+# local analysis reports, sample contacts or QA evidence.
+$templateTarget = Join-Path (Join-Path $payload "docs") "templates"
+New-Item -ItemType Directory -Force -Path $templateTarget | Out-Null
+foreach ($templateName in @("kb-content-template.md", "WINDOWS_CUSTOMER_PACKAGING_RUNBOOK.md")) {
+    $templateSource = Join-Path (Join-Path $root "audit") $templateName
+    if (Test-Path -LiteralPath $templateSource) { Copy-Item -LiteralPath $templateSource -Destination $templateTarget -Force }
+}
+
 # --- Integrity sweep: the bundled runtimes must be complete ---------------
 # A broken exclusion rule can silently gut the bundled npm/Node/Python and the
 # damage only shows up on the target machine. Fail loudly here instead.
@@ -191,6 +210,8 @@ $mustExist = @(
     "backend\requirements.txt",
     "runtime\python-packages",
     "runtime\frontend\server.js",
+    "runtime\frontend-static\index.html",
+    "runtime\electron\Email Automation.exe",
     "runtime\runtime-manifest.json",
     "scripts\portable-start.ps1",
     "scripts\portable-start-unified.ps1",
@@ -279,6 +300,52 @@ if (-not $IncludeData) {
 
 # --- Installer mode: no archive, caller owns the staged directory --------
 if ($StageDir) {
+    # Regenerate runtime-manifest.json FROM the staged payload, so the
+    # manifest strictly equals what the customer actually receives.
+    # build-runtime.ps1 generates the manifest against runtime/ on the
+    # build machine (where runtime/frontend/.next-prod/ exists, because
+    # it is produced by `next build` and kept in runtime/ for local dev).
+    # The staging exclusions above deliberately strip .next-prod,
+    # .frontend-build, .frontend-repair-*, etc. from the payload.
+    # Shipping a manifest that lists files the payload does not contain
+    # makes verify-runtime.ps1 fail on the customer machine with
+    # runtime_integrity_failed:missing:<file>. Regenerating from the
+    # payload closes that gap permanently: any future drift between
+    # staging exclusions and the manifest is caught at build time (M3)
+    # instead of discovered at customer startup.
+    $payloadRuntimeDir = Join-Path $payload "runtime"
+    $payloadManifest = Join-Path $payloadRuntimeDir "runtime-manifest.json"
+    if (Test-Path -LiteralPath $payloadManifest) {
+        $payloadVersion = (Get-Content -Raw (Join-Path $root "VERSION")).Trim()
+        $regenManifest = [ordered]@{
+            version = $payloadVersion
+            built_at = [DateTime]::UtcNow.ToString("o")
+            python = "tools/python/python.exe"
+            python_packages = "runtime/python-packages"
+            frontend_server = "runtime/frontend/server.js"
+            frontend_static = "runtime/frontend-static/index.html"
+            desktop_executable = "runtime/electron/Email Automation.exe"
+            files = @(
+                Get-ChildItem -LiteralPath $payloadRuntimeDir -Recurse -File -Force -ErrorAction SilentlyContinue |
+                    Where-Object { $_.FullName -ne $payloadManifest } |
+                    ForEach-Object {
+                        [ordered]@{
+                            path = $_.FullName.Substring($payload.Length + 1).Replace("\", "/")
+                            sha256 = ([System.BitConverter]::ToString(
+                                [System.Security.Cryptography.SHA256]::Create().ComputeHash(
+                                    [System.IO.File]::ReadAllBytes($_.FullName)
+                                )
+                            ) -replace '-', '')
+                            bytes = $_.Length
+                        }
+                    }
+            )
+        }
+        $regenManifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $payloadManifest -Encoding UTF8
+        Write-Output ("Re-generated runtime-manifest.json from payload: " + $regenManifest.files.Count + " files (strictly equals customer payload).")
+    } else {
+        Write-Output "WARN: payload/runtime/runtime-manifest.json not found - skipped regeneration. Staging rules may have stripped it."
+    }
     Write-Output ""
     Write-Output ("Staged payload (installer mode): " + $payload)
     if (-not $IncludeData) {

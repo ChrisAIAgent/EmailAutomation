@@ -155,6 +155,7 @@ def test_reply_send_clears_needs_reply_state(db, monkeypatch):
     """改动 2: a sent reply (kind=reply) must leave the contact in
     waiting_for_customer / awaiting_reply, not stuck in needs_reply."""
     from app.gmail.client import RealGmailTransport
+    from app.policy import engine as policy_engine
 
     class FakeRealTransport(RealGmailTransport):
         def __init__(self):
@@ -168,6 +169,10 @@ def test_reply_send_clears_needs_reply_state(db, monkeypatch):
             return {"id": "sent-msg-1"}
 
     _setenv(ENABLE_REAL_SEND="true", RESTRICTED_RECIPIENT_ALLOWLIST="lead@example.com")
+    # Keep this state-transition test independent of the real calendar. The
+    # sending-window rule has dedicated policy tests; this test verifies only
+    # the post-send reply transition below.
+    monkeypatch.setattr(policy_engine, "_now_utc", lambda: datetime(2026, 8, 31, 12, tzinfo=timezone.utc))
     acct, camp, contact, cc = _setup(db)
     contact.lifecycle_stage = "needs_reply"
     contact.next_action = "reply"

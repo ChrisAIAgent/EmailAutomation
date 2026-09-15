@@ -1,11 +1,15 @@
 param(
-    [string]$ApiBase = "http://127.0.0.1:8000",
+    [string]$ApiBase = "",
     [switch]$RequireRealSend,
     [switch]$RequireEmptyOperationalData,
     [switch]$Json
 )
 
 $ErrorActionPreference = "Stop"
+if (-not $ApiBase) {
+    $port = if ($env:EMAIL_AUTOMATION_BACKEND_PORT) { $env:EMAIL_AUTOMATION_BACKEND_PORT } else { "18000" }
+    $ApiBase = "http://127.0.0.1:$port"
+}
 try {
     $health = Invoke-RestMethod "$ApiBase/api/health" -TimeoutSec 5
     $gmail = Invoke-RestMethod "$ApiBase/api/gmail/status" -TimeoutSec 5

@@ -74,7 +74,7 @@ def test_changing_disabled_interval_does_not_start_takeover(client):
     assert body["active_session_id"] == ""
 
 
-def test_capability_can_only_start_global_inbox(client, db):
+def test_capability_can_start_owned_enabled_full_auto_runs(client, db):
     response = client.post("/api/agent-takeover", json={"enabled": True, "interval_minutes": 60})
     global_id = response.json()["global_automation_id"]
     token = "scheduled-session-secret"
@@ -92,13 +92,99 @@ def test_capability_can_only_start_global_inbox(client, db):
     db.add(campaign_automation); db.commit()
 
     allowed = client.post("/api/agent-takeover/authorize", json={
-        "token": token, "operation": "start_global_run", "automation_id": global_id,
+        "token": token, "operation": "start_agent_run", "automation_id": global_id,
     })
     assert allowed.status_code == 200
-    denied = client.post("/api/agent-takeover/authorize", json={
-        "token": token, "operation": "start_global_run", "automation_id": campaign_automation.id,
+    campaign_allowed = client.post("/api/agent-takeover/authorize", json={
+        "token": token, "operation": "start_agent_run", "automation_id": campaign_automation.id,
     })
-    assert denied.status_code == 403
+    assert campaign_allowed.status_code == 200
+    campaign_automation.execution_mode = "semi_auto"; db.commit()
+    denied = client.post("/api/agent-takeover/authorize", json={
+        "token": token, "operation": "start_agent_run", "automation_id": campaign_automation.id,
+    })
+    assert denied.status_code == 409
+
+
+def test_capability_checks_campaign_and_automation_ownership(client, db):
+    client.post("/api/agent-takeover", json={"enabled": True, "interval_minutes": 60})
+    token = "ownership-secret"
+    flags.set_flag(db, takeover_svc.FLAG_TOKEN_HASH, hashlib.sha256(token.encode()).hexdigest())
+    flags.set_flag(db, takeover_svc.FLAG_TOKEN_EXPIRES, (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
+    owned_campaign = models.Campaign(
+        owner_id=1, name="Owned", status="draft", sender_name="A", sender_company="B",
+        product_description="P", target_audience="T", tone="professional",
+    )
+    foreign_campaign = models.Campaign(
+        owner_id=2, name="Foreign", status="draft", sender_name="A", sender_company="B",
+        product_description="P", target_audience="T", tone="professional",
+    )
+    foreign_automation = models.Automation(
+        owner_id=2, name="Foreign automation", prompt="p", scope="global",
+        plan_json="{}", status="disabled", execution_mode="semi_auto",
+    )
+    foreign_user = models.User(id=2, email="foreign@example.com", name="Foreign Owner")
+    owned_account = models.GmailAccount(user_id=1, email="owner@example.com")
+    foreign_account = models.GmailAccount(user_id=2, email="foreign@example.com")
+    db.add_all([
+        owned_campaign, foreign_campaign, foreign_automation, foreign_user,
+        owned_account, foreign_account,
+    ])
+    db.flush()
+    owned_thread = models.EmailThread(gmail_account_id=owned_account.id, gmail_thread_id="owned-thread")
+    foreign_thread = models.EmailThread(gmail_account_id=foreign_account.id, gmail_thread_id="foreign-thread")
+    db.add_all([owned_thread, foreign_thread]); db.flush()
+    owned_draft = models.EmailDraft(
+        gmail_account_id=owned_account.id, thread_id=owned_thread.id,
+        to_email="customer@example.com", subject="Subject", body_text="Body", status="draft",
+    )
+    foreign_draft = models.EmailDraft(
+        gmail_account_id=foreign_account.id, thread_id=foreign_thread.id,
+        to_email="foreign-customer@example.com", subject="Subject", body_text="Body", status="draft",
+    )
+    db.add_all([owned_draft, foreign_draft]); db.flush()
+    owned_approval = models.Approval(
+        kind="reply", thread_id=owned_thread.id, draft_id=owned_draft.id,
+        to_email=owned_draft.to_email, subject="Subject", body_text="Body", status="pending",
+    )
+    foreign_approval = models.Approval(
+        kind="reply", thread_id=foreign_thread.id, draft_id=foreign_draft.id,
+        to_email=foreign_draft.to_email, subject="Subject", body_text="Body", status="pending",
+    )
+    db.add_all([owned_approval, foreign_approval]); db.commit()
+
+    owned = client.post("/api/agent-takeover/authorize", json={
+        "token": token, "operation": "add_campaign_contacts", "campaign_id": owned_campaign.id,
+    })
+    assert owned.status_code == 200, owned.text
+    removal = client.post("/api/agent-takeover/authorize", json={
+        "token": token, "operation": "remove_campaign_contact", "campaign_id": owned_campaign.id,
+    })
+    assert removal.status_code == 200, removal.text
+    foreign_campaign_reply = client.post("/api/agent-takeover/authorize", json={
+        "token": token, "operation": "pause_campaign", "campaign_id": foreign_campaign.id,
+    })
+    assert foreign_campaign_reply.status_code == 403
+    foreign_automation_reply = client.post("/api/agent-takeover/authorize", json={
+        "token": token, "operation": "enable_automation", "automation_id": foreign_automation.id,
+    })
+    assert foreign_automation_reply.status_code == 403
+    owned_thread_reply = client.post("/api/agent-takeover/authorize", json={
+        "token": token, "operation": "generate_inbox_reply", "thread_id": owned_thread.id,
+    })
+    assert owned_thread_reply.status_code == 200, owned_thread_reply.text
+    foreign_thread_reply = client.post("/api/agent-takeover/authorize", json={
+        "token": token, "operation": "generate_inbox_reply", "thread_id": foreign_thread.id,
+    })
+    assert foreign_thread_reply.status_code == 403
+    owned_revision = client.post("/api/agent-takeover/authorize", json={
+        "token": token, "operation": "revise_approval", "approval_id": owned_approval.id,
+    })
+    assert owned_revision.status_code == 200, owned_revision.text
+    foreign_revision = client.post("/api/agent-takeover/authorize", json={
+        "token": token, "operation": "revise_approval", "approval_id": foreign_approval.id,
+    })
+    assert foreign_revision.status_code == 403
 
 
 def test_due_tick_creates_fresh_tacwork_session_and_records_stage(client, db, monkeypatch):
@@ -124,7 +210,8 @@ def test_due_tick_creates_fresh_tacwork_session_and_records_stage(client, db, mo
     assert state["last_success_stage"] == "session_create"
     create_payload = calls[-1][2]
     assert "Cycle ID:" in create_payload["prompt"]
-    assert "takeover_token=" in create_payload["prompt"]
+    assert "takeover_token=" not in create_payload["prompt"]
+    assert "takeover_token=" in create_payload["system"]
     assert "Workspace display timezone: Asia/Shanghai" in create_payload["prompt"]
     assert "raw UTC timestamps" in create_payload["prompt"]
     assert db.query(models.AuditLog).filter_by(action="agent_takeover_session_started").count() == 1
@@ -173,6 +260,30 @@ def test_idle_session_is_completed_before_the_next_due_cycle(client, db, monkeyp
     assert db.query(models.AuditLog).filter_by(action="agent_takeover_session_completed").count() == 1
 
 
+def test_idle_session_with_mcp_error_preserves_completed_with_errors(client, db, monkeypatch):
+    client.post("/api/agent-takeover", json={"enabled": True, "interval_minutes": 15})
+    flags.set_flag(db, takeover_svc.FLAG_ACTIVE_SESSION, "ses_error")
+    flags.set_flag(db, takeover_svc.FLAG_WORKSPACE, "ws_email")
+    flags.set_flag(db, takeover_svc.FLAG_CYCLE_ID, "cycle-error")
+    flags.set_flag(db, takeover_svc.FLAG_LAST_STATUS, "running")
+    flags.set_flag(db, takeover_svc.FLAG_LAST_ERROR, '{"error":"mcp unavailable"}')
+    flags.set_flag(db, takeover_svc.FLAG_CYCLE_HAS_ERRORS, "true")
+    db.commit()
+
+    monkeypatch.setattr(takeover_svc, "_request", lambda method, path, payload=None: {"status": {"type": "idle"}})
+    result = takeover_svc.trigger_due(db)
+    assert result["status"] == "not_due"
+    state = takeover_svc.status(db)
+    assert state["active_session_id"] == ""
+    assert state["last_status"] == "completed_with_errors"
+    assert state["current_stage"] == "completed_with_errors"
+    assert state["cycle_has_errors"] is True
+    assert state["last_error"] == '{"error":"mcp unavailable"}'
+    row = db.query(models.AuditLog).filter_by(action="agent_takeover_session_completed").one()
+    assert row.success is False
+    assert '"outcome": "completed_with_errors"' in (row.detail or "")
+
+
 def test_takeover_disable_clears_active_session_state(client, db):
     client.post("/api/agent-takeover", json={"enabled": True, "interval_minutes": 15})
     flags.set_flag(db, takeover_svc.FLAG_ACTIVE_SESSION, "ses_old")
@@ -199,6 +310,23 @@ def test_takeover_telemetry_is_sanitized_and_traceable(client, db):
     assert row.entity_id == "cycle-123"
     assert token not in (row.detail or "")
     assert flags.get_flag(db, takeover_svc.FLAG_LAST_SUCCESS_STAGE) == "sync_gmail"
+
+
+def test_failed_takeover_telemetry_marks_cycle_with_errors(client, db):
+    client.post("/api/agent-takeover", json={"enabled": True, "interval_minutes": 60})
+    token = "telemetry-secret"
+    flags.set_flag(db, takeover_svc.FLAG_TOKEN_HASH, hashlib.sha256(token.encode()).hexdigest())
+    flags.set_flag(db, takeover_svc.FLAG_TOKEN_EXPIRES, (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
+    flags.set_flag(db, takeover_svc.FLAG_CYCLE_ID, "cycle-failed")
+    db.commit()
+
+    response = client.post("/api/agent-takeover/telemetry", json={
+        "token": token, "stage": "sync_gmail", "status": "failed",
+        "detail": {"error": "mcp_http_transport"},
+    })
+    assert response.status_code == 200, response.text
+    assert flags.get_flag(db, takeover_svc.FLAG_CYCLE_HAS_ERRORS) == "true"
+    assert "mcp_http_transport" in (flags.get_flag(db, takeover_svc.FLAG_LAST_ERROR) or "")
 
 
 def test_legacy_scheduler_never_directly_runs_global_scope(client, db):

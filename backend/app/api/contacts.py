@@ -7,6 +7,7 @@ import json
 import re
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
@@ -14,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..schemas import ContactCreate, ContactUpdate
+from ..services.xlsx import contacts_template_xlsx, read_xlsx_rows
 from .deps import ensure_owner, get_db
 
 router = APIRouter(prefix="/api/contacts", tags=["contacts"])
@@ -22,12 +24,45 @@ ALLOWED_CATEGORIES = {"prospect", "qualified", "customer", "partner", "won", "in
 ALLOWED_INTENT = {"high", "medium", "low", "unknown"}
 
 
-def _tags(value: str | None) -> list[str]:
+def _string_list(value: str | None) -> list[str]:
     try:
         parsed = json.loads(value or "[]")
         return [str(v) for v in parsed] if isinstance(parsed, list) else []
     except Exception:
         return []
+
+
+def _normalize_list(values: list[str]) -> list[str]:
+    """Trim and de-duplicate a user-managed list while keeping input order."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value).strip()
+        key = item.casefold()
+        if item and key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
+
+
+def _split_list(value: str | None) -> list[str]:
+    return _normalize_list(re.split(r"[,，;；]", value or ""))
+
+
+def _custom_fields(value: str | None) -> dict | None:
+    if not (value or "").strip():
+        return None
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        raise ValueError("custom_fields_must_be_json_object")
+    return parsed
+
+
+def _safe_custom_fields(value: str | None) -> dict | None:
+    try:
+        return _custom_fields(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def _serialize(contact: models.Contact, db: Session) -> dict:
@@ -42,8 +77,11 @@ def _serialize(contact: models.Contact, db: Session) -> dict:
         "first_name": contact.first_name, "last_name": contact.last_name,
         "company": contact.company, "title": contact.title, "phone": contact.phone,
         "website": contact.website, "category": contact.category or "prospect",
-        "tags": _tags(contact.tags), "intent_level": contact.intent_level or "unknown",
+        "tags": _string_list(contact.tags), "segments": _string_list(contact.segments),
+        "intent_level": contact.intent_level or "unknown",
         "notes": contact.notes, "source": contact.source, "status": contact.status,
+        "custom_fields": _safe_custom_fields(contact.custom_fields),
+        "timezone": contact.timezone,
         "lifecycle_stage": contact.lifecycle_stage or "new_customer",
         "next_action": contact.next_action,
         "manual_lock": bool(contact.manual_lock),
@@ -55,16 +93,17 @@ def _serialize(contact: models.Contact, db: Session) -> dict:
     }
 
 
-def _validate(payload, require_identity: bool = True) -> tuple[str, list[str]]:
+def _validate(payload, require_identity: bool = True) -> tuple[str, list[str], list[str]]:
     email = str(payload.email).strip().lower()
-    if require_identity and not (payload.first_name or "").strip() and not (payload.company or "").strip():
-        raise HTTPException(status_code=422, detail="name_or_company_required")
+    if require_identity and not (payload.first_name or "").strip() and not (payload.last_name or "").strip():
+        raise HTTPException(status_code=422, detail="name_required")
     if payload.category not in ALLOWED_CATEGORIES:
         raise HTTPException(status_code=422, detail="invalid_contact_category")
     if payload.intent_level not in ALLOWED_INTENT:
         raise HTTPException(status_code=422, detail="invalid_intent_level")
-    tags = sorted({str(t).strip() for t in payload.tags if str(t).strip()})
-    return email, tags
+    tags = _normalize_list(payload.tags)
+    segments = _normalize_list(payload.segments)
+    return email, tags, segments
 
 
 @router.get("")
@@ -93,11 +132,12 @@ def list_contacts(
 @router.post("")
 def create_contact(payload: ContactCreate, db: Session = Depends(get_db)):
     owner_id = ensure_owner(db)
-    email, tags = _validate(payload)
+    email, tags, segments = _validate(payload)
     if db.query(models.Contact).filter_by(owner_id=owner_id, email=email).first():
         raise HTTPException(status_code=409, detail="contact_email_exists")
-    data = payload.model_dump(exclude={"tags", "custom_fields"})
+    data = payload.model_dump(exclude={"tags", "segments", "custom_fields"})
     data.update(email=email, tags=json.dumps(tags, ensure_ascii=False),
+                segments=json.dumps(segments, ensure_ascii=False),
                 custom_fields=json.dumps(payload.custom_fields, ensure_ascii=False) if payload.custom_fields else None)
     contact = models.Contact(owner_id=owner_id, status="new", **data)
     db.add(contact)
@@ -134,17 +174,24 @@ def update_contact(contact_id: int, payload: ContactUpdate, db: Session = Depend
         raise HTTPException(status_code=422, detail="invalid_intent_level")
 
     for key, value in changes.items():
-        if key in {"email", "tags", "custom_fields"}:
+        if key in {"email", "tags", "segments", "custom_fields"}:
             continue
         setattr(contact, key, value)
     if "tags" in changes:
-        tags = sorted({str(t).strip() for t in (changes["tags"] or []) if str(t).strip()})
+        tags = _normalize_list(changes["tags"] or [])
         contact.tags = json.dumps(tags, ensure_ascii=False)
+    if "segments" in changes:
+        contact.segments = json.dumps(_normalize_list(changes["segments"] or []), ensure_ascii=False)
     if "custom_fields" in changes:
         custom_fields = changes["custom_fields"]
         contact.custom_fields = (
             json.dumps(custom_fields, ensure_ascii=False) if custom_fields is not None else None
         )
+    # Terminal CRM decisions must clear residual reply/follow-up actions from
+    # historical Inbox classification.  Without this, a stopped Contact can
+    # still appear in Needs Action and expose a draft-reply entry point.
+    from ..services.inbox_triage import normalize_terminal_contact_state
+    normalize_terminal_contact_state(contact)
     # A human CRM edit becomes authoritative until explicitly unlocked.
     if changes.get("manual_lock") is True:
         from datetime import datetime, timezone
@@ -173,15 +220,21 @@ def delete_contact(contact_id: int, db: Session = Depends(get_db)):
 def _parse_file(content: bytes, filename: str) -> list[dict]:
     rows: list[list[str]] = []
     if filename.lower().endswith(".xlsx"):
-        import openpyxl
-        ws = openpyxl.load_workbook(io.BytesIO(content), read_only=True).active
-        rows = [[str(v).strip() if v is not None else "" for v in row] for row in ws.iter_rows(values_only=True)]
+        rows = read_xlsx_rows(content)
     else:
         rows = list(csv.reader(io.StringIO(content.decode("utf-8-sig"))))
     if not rows:
         return []
-    aliases = {"name": "first_name", "姓名": "first_name", "公司": "company", "邮箱": "email",
-               "职位": "title", "电话": "phone", "分类": "category", "标签": "tags", "备注": "notes"}
+    aliases = {
+        "name": "first_name", "姓名": "first_name", "名字": "first_name",
+        "first_name": "first_name", "名": "first_name",
+        "last_name": "last_name", "姓": "last_name", "姓氏": "last_name",
+        "公司": "company", "邮箱": "email", "职位": "title", "电话": "phone",
+        "网站": "website", "网址": "website", "分类": "category", "标签": "tags",
+        "备注": "notes", "时区": "timezone", "来源": "source",
+        "客户分类": "segments", "行业分类": "segments", "行业": "segments",
+        "自定义字段": "custom_fields",
+    }
     header = []
     for value in rows[0]:
         normalized = str(value).strip().lower().replace(" ", "_")
@@ -189,7 +242,21 @@ def _parse_file(content: bytes, filename: str) -> list[dict]:
         # Accept those files while the frontend now emits a real UTF-8 BOM.
         normalized = normalized.removeprefix(r"\ufeff")
         header.append(aliases.get(normalized, normalized))
-    return [{header[i]: (row[i].strip() if i < len(row) else "") for i in range(len(header))} for row in rows[1:]]
+    return [
+        {header[i]: (row[i].strip() if i < len(row) else "") for i in range(len(header))}
+        for row in rows[1:]
+        if any(str(value).strip() for value in row)
+    ]
+
+
+@router.get("/template.xlsx")
+def download_contacts_template():
+    """Return the English-first Excel template consumed by the contact importer."""
+    return StreamingResponse(
+        io.BytesIO(contacts_template_xlsx()),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="contacts-import-template.xlsx"'},
+    )
 
 
 @router.post("/import")
@@ -201,33 +268,40 @@ async def import_contacts(file: UploadFile = File(...), confirm: bool = Query(Fa
     valid, invalid, duplicates = [], [], 0
     for index, row in enumerate(rows, start=2):
         email = (row.get("email") or "").strip().lower()
-        name = (row.get("first_name") or "").strip()
-        company = (row.get("company") or "").strip()
+        first_name = (row.get("first_name") or "").strip()
+        last_name = (row.get("last_name") or "").strip()
         errors = []
         if not EMAIL_RE.match(email): errors.append("invalid_email")
-        if not name and not company: errors.append("name_or_company_required")
+        if not first_name and not last_name: errors.append("name_required")
+        try:
+            custom_fields = _custom_fields(row.get("custom_fields"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            custom_fields = None
+            errors.append("invalid_custom_fields")
         if email in seen or email in existing:
             duplicates += 1; errors.append("duplicate_email")
         if errors:
             invalid.append({"row": index, "email": email, "errors": errors})
             continue
-        seen.add(email); valid.append(row | {"email": email})
+        seen.add(email); valid.append(row | {"email": email, "_custom_fields": custom_fields})
     preview = {"filename": file.filename, "total": len(rows), "valid": len(valid),
                "invalid": len(invalid), "duplicates": duplicates, "errors": invalid}
     if not confirm:
         return {"imported": 0, "preview": preview}
     imported = 0
     for row in valid:
-        raw_tags = row.get("tags") or ""
-        tags = [v.strip() for v in re.split(r"[,，;；]", raw_tags) if v.strip()]
+        tags = _split_list(row.get("tags"))
+        segments = _split_list(row.get("segments"))
         category = row.get("category") if row.get("category") in ALLOWED_CATEGORIES else "prospect"
         contact = models.Contact(
             owner_id=owner_id, email=row["email"], first_name=row.get("first_name") or None,
             last_name=row.get("last_name") or None, company=row.get("company") or None,
             title=row.get("title") or None, phone=row.get("phone") or None,
-            category=category, tags=json.dumps(tags, ensure_ascii=False),
+            website=row.get("website") or None, category=category,
+            tags=json.dumps(tags, ensure_ascii=False), segments=json.dumps(segments, ensure_ascii=False),
             intent_level="unknown", notes=row.get("notes") or None,
-            source="file_import", status="new",
+            custom_fields=json.dumps(row.get("_custom_fields"), ensure_ascii=False) if row.get("_custom_fields") else None,
+            timezone=row.get("timezone") or None, source=row.get("source") or "file_import", status="new",
         )
         db.add(contact); imported += 1
     try:

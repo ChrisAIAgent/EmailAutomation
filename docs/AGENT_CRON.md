@@ -3,9 +3,9 @@
 > `AGENTS.md` is authoritative for execution modes and safety. This document
 > covers scheduler operations; MCP mappings are in `AGENT_CAPABILITIES.md`.
 
-> The unified stack also owns TACWork Server (8787), TACWork Web (5173) and the
+> The transition Web stack also owns TACWork Server (18002), TACWork Web (18003) and the
 > OpenCode Engine. Always use `start-stack.bat` / `stop-stack.bat`; do not launch a
-> second Agent stack. `logs/run/services.json` records both Email Automation and
+> second Agent stack. The formal data directory's `run/services.json` records both Email Automation and
 > TACWork runtime PIDs.
 
 业务执行由 Backend、Huey 队列和唯一 Consumer 完成。外部 Agent 或系统 Cron 只负责触发、监控和汇报，不直接修改 Gmail、数据库或 Run 状态。
@@ -91,14 +91,14 @@ trigger -> queued -> running -> success | partial | failed
 .\start-stack.bat
 ```
 
-启动脚本会停止记录在 `logs/run/services.json` 的旧进程，清理遗留的 8000/3000 监听进程，启动新服务，并等待 Backend、Frontend、Consumer 心跳全部通过。
+启动脚本只清理经状态文件验证属于本应用的旧进程，绝不结束外部端口进程；过渡端口组为 18000-18003。正式 Electron 版不启动 Next Web Server。
 
 启动后必须验证：
 
 1. `/api/health.status=ok`
 2. `/api/health.consumer.healthy=true`
 3. 前端 HTTP 200
-4. `logs/run/services.json` 中只有本轮三个服务 PID
+4. 正式数据目录 `run/services.json` 中只有本轮服务 PID
 5. `logs/*-error.log` 无持续异常
 
 ## 6. 故障判断
@@ -172,9 +172,13 @@ for that message rather than allowing corrupted text into LangGraph.
 -> generate tracked Approvals -> full_auto dispatch or semi_auto wait -> inspect Automation Runs -> write reports/
 ```
 
-Run a full scan only on first takeover or when an audit is requested. Because it
-uses `in:anywhere`, it may rediscover Archive/Spam/Trash messages; this is expected
-and is not evidence that incremental sync failed.
+Cron and Agent Takeover may run Gmail History incremental sync only after the
+user-authorized first import is complete. They must never start the full import.
+They must also never start first-history Inbox triage: that fixed historical
+snapshot requires a separate explicit operator authorization. Scheduled work may
+only handle later Gmail History changes and their eligible untriaged threads.
+If the cursor expires, stop the cycle, report the recovery requirement and wait
+for an operator decision; do not silently scan a recent fixed-size page.
 
 ### Inbox versus Campaign scheduling
 
@@ -271,7 +275,7 @@ not prove that Gmail sync, send policy, or Consumer health is safe.
 
 ### Agent Takeover cadence, state, and local-runtime boundary
 
-The sidebar **Agent Takeover** control schedules only Global Inbox operations.
+The sidebar **Agent Takeover** control schedules Global Inbox operations: incremental Gmail sync, daily Inbox triage monitoring/creation, and eligible admitted-Contact work. It never starts the first full import or first-history triage, and it never makes a Contact-admission decision. A live session capability may perform its separately authorized same-owner Campaign or Automation configuration through typed MCP tools, but it does not take ownership of Campaign's Huey cadence or bypass any policy gate.
 Its cadence is a user-entered whole number of minutes from 1 through 1440.
 Recommended values are 1, 15, 30, 60, 120, 240 and 1440; use 1 minute only for
 short diagnostics because every due cycle creates a new TACWork root
@@ -289,7 +293,10 @@ any manual action. Do not use `run-now` merely to compensate for an offline gap.
 Monitor a cycle through `GET /api/agent-takeover`, the created TACWork root-session
 snapshot, the Global Agent Run, pending Approvals, and the report. Each minute the
 scheduler reconciles an idle TACWork session before it evaluates the next due time,
-then writes `completed` and preserves the last Session for history.
+then writes `completed` only if every authorized MCP stage completed without error.
+An idle session with a recorded MCP-stage failure is `completed_with_errors` and
+retains its error for operator review. Both outcomes preserve the last Session for
+history.
 `current_stage=poll_agent_run:success` and a completed Agent Run mean the business
 chain completed; neither `running` nor a session transcript proves that any email
 was sent. Only Gmail acceptance is a sent result.
@@ -306,6 +313,18 @@ block an already authorized scheduled operation. A missing or deleted prior
 TACWork session is stale local state: the scheduler clears it and creates a fresh
 root session in the same due cycle; other session lookup errors remain blockers
 and must be reported as `previous_run_status_unknown`.
+
+Scheduled sessions use private system context for their short-lived takeover grant;
+the grant must never appear in a user-visible session prompt, transcript, report,
+or MCP log. They must use registered typed `ea_*` tools only. A tool error is not a
+license to use REST, Shell, source exploration, guessed endpoints, or automatic
+retries: record the exact stage/error and finish safely. The scheduled status,
+Dashboard, Inbox and daily-triage reads also carry that private context, so a read
+failure produces `completed_with_errors` rather than a false clean completion.
+`ea_takeover_status` is
+the authority for takeover permissions and operating safety; `ea_dashboard` is
+only the queue-metrics source. Refresh takeover status before the final report;
+do not present a stale/past next-run value as a future wake-up.
 
 ### Web scheduler (no Electron dependency)
 

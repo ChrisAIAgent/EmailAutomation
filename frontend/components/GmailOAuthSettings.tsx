@@ -1,107 +1,82 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { Mail, Save, ShieldCheck } from "lucide-react";
+import { ChangeEvent, useEffect, useState } from "react";
+import { FileKey2, Mail, ShieldCheck } from "lucide-react";
 import { api } from "@/lib/api";
 import { useLang } from "@/lib/i18n";
 
 export default function GmailOAuthSettings() {
   const { lang } = useLang();
   const zh = lang === "zh";
-  const [configured, setConfigured] = useState<boolean | null>(null);
-  const [clientIdHint, setClientIdHint] = useState("");
-  const [redirectUri, setRedirectUri] = useState("http://127.0.0.1:8000/api/gmail/oauth/callback");
-  const [clientId, setClientId] = useState("");
-  const [clientSecret, setClientSecret] = useState("");
+  const [config, setConfig] = useState<any>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
 
   const load = async () => {
-    try {
-      const cfg = await api.gmailOauthConfig();
-      setConfigured(!!cfg.configured);
-      setClientIdHint(cfg.client_id_hint || "");
-      if (cfg.redirect_uri) setRedirectUri(cfg.redirect_uri);
-    } catch (e: any) {
-      setMessage(e?.message || (zh ? "读取 Gmail 配置失败" : "Failed to read Gmail config"));
-    }
+    try { setConfig(await api.gmailOauthConfig()); }
+    catch (error: any) { setMessage(error?.message || (zh ? "读取 Gmail 配置失败" : "Failed to read Gmail configuration")); }
   };
+  useEffect(() => { void load(); }, []);
 
-  useEffect(() => { load(); }, []);
-
-  const save = async () => {
-    setBusy(true);
-    setMessage("");
+  const importDesktopConfig = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    setBusy(true); setMessage("");
     try {
-      await api.gmailOauthSave({ client_id: clientId, client_secret: clientSecret, redirect_uri: redirectUri });
-      setConfigured(true);
-      setClientIdHint(clientId.slice(-4));
-      setClientSecret("");
+      const parsed = JSON.parse(await file.text());
+      const result = await api.gmailOauthSave(parsed);
+      setConfig(result);
       setMessage(zh
-        ? "Google OAuth 凭证已保存。现在可以点击顶部「连接 Gmail」完成授权。"
-        : "Google OAuth credentials saved. You can now click \"Connect Gmail\" to authorize.");
-    } catch (e: any) {
-      setMessage(e?.message || (zh ? "保存失败" : "Save failed"));
-    } finally {
-      setBusy(false);
-    }
+        ? "Desktop OAuth 配置已安全保存。请点击页面顶部“连接 Gmail”，并在系统浏览器完成授权。"
+        : "Desktop OAuth configuration saved securely. Click Connect Gmail and finish authorization in your system browser.");
+    } catch (error: any) {
+      setMessage(error instanceof SyntaxError
+        ? (zh ? "文件不是有效的 JSON。" : "The selected file is not valid JSON.")
+        : (error?.message || (zh ? "导入失败" : "Import failed")));
+    } finally { setBusy(false); }
   };
 
+  const state = config?.oauth_state || (config?.configured ? "oauth_not_connected" : "oauth_not_configured");
   return (
     <div className="card space-y-4">
       <div className="flex items-start gap-2">
         <Mail size={19} className="text-accent mt-0.5" />
         <div>
-          <h2 className="font-semibold">{zh ? "Gmail OAuth 凭证" : "Gmail OAuth Credentials"}</h2>
-          <p className="text-sm text-muted mt-1">
-            {zh
-              ? "新电脑首次运行需在此填写 Google Cloud 控制台取得的 OAuth 客户端 ID 与密钥。填写后才能在设置向导里连接 Gmail。凭证仅保存在本机 backend/.env，不会外传。"
-              : "On a fresh PC, paste the OAuth Client ID and Secret from Google Cloud Console here. After saving, use \"Connect Gmail\" to authorize. Credentials are stored only in this machine's backend/.env."}
-          </p>
+          <h2 className="font-semibold">{zh ? "Gmail 客户自有 OAuth" : "Customer-owned Gmail OAuth"}</h2>
+          <p className="text-sm text-muted mt-1">{zh
+            ? "从客户自己的 Google Cloud 项目导入 Desktop app credentials.json。配置、Token 与邮件数据只保存在当前电脑，不需要 API Key，也不需要手工填写 Redirect URI。"
+            : "Import a Desktop app credentials.json from the customer's own Google Cloud project. Configuration, tokens, and mail data stay on this computer; no API key or manual redirect URI is required."}</p>
         </div>
       </div>
 
       <div className="flex items-center gap-2 text-sm">
-        {configured === null ? (
-          <span className="badge text-muted border-border">{zh ? "检查中…" : "Checking…"}</span>
-        ) : configured ? (
-          <span className="badge text-ok border-ok">{zh ? "已配置" : "Configured"}{clientIdHint ? ` (…${clientIdHint})` : ""}</span>
-        ) : (
-          <span className="badge text-warn border-warn">{zh ? "未配置" : "Not configured"}</span>
-        )}
+        <span className={`badge ${state === "credential_key_unavailable" ? "text-danger border-danger" : config?.configured ? "text-ok border-ok" : "text-warn border-warn"}`}>
+          {state === "credential_key_unavailable"
+            ? (zh ? "凭据无法解密，需要重新导入" : "Credentials unavailable; import again")
+            : config?.configured
+              ? `${zh ? "已导入 Desktop OAuth" : "Desktop OAuth imported"}${config.client_id_hint ? ` (…${config.client_id_hint})` : ""}`
+              : (zh ? "尚未导入" : "Not imported")}
+        </span>
       </div>
 
-      <div className="grid gap-3 md:grid-cols-2">
-        <Field label={zh ? "Google Client ID" : "Google Client ID"} value={clientId} onChange={setClientId} placeholder={zh ? "例如 123456-abc.apps.googleusercontent.com" : "e.g. 123456-abc.apps.googleusercontent.com"} />
-        <Field label={zh ? "Google Client Secret" : "Google Client Secret"} value={clientSecret} onChange={setClientSecret} password placeholder={zh ? "留空表示不修改（仅首次必填）" : "Blank to keep (required on first setup)"} />
-      </div>
+      <ol className="text-sm text-muted list-decimal pl-5 space-y-1">
+        <li>{zh ? "在 Google Cloud 启用 Gmail API 并配置 OAuth 同意屏幕。" : "Enable Gmail API and configure the OAuth consent screen in Google Cloud."}</li>
+        <li>{zh ? "创建 OAuth Client ID，Application type 选择 Desktop app。" : "Create an OAuth Client ID with Application type set to Desktop app."}</li>
+        <li>{zh ? "下载 credentials.json，并在下方导入。Web application 类型会被拒绝。" : "Download credentials.json and import it below. Web application credentials are rejected."}</li>
+      </ol>
 
-      <label className="text-sm">
-        <span className="block text-muted mb-1">{zh ? "重定向 URI（需在 Google Cloud 授权回调中登记）" : "Redirect URI (must be registered in Google Cloud Console)"}</span>
-        <input className="input w-full" value={redirectUri} onChange={(e) => setRedirectUri(e.target.value)} />
+      <label className={`btn-primary inline-flex w-fit items-center gap-2 ${busy ? "opacity-60 pointer-events-none" : ""}`}>
+        <FileKey2 size={15} /> {busy ? (zh ? "正在导入…" : "Importing…") : (zh ? "导入 Google Desktop OAuth 配置" : "Import Google Desktop OAuth configuration")}
+        <input type="file" accept="application/json,.json" className="hidden" onChange={importDesktopConfig} disabled={busy} />
       </label>
 
       <div className="flex items-center gap-2 text-xs text-muted">
         <ShieldCheck size={14} className="text-ok" />
-        {zh ? "凭证使用本机加密保存，读取接口不会回显密钥。" : "Credentials are stored locally; read APIs never return the secret."}
+        {zh ? "配置使用当前 Windows 用户的 DPAPI 加密；读取接口不会返回 Client Secret 或 Token。" : "Configuration is protected with current-user Windows DPAPI; read APIs never return the client secret or tokens."}
       </div>
-
-      <div className="flex flex-wrap gap-2">
-        <button className="btn-primary flex items-center gap-2" disabled={busy} onClick={save}>
-          <Save size={14} /> {busy ? (zh ? "保存中…" : "Saving…") : (zh ? "保存 OAuth 凭证" : "Save OAuth credentials")}
-        </button>
-      </div>
-
+      {config?.redirect_uri && <div className="text-xs text-muted">Loopback callback: {config.redirect_uri}</div>}
       {message && <div className="text-sm text-muted">{message}</div>}
     </div>
-  );
-}
-
-function Field({ label, value, onChange, placeholder, password }: { label: string; value: string; onChange: (value: string) => void; placeholder?: string; password?: boolean }) {
-  return (
-    <label className="text-sm">
-      <span className="block text-muted mb-1">{label}</span>
-      <input type={password ? "password" : "text"} autoComplete="new-password" className="input w-full" value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} />
-    </label>
   );
 }

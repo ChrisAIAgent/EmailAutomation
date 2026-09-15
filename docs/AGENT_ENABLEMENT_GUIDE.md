@@ -16,7 +16,7 @@
    - Huey Consumer `healthy=true`
    - Gmail 已连接正确账号
    - 系统没有暂停
-5. 如果 Gmail 尚未连接，引导用户在网页端完成 Google OAuth 授权。
+5. 如果 Gmail 尚未连接，引导用户在网页端完成 Google OAuth 授权：创建 Google **Desktop app** Client → 下载 `credentials.json` → 在 **Agent 设置 → Gmail 客户自有 OAuth** 导入 → 点击“连接 Gmail”。Desktop app 不填写 Authorized JavaScript origins 或 Authorized redirect URIs；若用户已有 Web application Client，要求其新建 Desktop app，不要建议填写 localhost 或回调 URI。不得要求用户在对话中提供文件路径、JSON、Client Secret 或 Token。
 
 ## 二、首次接管流程
 
@@ -24,12 +24,14 @@
 
 按顺序执行：
 
-1. 同步 Gmail。
+1. 读取 Gmail 首次历史导入状态。未完成时，向用户说明范围和影响并取得明确授权，
+   再启动全部正常邮件（不含 Spam/Trash）的可恢复导入。
    同步层会解码 RFC 2047 Subject 和 MIME 正文，并在 Gmail 声明错误 charset
    时使用 raw MIME 与安全的可逆乱码修复。历史损坏字段可在重同步时修复，
    AuditLog action 为 `gmail_mime_decode_repaired`。
-2. 进行全量扫描或用户指定范围扫描。
-3. 先判断邮件方向：入站、外发或混合线程。
+2. 等待首次导入完成后，说明首次历史分拣会处理固定本地快照并取得新的明确授权；它按 50 个线程一批后台运行，支持暂停/恢复/取消/重试，不会创建 Draft、Approval 或发送。
+3. 首次历史分拣完成后，日常同步只读取 Gmail History 增量变化，日常分拣只处理新增或变化后仍未分拣的线程。
+4. 先判断邮件方向：入站、外发或混合线程。
 4. 过滤广告、垃圾、Newsletter、系统通知、验证码和无关营销邮件。
 5. 对剩余邮件判断是否为真人直接沟通。
 6. 仅对确认是真人且属于业务客户候选的对象创建或更新 Contact；真人判断通过不等于联系人准入通过。
@@ -234,12 +236,17 @@ caches, but it must not include live secrets, OAuth tokens, business databases, 
 logs by default. The expected operator flow is:
 
 ```text
-unzip -> portable-bootstrap.bat -> provide backend/.env -> portable-start.bat
--> open http://127.0.0.1:3000 -> use the embedded TACWork panel for guided setup
+install -> launch Email Automation.exe -> wait for the app readiness gate
+-> import customer-owned Google Desktop OAuth credentials.json in Web Setup
+-> complete authorization in the system browser -> use the embedded TACWork panel
 ```
 
 The embedded Agent may guide the user through model configuration and Gmail OAuth,
 but it must not invent credentials, print secrets, or bypass the Web OAuth flow.
+Only an `installed` Desktop OAuth JSON is accepted. Google login must open in the
+system browser, never inside Electron or TACWork. `oauth_not_configured`,
+`oauth_not_connected`, `oauth_connected`, and `credential_key_unavailable` are
+distinct states; saving a file is not proof that Gmail is connected.
 
 ## Operational computer migration
 

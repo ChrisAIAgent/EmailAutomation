@@ -1,5 +1,7 @@
 // Frontend API client. All data comes from the backend (DB + real runs).
-export const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+declare global { interface Window { __EMAIL_AUTOMATION_RUNTIME__?: { apiUrl?: string; tacworkUrl?: string; tacworkServerUrl?: string; version?: string }; emailAutomation?: { openExternal: (url: string) => Promise<unknown>; openLogs: () => Promise<unknown>; repair: () => Promise<unknown>; quitAndStop: () => Promise<unknown>; getRuntimeStatus: () => Promise<unknown>; getDiagnostics: () => Promise<unknown> } } }
+const runtimeConfig = typeof window !== "undefined" ? window.__EMAIL_AUTOMATION_RUNTIME__ : undefined;
+export const API_BASE = runtimeConfig?.apiUrl || process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:18000";
 
 // Keep ordinary dashboard reads snappy, but real Gmail/model operations often
 // take 20-60s in a live demo. Those long-running actions pass an explicit
@@ -43,6 +45,45 @@ async function req<T>(path: string, init?: RequestInit, timeoutMs: number = DEFA
   }
 }
 
+export function parseApiError(e: any): { status: number | null; code: string | null; raw: string } {
+  const raw = String(e?.message ?? e ?? "");
+  const match = raw.match(/^(\d{3}):\s*([\s\S]*)$/);
+  const status = match ? Number(match[1]) : null;
+  const body = match ? match[2] : raw;
+  let code: string | null = null;
+  try {
+    const parsed = JSON.parse(body);
+    code = parsed?.detail ?? parsed?.error?.code ?? null;
+  } catch {
+    // Unknown non-JSON errors retain their original text below.
+  }
+  return { status, code: code ? String(code) : null, raw };
+}
+
+export function friendlyError(e: any, zh: boolean): string {
+  const { status, code, raw } = parseApiError(e);
+  if (raw.startsWith("Request timeout")) return raw;
+  const key = (code ?? "").toLowerCase();
+  if (key === "initial_import_required") {
+    return zh ? "需先完成首次历史导入，再执行首次历史分拣。" : "Complete the first mail history import before running first history triage.";
+  }
+  if (key === "initial_triage_no_failed_items") {
+    return zh ? "当前没有失败项可重试。" : "There are no failed items to retry.";
+  }
+  if (key.startsWith("initial_triage_is_")) {
+    const state = key.replace("initial_triage_is_", "");
+    return zh ? `任务当前状态为 ${state}，无法执行该操作。` : `The run is ${state}; this action is not allowed.`;
+  }
+  if (key === "initial_triage_not_found" || key === "initial_triage_action_not_found") {
+    return zh ? "未找到对应的首次分拣任务或操作。" : "First-triage run or action not found.";
+  }
+  if (key === "gmail_sync_failed") {
+    return zh ? "Gmail 同步暂时遇到网络连接中断，请稍后重试；已同步的邮件不会丢失。" : "Gmail sync was interrupted by a network connection issue. Retry shortly; already-synced mail is preserved.";
+  }
+  if (status && code) return `${status}: ${code}`;
+  return raw;
+}
+
 // Every method declares a concrete return type so callers never receive `unknown`.
 export const api = {
   health: () => req<any>("/api/health"),
@@ -50,14 +91,24 @@ export const api = {
   gmailStart: () => req<any>("/api/gmail/oauth/start"),
   gmailDisconnect: () => req<any>("/api/gmail/disconnect", { method: "POST" }),
   gmailOauthConfig: () => req<any>("/api/gmail/oauth-config"),
-  gmailOauthSave: (body: { client_id: string; client_secret: string; redirect_uri?: string }) =>
-    req<any>("/api/gmail/oauth-config", { method: "PUT", body: JSON.stringify(body) }),
-  gmailSync: (fullScan = false) => req<any>(`/api/gmail/sync${fullScan ? "?full_scan=true" : ""}`, { method: "POST" }, LONG_ACTION_TIMEOUT_MS),
+  gmailOauthSave: (credentials: Record<string, unknown>) =>
+    req<any>("/api/gmail/oauth-config", { method: "PUT", body: JSON.stringify({ credentials }) }),
+  gmailSync: () => req<any>("/api/gmail/sync", { method: "POST" }, LONG_ACTION_TIMEOUT_MS),
+  gmailImportStatus: () => req<any>("/api/gmail/imports/current"),
+  gmailImportStart: () => req<any>("/api/gmail/imports", { method: "POST" }),
+  gmailImportPause: (id: number) => req<any>(`/api/gmail/imports/${id}/pause`, { method: "POST" }),
+  gmailImportResume: (id: number) => req<any>(`/api/gmail/imports/${id}/resume`, { method: "POST" }),
+  gmailImportCancel: (id: number) => req<any>(`/api/gmail/imports/${id}/cancel`, { method: "POST" }),
 
   contacts: (query = "") => req<any[]>(`/api/contacts${query ? `?${query}` : ""}`),
   createContact: (body: any) => req<any>("/api/contacts", { method: "POST", body: JSON.stringify(body) }),
   updateContact: (id: number, body: any) => req<any>(`/api/contacts/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteContact: (id: number) => req<any>(`/api/contacts/${id}`, { method: "DELETE" }),
+  downloadContactsTemplate: async () => {
+    const res = await fetch(`${API_BASE}/api/contacts/template.xlsx`);
+    if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+    return res.blob();
+  },
   importContacts: (file: File, confirm: boolean) =>
     uploadReq<any>(`/api/contacts/import?confirm=${confirm}`, (() => { const fd = new FormData(); fd.append("file", file); return fd; })()),
 
@@ -78,6 +129,7 @@ export const api = {
   uploadContacts: (id: number, file: File, confirm: boolean) =>
     uploadReq<any>(`/api/campaigns/${id}/upload-contacts?confirm=${confirm}`, (() => { const fd = new FormData(); fd.append("file", file); return fd; })()),
   generate: (id: number) => req<any>(`/api/campaigns/${id}/generate`, { method: "POST" }, LONG_ACTION_TIMEOUT_MS),
+  campaignGenerationStatus: (id: number) => req<any>(`/api/campaigns/${id}/generation-status`),
   startCampaign: (id: number) => req<any>(`/api/campaigns/${id}/start`, { method: "POST" }),
   pauseCampaign: (id: number) => req<any>(`/api/campaigns/${id}/pause`, { method: "POST" }),
   stopCampaign: (id: number) => req<any>(`/api/campaigns/${id}/stop`, { method: "POST" }),
@@ -86,6 +138,19 @@ export const api = {
   inboxThreads: () => req<any[]>("/api/inbox/threads"),
   inboxCustomers: () => req<any[]>("/api/inbox/customers"),
   inboxStats: () => req<any>("/api/inbox/stats"),
+  initialTriageStatus: () => req<any>("/api/inbox/initial-triage/current"),
+  startInitialTriage: () => req<any>("/api/inbox/initial-triage", { method: "POST" }),
+  controlInitialTriage: (id: number, action: "pause" | "resume" | "cancel") =>
+    req<any>(`/api/inbox/initial-triage/${id}/${action}`, { method: "POST" }),
+  retryInitialTriageFailed: (id: number) =>
+    req<any>(`/api/inbox/initial-triage/${id}/retry-failed`, { method: "POST" }),
+  dailyTriageStatus: () => req<any>("/api/inbox/daily-triage/current"),
+  recentTriageResult: () => req<any>("/api/inbox/triage/recent"),
+  startDailyTriage: () => req<any>("/api/inbox/daily-triage", { method: "POST" }),
+  controlDailyTriage: (id: number, action: "pause" | "resume" | "cancel") =>
+    req<any>(`/api/inbox/daily-triage/${id}/${action}`, { method: "POST" }),
+  retryDailyTriageFailed: (id: number) =>
+    req<any>(`/api/inbox/daily-triage/${id}/retry-failed`, { method: "POST" }),
   sortInbox: () => req<any>("/api/inbox/sort", { method: "POST" }, LONG_ACTION_TIMEOUT_MS),
   threadDetail: (id: number) => req<any>(`/api/inbox/threads/${id}`),
   analyzeThread: (id: number) => req<any>(`/api/inbox/threads/${id}/analyze`, { method: "POST" }, LONG_ACTION_TIMEOUT_MS),
@@ -94,6 +159,10 @@ export const api = {
     req<any>(`/api/inbox/threads/${id}/contact`, { method: "POST", body: JSON.stringify(body) }),
   resolveHumanReview: (id: number, decision: "approve" | "reject" | "agent_decide") =>
     req<any>(`/api/inbox/threads/${id}/human-review`, { method: "POST", body: JSON.stringify({ decision }) }),
+  enableSenderContentReviewIgnore: (email: string) =>
+    req<any>(`/api/inbox/senders/${encodeURIComponent(email)}/content-review/ignore`, { method: "POST" }),
+  removeSenderContentReviewIgnore: (email: string) =>
+    req<any>(`/api/inbox/senders/${encodeURIComponent(email)}/content-review/ignore`, { method: "DELETE" }),
   clearStaleInboxReview: (id: number) =>
     req<any>(`/api/inbox/threads/${id}/clear-stale-review`, { method: "POST" }),
   nonCustomerFilters: () => req<any[]>("/api/inbox/non-customer-filters"),
@@ -150,6 +219,16 @@ export const api = {
   setPause: (paused: boolean) =>
     req<any>(`/api/system/pause?paused=${paused}`, { method: "POST" }),
 
+  // Diagnostics are strictly manual. Nothing may poll these endpoints.
+  // `diagnostics` is the health overview; `investigate` performs on-demand
+  // root-cause analysis of one broken link (or of every failing link).
+  diagnostics: () => req<DiagnosticReport>("/api/system/diagnostics", undefined, 15_000),
+  investigate: (target: string, incidentId?: string) =>
+    req<InvestigateReport>("/api/system/diagnostics/investigate", {
+      method: "POST",
+      body: JSON.stringify({ target, incident_id: incidentId || null }),
+    }, 60_000),
+
   agentTakeover: () => req<any>("/api/agent-takeover"),
   updateAgentTakeover: (enabled: boolean, intervalMinutes: number, displayTimezone?: string) =>
     req<any>("/api/agent-takeover", { method: "POST", body: JSON.stringify({ enabled, interval_minutes: intervalMinutes, display_timezone: displayTimezone }) }),
@@ -200,4 +279,56 @@ export type Metrics = {
   draft_only: boolean;
   openclaw_connected: boolean;
   langgraph_configured: boolean;
+};
+
+// Unified diagnostic chain (mirrors backend/app/diagnostics.py DiagnosticResult).
+export type DiagnosticItem = {
+  id: string;
+  category: string;
+  label: string;
+  status: "ok" | "warn" | "error" | "info";
+  detail: string;
+  remedy: string | null;
+  latency_ms: number;
+  ts: string;
+};
+
+export type DiagnosticReport = {
+  generated_at: string;
+  trace_id?: string;
+  error?: string;
+  overall: "ok" | "degraded" | "error" | "unknown";
+  counts: { ok: number; warn: number; error: number; info: number; unknown?: number };
+  items: DiagnosticItem[];
+  by_category?: Record<string, DiagnosticItem[]>;
+};
+
+// On-demand root-cause investigation (mirrors backend/app/diagnostics_investigate.py).
+export type InvestigateEvidence = { source: string; finding: string };
+export type InvestigateRemedy = {
+  action: string;
+  label: string;
+  risk: "low" | "medium" | "high";
+  requires_confirmation: boolean;
+};
+export type InvestigateItemReport = {
+  target: string;
+  status: "confirmed" | "suspected" | "healthy" | "unknown";
+  root_cause: string | null;
+  root_cause_label: string | null;
+  confidence: "high" | "medium" | "low" | null;
+  summary: string;
+  evidence: InvestigateEvidence[];
+  remedies: InvestigateRemedy[];
+  next_checks: string[];
+  // Client-side stamp of when this report was fetched (not sent by the backend).
+  investigated_at?: string;
+};
+export type InvestigateReport = {
+  incident_id: string;
+  target: string;
+  generated_at: string;
+  trace_id: string | null;
+  backend_up: boolean;
+  reports: InvestigateItemReport[];
 };

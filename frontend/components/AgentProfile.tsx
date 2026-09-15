@@ -1,12 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Bot, KeyRound, Save, ShieldCheck, Wifi } from "lucide-react";
+import { CheckCircle2, KeyRound, Save, ShieldCheck, TriangleAlert, Wifi } from "lucide-react";
 import { api } from "@/lib/api";
 import { useLang } from "@/lib/i18n";
 import GmailOAuthSettings from "./GmailOAuthSettings";
 
-export default function AgentProfileView() {
+export default function AgentProfileView({ onChanged }: { onChanged?: () => Promise<void> | void }) {
   const { lang } = useLang();
   const zh = lang === "zh";
   const [profile, setProfile] = useState<any>(null);
@@ -54,9 +54,20 @@ export default function AgentProfileView() {
   const saveEmail = async () => {
     setBusy("email"); setAiMessage("");
     try {
-      setEmailAi(await api.updateEmailAiConfig(emailPayload()));
+      await api.updateEmailAiConfig(emailPayload());
+      // Do not treat a successful write response as sufficient proof. Read the
+      // public (non-secret) representation back from the active backend so the
+      // operator sees the real persisted state after a reload.
+      const saved = await api.emailAiConfig();
+      if (!saved.usable || saved.source !== "db" || !saved.db_config_readable) {
+        throw new Error(zh ? "配置未能由当前服务确认；请勿视为已保存。" : "The active service could not confirm the saved configuration.");
+      }
+      setEmailAi(saved);
       setEmailKey("");
-      setAiMessage(zh ? "邮件 Agent AI 配置已加密保存。请重启服务后生效。" : "Email Agent AI config saved. Restart services to apply.");
+      await onChanged?.();
+      setAiMessage(zh
+        ? `邮件 Agent AI 已加密保存并会用于下一次运行：${saved.model}。顶部状态已刷新。`
+        : `Email Agent AI is saved and will be used for the next run: ${saved.model}. The header status was refreshed.`);
     }
     catch (e: any) { setAiMessage(e?.message || (zh ? "保存失败" : "Save failed")); }
     finally { setBusy(null); }
@@ -88,7 +99,7 @@ export default function AgentProfileView() {
     <div className="space-y-4 max-w-5xl">
       <div>
         <div className="flex items-center gap-2">
-          <Bot size={22} className="text-brand" />
+          <img src="/brand/agent-avatar.png" alt="" className="h-[22px] w-[22px] shrink-0 rounded-full object-cover" />
           <h1 className="text-xl font-semibold">{zh ? "全局 Agent Profile" : "Global Agent Profile"}</h1>
         </div>
         <p className="mt-1 text-sm text-muted">
@@ -126,17 +137,35 @@ export default function AgentProfileView() {
 
       <div className="card space-y-4">
         <div className="flex items-start gap-2"><KeyRound size={19} className="text-accent mt-0.5" /><div><h2 className="font-semibold">{zh ? "邮件 Agent AI（LLM）" : "Email Agent AI (LLM)"}</h2><p className="text-sm text-muted mt-1">{zh ? "Email Automation 分拣、回复与自动化所用的唯一 LLM。TACWork 对话 AI 请在其自身的 Web 端 AI Providers 中配置，此处不重复。" : "The only LLM used by Email Automation for triage, replies and automation. Configure TACWork's conversation AI in its own Web UI (AI Providers); it is not set here."}</p></div></div>
+        {emailAi.error_code === "credential_unreadable" ? (
+          <div className="rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger flex items-start gap-2"><TriangleAlert size={16} className="mt-0.5 shrink-0" /><div>{zh ? "当前运行环境无法读取已保存的加密凭据。请在此环境重新输入 API Key 并保存；系统不会尝试恢复、复制或显示原始 Key。" : "This runtime cannot read the saved encrypted credential. Re-enter the API key here and save it; the system will not recover, copy, or display the original key."}</div></div>
+        ) : emailAi.usable ? (
+          <div className="rounded-lg border border-ok/40 bg-ok/10 px-3 py-2 text-sm">
+            <div className="flex items-center gap-2 font-medium text-ok"><CheckCircle2 size={16} />{emailAi.source === "env" ? (zh ? "邮件 Agent AI 正由运行环境配置" : "Email Agent AI is configured by the runtime environment") : (zh ? "邮件 Agent AI 已加密保存" : "Email Agent AI is securely saved")}</div>
+            <div className="mt-1 text-xs text-muted break-all">
+              {zh ? "当前配置：" : "Current configuration: "}{emailAi.provider_name} · {emailAi.model} · {emailAi.base_url}
+            </div>
+            <div className="mt-1 text-xs text-muted">{emailAi.source === "env" ? (zh ? "当前值来自运行环境；此页面不会读取或显示 Key。" : "The active value comes from the runtime environment; this page never reads or displays it.") : (zh ? "API Key 已安全保存，读取页面不会回显。" : "The API key is stored securely and is never returned to this page.")}</div>
+          </div>
+        ) : (
+          <div className="rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 text-sm text-warn flex items-center gap-2"><TriangleAlert size={16} />{zh ? "邮件 Agent AI 尚未配置或当前服务无法读取已保存凭据。" : "Email Agent AI is not configured, or the active service cannot read the saved credential."}</div>
+        )}
         <div className="grid gap-3 md:grid-cols-2">
           <Field label={zh ? "Provider 名称" : "Provider name"} value={emailAi.provider_name} onChange={(v) => updateEmail("provider_name", v)} />
           <Field label={zh ? "模型 ID / Endpoint ID" : "Model / endpoint ID"} value={emailAi.model} onChange={(v) => updateEmail("model", v)} />
           <div className="md:col-span-2"><Field label={zh ? "API Base URL（HTTPS）" : "API base URL (HTTPS)"} value={emailAi.base_url} onChange={(v) => updateEmail("base_url", v)} /></div>
-          <label className="text-sm md:col-span-2"><span className="block text-muted mb-1">API Key</span><input type="password" autoComplete="new-password" className="input w-full" value={emailKey} onChange={e => setEmailKey(e.target.value)} placeholder={emailAi.api_key_configured ? (zh ? "已配置；留空保持不变" : "Configured; leave blank to keep") : (zh ? "输入 API Key" : "Enter API key")} /></label>
+          <label className="text-sm md:col-span-2"><span className="block text-muted mb-1">API Key</span><input type="password" autoComplete="new-password" className="input w-full" value={emailKey} onChange={e => setEmailKey(e.target.value)} placeholder={emailAi.source === "db" && emailAi.usable ? (zh ? "已配置；留空保持不变" : "Configured; leave blank to keep") : (zh ? "输入 API Key" : "Enter API key")} /></label>
         </div>
-        <div className="flex flex-wrap gap-2">
+      <div className="flex flex-wrap gap-2">
           <button className="btn flex items-center gap-2" disabled={!!busy} onClick={testEmail}><Wifi size={14} />{busy === "email" ? (zh ? "检查中…" : "Checking…") : (zh ? "检查邮件 Agent 连接" : "Check Email Agent connection")}</button>
           <button className="btn-primary flex items-center gap-2" disabled={!!busy} onClick={saveEmail}><Save size={14} />{busy === "email" ? (zh ? "保存中…" : "Saving…") : (zh ? "加密保存配置" : "Save encrypted config")}</button>
         </div>
       </div>
+      <p className="text-xs text-muted">
+        {zh
+          ? "保存后立即用于下一次分拣、回复或自动化运行；无需重启。可点击“检查邮件 Agent 连接”验证当前输入或已保存的 Key。"
+          : "The saved configuration is used for the next triage, reply, or automation run; no restart is required. Use Check Email Agent connection to verify the current input or saved key."}
+      </p>
 
       <div className="text-xs text-muted">{zh ? "Key 使用 Workspace 加密密钥保存，浏览器和读取 API 不会回显。连接检查会先显示目标域名并要求确认。" : "Keys are encrypted locally and never returned by read APIs. Connection checks show and confirm the target first."}</div>
       {aiMessage && <div className="text-sm text-muted">{aiMessage}</div>}

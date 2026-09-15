@@ -1,10 +1,18 @@
 "use client";
 
+import { useState } from "react";
 import { CheckCircle, Clock, Inbox as InboxIcon, Mail, Send, ThumbsUp, AlertTriangle, Users } from "lucide-react";
 import { useLang } from "@/lib/i18n";
 
 export default function Overview({ metrics, gmail, health, readiness, onRefresh }: any) {
   const { t, lang } = useLang();
+  const [refreshing, setRefreshing] = useState(false);
+
+  const refresh = async () => {
+    setRefreshing(true);
+    try { await onRefresh?.(); }
+    finally { setRefreshing(false); }
+  };
 
   // Fresh-takeover / empty-workspace detection: no outreach activity recorded yet.
   const isEmpty =
@@ -28,7 +36,9 @@ export default function Overview({ metrics, gmail, health, readiness, onRefresh 
     <div>
       <div className="flex items-center justify-between mb-3">
         <h1 className="text-xl font-semibold">{t('nav_dashboard')}</h1>
-        <button className="btn" onClick={onRefresh}>{t('common_refresh')}</button>
+        <button type="button" className="btn" onClick={refresh} disabled={refreshing} aria-busy={refreshing}>
+          {refreshing ? (lang === "zh" ? "刷新中…" : "Refreshing…") : t('common_refresh')}
+        </button>
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-2 2xl:grid-cols-4 gap-3">
         {cards.map((c) => {

@@ -30,8 +30,8 @@ class ApiError(HTTPException):
 ERROR_CODES = {
     "GMAIL_SYNC_FAILED": "Gmail inbox sync did not complete.",
     "APPROVAL_BLOCKED": "Approval could not be dispatched (policy / send gate).",
-    "DRAFT_ONLY_MODE": "Real sending is disabled (ENABLE_REAL_SEND=false).",
-    "NO_REAL_GMAIL": "Real send enabled but no real Gmail account is connected.",
+    "DRAFT_ONLY_MODE": "Real sending requires a connected customer-owned Gmail account.",
+    "NO_REAL_GMAIL": "No connected real Gmail account is available for sending.",
     "POLICY_BLOCKED": "Blocked by the policy engine (suppression / window / limit).",
 }
 

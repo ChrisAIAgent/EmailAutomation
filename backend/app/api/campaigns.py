@@ -2,20 +2,24 @@
 from __future__ import annotations
 
 import io
+import json
 import logging
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models
 from ..agents.orchestrator import Orchestrator
-from ..config import is_openclaw_configured
+from ..config import get_settings, is_openclaw_configured
 from ..exceptions import AgentUnavailableError
 from ..schemas import CampaignCreate, CampaignOut, CsvImportRequest, CsvImportResult, GenerateOutreachInput
 from ..services import approvals as approval_svc
 from ..services import contacts as contact_svc
+from ..services.xlsx import read_xlsx_rows
 from .deps import get_db, ensure_owner
 
 logger = logging.getLogger("api.campaigns")
@@ -244,6 +248,8 @@ def import_csv(campaign_id: int, req: CsvImportRequest, db: Session = Depends(ge
     c = db.get(models.Campaign, campaign_id)
     if not c:
         raise HTTPException(status_code=404, detail="campaign not found")
+    if c.status == "archived":
+        raise HTTPException(status_code=409, detail="campaign_archived")
     result = contact_svc.import_contacts(
         db, owner_id=c.owner_id, campaign_id=campaign_id, csv_text=req.csv_text,
         field_map=req.field_map, has_header=req.has_header,
@@ -255,8 +261,32 @@ def import_csv(campaign_id: int, req: CsvImportRequest, db: Session = Depends(ge
 
 # --------------- file upload (XLSX + CSV) ---------------
 
-EXPECTED_COLUMNS = ["email", "first_name", "last_name", "company", "title", "notes"]
+EXPECTED_COLUMNS = [
+    "email", "first_name", "last_name", "company", "title", "phone", "website",
+    "segments", "tags", "timezone", "notes", "custom_fields", "source",
+]
 _EMAIL_RE = __import__("re").compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _split_list(value: str | None) -> list[str]:
+    """Parse user-managed tag/segment text without changing its display case."""
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in re.split(r"[,，;；]", value or ""):
+        item = raw.strip()
+        if item and item.casefold() not in seen:
+            seen.add(item.casefold())
+            result.append(item)
+    return result
+
+
+def _custom_fields(value: str | None) -> dict | None:
+    if not (value or "").strip():
+        return None
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        raise ValueError("custom_fields_must_be_json_object")
+    return parsed
 
 
 def _parse_upload(file_bytes: bytes, filename: str) -> tuple[list[str], list[dict]]:
@@ -264,18 +294,22 @@ def _parse_upload(file_bytes: bytes, filename: str) -> tuple[list[str], list[dic
     lower = filename.lower()
     rows: list[list[str]] = []
     if lower.endswith(".xlsx"):
-        import openpyxl
-        wb = openpyxl.load_workbook(io.BytesIO(file_bytes))
-        ws = wb.active
-        for row in ws.iter_rows(values_only=True):
-            rows.append([str(c) if c is not None else "" for c in row])
+        rows = read_xlsx_rows(file_bytes)
     else:
         text = file_bytes.decode("utf-8-sig")
         reader = __import__("csv").reader(io.StringIO(text))
         rows = [r for r in reader]
     if not rows:
         return [], []
-    header = [c.strip().lower() for c in rows[0]]
+    aliases = {
+        "姓名": "first_name", "名字": "first_name", "名": "first_name",
+        "姓": "last_name", "姓氏": "last_name", "公司": "company", "邮箱": "email",
+        "职位": "title", "电话": "phone", "网站": "website", "网址": "website",
+        "标签": "tags", "备注": "notes", "时区": "timezone", "来源": "source",
+        "客户分类": "segments", "行业分类": "segments", "行业": "segments",
+        "自定义字段": "custom_fields",
+    }
+    header = [aliases.get(c.strip().lower().replace(" ", "_"), c.strip().lower().replace(" ", "_")) for c in rows[0]]
     # map header columns to expected fields
     col_idx: dict[str, int] = {}
     for i, h in enumerate(header):
@@ -302,6 +336,8 @@ async def upload_contacts(
     c = db.get(models.Campaign, campaign_id)
     if not c:
         raise HTTPException(status_code=404, detail="campaign not found")
+    if c.status == "archived":
+        raise HTTPException(status_code=409, detail="campaign_archived")
     by = await file.read()
     header, rows = _parse_upload(by, file.filename or "")
 
@@ -318,6 +354,12 @@ async def upload_contacts(
             errors.append("missing email")
         elif not _EMAIL_RE.match(email):
             errors.append("invalid email format")
+        if not (r.get("first_name") or "").strip() and not (r.get("last_name") or "").strip():
+            errors.append("name required")
+        try:
+            r["_custom_fields"] = _custom_fields(r.get("custom_fields"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            errors.append("invalid custom_fields JSON object")
         if errors:
             invalid_rows.append({"row": row_num, "email": email or "(empty)", "errors": errors, **r})
             continue
@@ -363,6 +405,13 @@ async def upload_contacts(
                 owner_id=c.owner_id, email=email,
                 first_name=r.get("first_name") or "", last_name=r.get("last_name") or "",
                 company=r.get("company") or "", title=r.get("title") or "",
+                phone=r.get("phone") or None, website=r.get("website") or None,
+                tags=json.dumps(_split_list(r.get("tags")), ensure_ascii=False),
+                segments=json.dumps(_split_list(r.get("segments")), ensure_ascii=False),
+                timezone=r.get("timezone") or None, notes=r.get("notes") or None,
+                custom_fields=(json.dumps(r.get("_custom_fields"), ensure_ascii=False)
+                               if r.get("_custom_fields") else None),
+                source=r.get("source") or "file_import",
             )
             db.add(contact)
             db.flush()
@@ -399,6 +448,88 @@ async def upload_contacts(
     }
 
 
+def _json_list(value: str | None) -> list:
+    try:
+        parsed = json.loads(value or "[]")
+        return parsed if isinstance(parsed, list) else []
+    except (TypeError, ValueError):
+        return []
+
+
+def _generation_run_out(run: models.CampaignGenerationRun, *, reused: bool = False) -> dict:
+    failures = _json_list(run.failures_json)
+    return {
+        "run_id": run.id,
+        "status": run.status,
+        "generated": run.generated,
+        "failed": run.failed,
+        "approvals": _json_list(run.approvals_json),
+        "failures": failures,
+        "total_contacts": run.total_contacts,
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+        "error": run.error,
+        "reused": reused,
+    }
+
+
+def _record_generation_failure(
+    db: Session, run_id: int, contact_id: int, email: str, code: str,
+) -> None:
+    """Persist one failed recipient without rolling back prior approvals."""
+    # Keep raw driver details in server logs, not the public run-status API.
+    if "database is locked" in (code or "").casefold():
+        code = "draft_database_locked"
+    run = db.get(models.CampaignGenerationRun, run_id)
+    if run is None:
+        return
+    failures = _json_list(run.failures_json)
+    failures.append({"contact_id": contact_id, "email": email, "code": code[:160]})
+    run.failures_json = json.dumps(failures, ensure_ascii=False)
+    run.failed = len(failures)
+    db.commit()
+
+
+def _current_generation_run(db: Session, campaign_id: int) -> models.CampaignGenerationRun | None:
+    run = (
+        db.query(models.CampaignGenerationRun)
+        .filter_by(campaign_id=campaign_id, status="running")
+        .order_by(models.CampaignGenerationRun.started_at.desc())
+        .first()
+    )
+    if not run:
+        return None
+    stale_seconds = max(300, int(get_settings().LLM_TIMEOUT_SECONDS) * 3)
+    started_at = run.started_at
+    if started_at and started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    if started_at and started_at < datetime.now(timezone.utc) - timedelta(seconds=stale_seconds):
+        run.status = "failed"
+        run.finished_at = datetime.now(timezone.utc)
+        run.error = "generation_run_stale"
+        db.commit()
+        return None
+    return run
+
+
+@router.get("/{campaign_id}/generation-status")
+def generation_status(campaign_id: int, db: Session = Depends(get_db)):
+    if not db.get(models.Campaign, campaign_id):
+        raise HTTPException(status_code=404, detail="campaign not found")
+    active = _current_generation_run(db, campaign_id)
+    if active:
+        return _generation_run_out(active, reused=True)
+    latest = (
+        db.query(models.CampaignGenerationRun)
+        .filter_by(campaign_id=campaign_id)
+        .order_by(models.CampaignGenerationRun.created_at.desc())
+        .first()
+    )
+    return _generation_run_out(latest) if latest else {
+        "status": "idle", "generated": 0, "failed": 0, "approvals": [], "failures": [],
+    }
+
+
 @router.post("/{campaign_id}/generate")
 def generate_outreach(campaign_id: int, db: Session = Depends(get_db)):
     """Generate personalized outreach for all queued contacts and queue approvals.
@@ -408,41 +539,106 @@ def generate_outreach(campaign_id: int, db: Session = Depends(get_db)):
     c = db.get(models.Campaign, campaign_id)
     if not c:
         raise HTTPException(status_code=404, detail="campaign not found")
-    orch = Orchestrator(db)
+    if c.status != "active":
+        raise HTTPException(status_code=409, detail=f"campaign_{c.status}")
+    active = _current_generation_run(db, campaign_id)
+    if active:
+        return _generation_run_out(active, reused=True)
     queued = db.query(models.CampaignContact).filter_by(
         campaign_id=campaign_id, status="queued", membership_active=True
     ).all()
     if not queued:
-        return {"generated": 0, "approvals": []}
-    approvals = []
+        return {"status": "completed", "generated": 0, "failed": 0, "approvals": [], "failures": []}
+    run = models.CampaignGenerationRun(campaign_id=campaign_id, total_contacts=len(queued))
+    db.add(run)
+    try:
+        # Commit before the slow LLM call. A client timeout can now be safely
+        # observed by a later request instead of starting a duplicate batch.
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        active = _current_generation_run(db, campaign_id)
+        if active:
+            return _generation_run_out(active, reused=True)
+        raise HTTPException(status_code=409, detail="generation_run_conflict")
+
+    run_id = run.id
+    approvals: list[int] = []
+    degraded = 0
+    orch = Orchestrator(db)
     for cc in queued:
+        contact = db.get(models.Contact, cc.contact_id)
+        email = contact.email if contact else ""
         inp = GenerateOutreachInput(campaign_id=campaign_id, contact_id=cc.contact_id, mode=c.agent_mode)
         try:
             out = orch.generate_outreach(inp)
         except AgentUnavailableError as e:
-            raise HTTPException(status_code=409, detail=f"Agent unavailable: {e.agent}. Configure it or switch mode.")
+            db.rollback()
+            _record_generation_failure(db, run_id, cc.contact_id, email, f"agent_unavailable:{e.agent}")
+            continue
+        except Exception as exc:
+            logger.exception("Campaign generation failed campaign=%s contact=%s", campaign_id, cc.contact_id)
+            db.rollback()
+            _record_generation_failure(db, run_id, cc.contact_id, email, f"generation_failed:{type(exc).__name__}")
+            continue
         # pick primary proposal
         if hasattr(out, "langgraph"):  # ComparisonView
             ad = getattr(out, c.primary_agent) or getattr(out, "langgraph")
             if ad is None:
+                _record_generation_failure(db, run_id, cc.contact_id, email, "proposal_unavailable")
                 continue
             from ..schemas import decision_to_proposal
             prop = decision_to_proposal(ad)
         else:
             prop = out
         if prop is None:
+            _record_generation_failure(db, run_id, cc.contact_id, email, "proposal_unavailable")
+            continue
+        # generate_outreach flushes an AgentRun into this Session. Gmail Draft
+        # creation may refresh OAuth credentials using a different, short-lived
+        # Session. Commit the local decision first so SQLite does not retain a
+        # writer lock while that OAuth session persists its refresh.
+        try:
+            db.commit()
+        except Exception:
+            logger.exception("Failed to persist campaign generation decision", extra={"run_id": run_id})
+            _record_generation_failure(
+                db, run_id, cc.contact_id, email, "agent_decision_persist_failed"
+            )
             continue
         try:
             ap = approval_svc.create_outreach_approval(
                 db, cc, prop, mode=c.agent_mode,
                 agent=c.primary_agent, is_primary=True,
             )
+            approvals.append(ap.id)
+            current = db.get(models.CampaignGenerationRun, run_id)
+            if current is not None:
+                stored = _json_list(current.approvals_json)
+                stored.append(ap.id)
+                current.approvals_json = json.dumps(stored)
+                current.generated = len(stored)
+            if getattr(prop, "model", "") == "rule-based":
+                degraded += 1
+            # One recipient is one transaction: a later failure cannot erase
+            # this Draft/Approval pair.
+            db.commit()
         except approval_svc.DraftCreationError as exc:
             db.rollback()
-            raise HTTPException(status_code=409, detail=exc.reason) from exc
-        approvals.append(ap.id)
+            _record_generation_failure(db, run_id, cc.contact_id, email, exc.reason)
+        except Exception as exc:
+            logger.exception("Campaign draft creation failed campaign=%s contact=%s", campaign_id, cc.contact_id)
+            db.rollback()
+            _record_generation_failure(db, run_id, cc.contact_id, email, f"draft_creation_failed:{type(exc).__name__}")
+    run = db.get(models.CampaignGenerationRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=500, detail="generation_run_missing")
+    run.status = "completed" if run.failed == 0 else ("partial" if run.generated else "failed")
+    run.finished_at = datetime.now(timezone.utc)
+    if degraded:
+        run.error = f"rule_based_fallback:{degraded}"
     db.commit()
-    return {"generated": len(approvals), "approvals": approvals}
+    return {**_generation_run_out(run), "degraded": degraded}
 
 
 @router.post("/{campaign_id}/start")
@@ -450,6 +646,8 @@ def start_campaign(campaign_id: int, db: Session = Depends(get_db)):
     c = db.get(models.Campaign, campaign_id)
     if not c:
         raise HTTPException(status_code=404, detail="campaign not found")
+    if c.status == "archived":
+        raise HTTPException(status_code=409, detail="campaign_archived")
     c.status = "active"
     db.commit()
     return {"ok": True, "status": c.status}
@@ -460,6 +658,8 @@ def pause_campaign(campaign_id: int, db: Session = Depends(get_db)):
     c = db.get(models.Campaign, campaign_id)
     if not c:
         raise HTTPException(status_code=404, detail="campaign not found")
+    if c.status == "archived":
+        raise HTTPException(status_code=409, detail="campaign_archived")
     c.status = "paused"
     db.commit()
     return {"ok": True, "status": c.status}
@@ -470,6 +670,8 @@ def stop_campaign(campaign_id: int, db: Session = Depends(get_db)):
     c = db.get(models.Campaign, campaign_id)
     if not c:
         raise HTTPException(status_code=404, detail="campaign not found")
+    if c.status == "archived":
+        raise HTTPException(status_code=409, detail="campaign_archived")
     c.status = "stopped"
     # cancel scheduled follow-ups
     db.query(models.FollowUpTask).filter_by(campaign_id=campaign_id, status="scheduled").update({"status": "cancelled"})
@@ -495,7 +697,43 @@ def delete_campaign(campaign_id: int, db: Session = Depends(get_db)):
         .first()
         is not None
     )
+    now = datetime.now(timezone.utc)
     c.status = "archived"
-    db.query(models.FollowUpTask).filter_by(campaign_id=campaign_id, status="scheduled").update({"status": "cancelled"})
+    members = db.query(models.CampaignContact).filter_by(campaign_id=campaign_id).all()
+    for member in members:
+        if member.membership_active:
+            member.membership_active = False
+            member.removed_at = now
+            member.removed_reason = "campaign_archived"
+
+    pending = db.query(models.Approval).filter(
+        models.Approval.campaign_id == campaign_id,
+        models.Approval.status == "pending",
+        models.Approval.campaign_contact_id.isnot(None),
+    ).all()
+    for approval in pending:
+        approval.status = "expired"
+        approval.decided_by = "system"
+        approval.decided_at = now
+        approval.rejection_reason = "campaign_archived"
+        if approval.draft_id:
+            draft = db.get(models.EmailDraft, approval.draft_id)
+            if draft and draft.status in ("draft", "approved"):
+                draft.status = "cancelled"
+        if approval.automation_run_id:
+            run = db.get(models.AutomationRun, approval.automation_run_id)
+            if run:
+                from ..services import automation as automation_svc
+                automation_svc.invalidate_frozen_run(
+                    db, run, "campaign archived", actor="system"
+                )
+
+    tasks = db.query(models.FollowUpTask).filter(
+        models.FollowUpTask.campaign_id == campaign_id,
+        models.FollowUpTask.status.in_(("scheduled", "ready", "running", "paused", "failed")),
+    ).all()
+    for task in tasks:
+        task.status = "cancelled"
+        task.last_error = "campaign_archived"
     db.commit()
     return {"ok": True, "deleted": True, "status": "archived", "had_send_records": has_sent}

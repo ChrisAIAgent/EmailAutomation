@@ -33,9 +33,16 @@ export default class ErrorBoundary extends Component<
             <p className="text-muted text-sm mb-4 break-words">
               {this.state.error.message || t('common_error')}
             </p>
-            <button className="btn-primary" onClick={this.handleRetry}>
-              {t('common_retry')}
-            </button>
+            <div className="flex gap-2">
+              <button className="btn-primary" onClick={this.handleRetry}>
+                {t('common_retry')}
+              </button>
+              {/* Pure navigation only: the diagnostics page never runs a check
+                  on mount, so opening it performs zero diagnostic work. */}
+              <button className="btn" onClick={() => window.location.assign("/diagnostics")}>
+                {t('diag_open')}
+              </button>
+            </div>
           </div>
         </div>
       );

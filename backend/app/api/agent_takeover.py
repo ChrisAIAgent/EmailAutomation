@@ -34,6 +34,9 @@ class AgentTakeoverAuthorize(BaseModel):
     token: str
     operation: str
     automation_id: int | None = None
+    campaign_id: int | None = None
+    thread_id: int | None = None
+    approval_id: int | None = None
 
 
 class AgentTakeoverTelemetry(BaseModel):
@@ -158,15 +161,51 @@ def run_agent_takeover_now(db: Session = Depends(get_db)):
 def authorize_agent_takeover(body: AgentTakeoverAuthorize, db: Session = Depends(get_db)):
     """Validate one scheduled-session capability without expanding its scope."""
     owner_id = ensure_owner(db)
-    allowed = {"sync_gmail", "sort_inbox", "start_global_run"}
+    campaign_operations = {
+        "add_campaign_contacts", "update_campaign", "generate_campaign_outreach",
+        "start_campaign", "pause_campaign", "stop_campaign", "remove_campaign_contact",
+    }
+    automation_operations = {
+        "enable_automation", "pause_automation", "schedule_automation", "start_agent_run",
+    }
+    allowed = {
+        "sync_gmail", "sort_inbox", "start_daily_triage", "control_daily_triage",
+        "create_campaign", "generate_automation_plan", "create_automation",
+        "generate_inbox_reply", "revise_approval",
+        *campaign_operations, *automation_operations,
+    }
     if body.operation not in allowed or not takeover_svc.token_is_valid(db, body.token):
         raise HTTPException(status_code=403, detail="invalid_or_expired_agent_takeover_grant")
-    if body.operation == "start_global_run":
-        automation = _global_automation(db, owner_id)
-        if not automation or automation.id != body.automation_id or automation.scope != "global":
-            raise HTTPException(status_code=403, detail="agent_takeover_only_allows_global_inbox_run")
+    if body.operation in campaign_operations:
+        if body.campaign_id is None:
+            raise HTTPException(status_code=422, detail="agent_takeover_campaign_required")
+    if body.campaign_id is not None:
+        campaign = db.get(models.Campaign, body.campaign_id)
+        if not campaign or campaign.owner_id != owner_id:
+            raise HTTPException(status_code=403, detail="agent_takeover_campaign_not_owned")
+    if body.operation == "generate_inbox_reply":
+        if body.thread_id is None:
+            raise HTTPException(status_code=422, detail="agent_takeover_thread_required")
+        thread = db.get(models.EmailThread, body.thread_id)
+        account = db.get(models.GmailAccount, thread.gmail_account_id) if thread else None
+        if not thread or not account or account.user_id != owner_id:
+            raise HTTPException(status_code=403, detail="agent_takeover_thread_not_owned")
+    if body.operation == "revise_approval":
+        if body.approval_id is None:
+            raise HTTPException(status_code=422, detail="agent_takeover_approval_required")
+        approval = db.get(models.Approval, body.approval_id)
+        from ..services.approvals import approval_owner_id
+        if not approval or approval_owner_id(db, approval) != owner_id:
+            raise HTTPException(status_code=403, detail="agent_takeover_approval_not_owned")
+    if body.operation in automation_operations:
+        if body.automation_id is None:
+            raise HTTPException(status_code=422, detail="agent_takeover_automation_required")
+        automation = db.get(models.Automation, body.automation_id)
+        if not automation or automation.owner_id != owner_id:
+            raise HTTPException(status_code=403, detail="agent_takeover_automation_not_owned")
+    if body.operation == "start_agent_run":
         if automation.execution_mode != "full_auto" or automation.status != "enabled":
-            raise HTTPException(status_code=409, detail="global_inbox_not_ready_for_takeover")
+            raise HTTPException(status_code=409, detail="automation_not_ready_for_takeover")
     return {"authorized": True, "operation": body.operation}
 
 
@@ -176,7 +215,17 @@ def record_agent_takeover_telemetry(body: AgentTakeoverTelemetry, db: Session = 
     ensure_owner(db)
     if not takeover_svc.token_is_valid(db, body.token):
         raise HTTPException(status_code=403, detail="invalid_or_expired_agent_takeover_grant")
-    allowed_stages = {"sync_gmail", "sort_inbox", "start_global_run", "poll_agent_run"}
+    allowed_stages = {
+        "read_operating_state", "read_inbox", "read_daily_triage",
+        "sync_gmail", "sort_inbox", "start_daily_triage", "control_daily_triage",
+        "poll_daily_triage", "create_campaign", "add_campaign_contacts",
+        "remove_campaign_contact", "generate_inbox_reply",
+        "revise_approval",
+        "update_campaign", "generate_campaign_outreach", "start_campaign",
+        "pause_campaign", "stop_campaign", "generate_automation_plan",
+        "create_automation", "enable_automation", "pause_automation",
+        "schedule_automation", "start_agent_run", "poll_agent_run",
+    }
     allowed_statuses = {"started", "success", "failed"}
     if body.stage not in allowed_stages or body.status not in allowed_statuses:
         raise HTTPException(status_code=422, detail="invalid_takeover_telemetry")
@@ -186,6 +235,7 @@ def record_agent_takeover_telemetry(body: AgentTakeoverTelemetry, db: Session = 
         flags.set_flag(db, takeover_svc.FLAG_LAST_SUCCESS_STAGE, body.stage)
     elif body.status == "failed":
         flags.set_flag(db, takeover_svc.FLAG_LAST_ERROR, json.dumps(body.detail or {})[:500])
+        flags.set_flag(db, takeover_svc.FLAG_CYCLE_HAS_ERRORS, "true")
     cycle_id = flags.get_flag(db, takeover_svc.FLAG_CYCLE_ID)
     db.add(models.AuditLog(
         actor="tacwork", action=f"agent_takeover_{body.stage}_{body.status}",

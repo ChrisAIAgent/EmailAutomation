@@ -110,6 +110,25 @@ class GenerateFollowUpInput(BaseModel):
     thread_id: int
     sequence: int = 1
     mode: str = "langgraph_only"
+
+
+class ApprovalRevisionInput(BaseModel):
+    """Internal, draft-only instruction for revising one pending Approval."""
+
+    approval_id: int
+    instruction: str
+    kind: str
+    current_subject: str
+    current_body_text: str
+    campaign_id: Optional[int] = None
+    contact_id: Optional[int] = None
+    thread_id: Optional[int] = None
+    thread_context: Optional[str] = None
+    latest_customer_message: Optional[str] = None
+    intent: str = "unknown"
+    recommended_action: str = "human_review"
+    risk_level: str = "low"
+    mode: str = "langgraph_only"
     last_message_body: Optional[str] = None
 
 
@@ -167,6 +186,7 @@ class ContactBase(BaseModel):
     website: Optional[str] = None
     category: str = "prospect"
     tags: list[str] = Field(default_factory=list)
+    segments: list[str] = Field(default_factory=list)
     intent_level: str = "unknown"
     notes: Optional[str] = None
     lifecycle_stage: str = "new_customer"
@@ -197,6 +217,7 @@ class ContactUpdate(BaseModel):
     website: Optional[str] = None
     category: Optional[str] = None
     tags: Optional[list[str]] = None
+    segments: Optional[list[str]] = None
     intent_level: Optional[str] = None
     notes: Optional[str] = None
     lifecycle_stage: Optional[str] = None
@@ -251,6 +272,13 @@ class ApprovalInvalidation(BaseModel):
     """Close a pending approval without sending its draft."""
     reason: str = "invalidated by operator"
     editor_email: Optional[str] = None
+
+
+class ApprovalRevision(BaseModel):
+    """A natural-language instruction to revise, but never dispatch, one draft."""
+
+    instruction: str = Field(min_length=1, max_length=2_000)
+    editor_email: Optional[str] = Field(default=None, max_length=200)
 
 class SendResult(BaseModel):
     draft_id: int

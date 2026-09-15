@@ -20,7 +20,10 @@ def _make_campaign(client, **over):
     payload.update(over)
     r = client.post("/api/campaigns", json=payload)
     assert r.status_code == 200, r.text
-    return r.json()["id"]
+    cid = r.json()["id"]
+    started = client.post(f"/api/campaigns/{cid}/start")
+    assert started.status_code == 200, started.text
+    return cid
 
 
 def _import(client, cid, csv_text):
@@ -115,6 +118,96 @@ def test_status_pending_and_no_send(client):
     m = client.get("/api/dashboard/metrics").json()
     assert m["sent_today"] == 0
     assert m["draft_only"] is True
+
+
+def test_generation_keeps_success_when_one_contact_fails(client, monkeypatch):
+    from app.api import campaigns as campaign_api
+    from app.exceptions import AgentUnavailableError
+
+    cid = _make_campaign(client)
+    _import(client, cid, "email,first_name\nfirst@test.com,First\nsecond@test.com,Second\n")
+    original = campaign_api.Orchestrator.generate_outreach
+
+    def one_failure(self, inp):
+        if inp.contact_id == 2:
+            raise AgentUnavailableError("langgraph")
+        return original(self, inp)
+
+    monkeypatch.setattr(campaign_api.Orchestrator, "generate_outreach", one_failure)
+    generated = client.post(f"/api/campaigns/{cid}/generate")
+    assert generated.status_code == 200, generated.text
+    body = generated.json()
+    assert body["status"] == "partial"
+    assert body["generated"] == 1
+    assert body["failed"] == 1
+    assert body["approvals"]
+    assert body["failures"][0]["email"] == "second@test.com"
+    assert len(client.get("/api/approvals", params={"status": "pending"}).json()) == 1
+    assert client.get(f"/api/campaigns/{cid}/generation-status").json()["status"] == "partial"
+
+
+def test_generation_reuses_existing_running_run(client, db):
+    from app import models
+
+    cid = _make_campaign(client)
+    running = models.CampaignGenerationRun(campaign_id=cid, total_contacts=2)
+    db.add(running)
+    db.commit()
+    response = client.post(f"/api/campaigns/{cid}/generate")
+    assert response.status_code == 200
+    assert response.json()["status"] == "running"
+    assert response.json()["reused"] is True
+    assert response.json()["run_id"] == running.id
+
+
+def test_generation_releases_agent_decision_lock_before_gmail_draft(client, monkeypatch):
+    """OAuth persistence in another Session must not block on AgentRun flushes."""
+    from types import SimpleNamespace
+
+    from app import models
+    from app.api import campaigns as campaign_api
+    from app.db import SessionLocal
+    from app.schemas import EmailProposal
+
+    cid = _make_campaign(client)
+    _import(client, cid, "email,first_name\ndecision-lock@example.com,Decision\n")
+
+    def fake_generate(self, inp):
+        self.db.add(models.AgentRun(
+            run_id=f"decision-lock-{inp.contact_id}", agent="langgraph",
+            task_type="generate_outreach", campaign_id=inp.campaign_id,
+            contact_id=inp.contact_id,
+        ))
+        self.db.flush()
+        return EmailProposal(
+            agent="langgraph", run_id=f"decision-lock-{inp.contact_id}",
+            subject="APSARA invitation",
+            body_text="Hello,\n\nPlease join us.\n\nBest regards,\nChris\nTAC AISolution",
+            confidence=0.9,
+        )
+
+    def fake_create_draft(_db, _membership, _proposal, **_kwargs):
+        oauth_session = SessionLocal()
+        try:
+            oauth_session.connection().exec_driver_sql("PRAGMA busy_timeout=1")
+            oauth_session.add(models.AuditLog(
+                actor="system", action="oauth_refresh_persist_test",
+                entity="oauth_credential", entity_id="test", detail="",
+            ))
+            oauth_session.commit()
+        finally:
+            oauth_session.close()
+        return SimpleNamespace(id=987)
+
+    monkeypatch.setattr(campaign_api.Orchestrator, "generate_outreach", fake_generate)
+    monkeypatch.setattr(campaign_api.approval_svc, "create_outreach_approval", fake_create_draft)
+
+    response = client.post(f"/api/campaigns/{cid}/generate")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+    assert response.json()["generated"] == 1
+    assert response.json()["failed"] == 0
 
 
 def test_quality_flags_fabrication():

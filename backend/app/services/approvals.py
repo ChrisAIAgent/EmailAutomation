@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -12,6 +13,7 @@ from ..config import get_settings
 from ..security import new_idempotency_key
 from ..tools.email_tools import UnifiedEmailToolLayer
 from .accounts import resolve_sending_account
+from .thread_context import build_thread_context
 
 logger = logging.getLogger("approvals")
 
@@ -21,6 +23,15 @@ class DraftCreationError(RuntimeError):
 
     def __init__(self, reason: str):
         self.reason = reason
+        super().__init__(reason)
+
+
+class ApprovalRevisionError(RuntimeError):
+    """A revision failed before any Approval/Draft content was changed."""
+
+    def __init__(self, reason: str, status_code: int = 409):
+        self.reason = reason
+        self.status_code = status_code
         super().__init__(reason)
 
 
@@ -38,7 +49,7 @@ def _account_for_campaign(db, campaign):
     # placeholder) but with consistent ordering and an OAuth join, so a stale placeholder row
     # can never win over the real connected account. ``provision=True`` keeps
     # draft-only mode working when no real account exists.
-    return resolve_sending_account(db, campaign=campaign, provision=True)
+    return resolve_sending_account(db, campaign=campaign, provision=get_settings().ALLOW_INMEMORY_GMAIL)
 
 
 def _account_for_thread(db, thread):
@@ -55,7 +66,7 @@ def _account_for_thread(db, thread):
             owner_id = acc.user_id
     if owner_id is None:
         owner_id = db.query(models.User.id).order_by(models.User.id.asc()).scalar()
-    return resolve_sending_account(db, thread=thread, owner_id=owner_id, provision=True)
+    return resolve_sending_account(db, thread=thread, owner_id=owner_id, provision=get_settings().ALLOW_INMEMORY_GMAIL)
 
 
 def _append_reference(references: str | None, message_id: str) -> str:
@@ -129,6 +140,247 @@ def _thread_reply_context(db, tl, thread, source_message=None):
     }
 
 
+def approval_owner_id(db, approval: models.Approval) -> int | None:
+    """Resolve the owner for an Approval without falling back across tenants."""
+    if approval.campaign_id:
+        campaign = db.get(models.Campaign, approval.campaign_id)
+        if campaign:
+            return campaign.owner_id
+    if approval.thread_id:
+        thread = db.get(models.EmailThread, approval.thread_id)
+        account = db.get(models.GmailAccount, thread.gmail_account_id) if thread else None
+        if account:
+            return account.user_id
+    return None
+
+
+def _revision_hash(subject: str, body_text: str) -> str:
+    return hashlib.sha256(f"{subject.strip()}\n{body_text.strip()}".encode("utf-8")).hexdigest()
+
+
+def _latest_successful_revision(db, approval_id: int):
+    rows = (
+        db.query(models.AuditLog)
+        .filter_by(action="approval_revised", entity="approval", entity_id=str(approval_id), success=True)
+        .order_by(models.AuditLog.created_at.desc(), models.AuditLog.id.desc())
+        .all()
+    )
+    for row in rows:
+        try:
+            detail = json.loads(row.detail or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(detail, dict):
+            return detail
+    return None
+
+
+def _revision_contact(db, approval, campaign, thread):
+    if approval.campaign_contact_id:
+        member = db.get(models.CampaignContact, approval.campaign_contact_id)
+        if member:
+            return db.get(models.Contact, member.contact_id), member
+    owner_id = approval_owner_id(db, approval)
+    email = (thread.contact_email if thread else None) or approval.to_email
+    contact = None
+    if email and owner_id is not None:
+        contact = db.query(models.Contact).filter_by(owner_id=owner_id, email=email.lower()).first()
+    return contact, None
+
+
+def _proposal_from_revision_output(output, campaign):
+    """Select the configured primary proposal in compare mode."""
+    if hasattr(output, "langgraph"):
+        primary = campaign.primary_agent if campaign and campaign.primary_agent in {"langgraph", "openclaw"} else "langgraph"
+        decision = getattr(output, primary, None) or getattr(output, "langgraph", None) or getattr(output, "openclaw", None)
+        if decision is None or not getattr(decision, "draft", None):
+            return None
+        from ..schemas import decision_to_proposal
+        return decision_to_proposal(decision)
+    return output
+
+
+def revise_pending_approval(db, approval_id: int, instruction: str, *, editor_email: str | None = None, owner_id: int | None = None):
+    """Revise one pending Approval and its existing Gmail Draft, never send.
+
+    Every failure before ``update_draft`` leaves the existing content untouched;
+    an update failure likewise leaves the Approval fields unchanged.  The linked
+    Draft is always updated in place, so the Approval/Draft relationship and the
+    original Gmail thread are retained.
+    """
+    normalized = (instruction or "").strip()
+    if not normalized:
+        raise ApprovalRevisionError("approval_revision_instruction_required", 422)
+    if len(normalized) > 2_000:
+        raise ApprovalRevisionError("approval_revision_instruction_too_long", 422)
+
+    approval = db.get(models.Approval, approval_id)
+    if approval is None:
+        raise ApprovalRevisionError("approval_not_found", 404)
+    if approval.status != "pending":
+        raise ApprovalRevisionError(f"approval_not_pending:{approval.status}")
+    resolved_owner_id = approval_owner_id(db, approval)
+    if owner_id is not None and resolved_owner_id != owner_id:
+        raise ApprovalRevisionError("approval_not_owned", 403)
+    if resolved_owner_id is None:
+        raise ApprovalRevisionError("approval_owner_unresolved")
+    draft = db.get(models.EmailDraft, approval.draft_id) if approval.draft_id else None
+    if draft is None or draft.status != "draft":
+        raise ApprovalRevisionError("approval_revision_draft_unavailable")
+    if not (draft.gmail_draft_id or "").strip():
+        # Do not spend an LLM call on copy that cannot be written to the actual
+        # Gmail Draft. The existing Approval remains pending and unchanged.
+        raise ApprovalRevisionError("approval_revision_draft_remote_id_missing")
+
+    instruction_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    current_hash = _revision_hash(approval.subject, approval.body_text or "")
+    previous = _latest_successful_revision(db, approval.id)
+    if previous and previous.get("instruction_hash") == instruction_hash and previous.get("new_hash") == current_hash:
+        return {
+            "ok": True, "approval_id": approval.id, "draft_id": draft.id,
+            "status": approval.status, "kind": approval.kind,
+            "subject": approval.subject, "body_text": approval.body_text,
+            "revision_applied": True, "idempotent_replay": True, "sent": False,
+        }
+
+    campaign = db.get(models.Campaign, approval.campaign_id) if approval.campaign_id else None
+    thread = db.get(models.EmailThread, approval.thread_id) if approval.thread_id else None
+    contact, member = _revision_contact(db, approval, campaign, thread)
+    if approval.campaign_contact_id and (member is None or not member.membership_active):
+        raise ApprovalRevisionError("campaign_contact_removed")
+    if approval.kind in {"reply", "follow_up"} and thread is None:
+        raise ApprovalRevisionError("gmail_thread_context_missing")
+
+    latest_customer_message = ""
+    reply_context = None
+    mode = campaign.agent_mode if campaign else "langgraph_only"
+    agent = campaign.primary_agent if campaign else (approval.agent or "langgraph")
+    if thread is not None:
+        latest = (
+            db.query(models.EmailMessage)
+            .filter_by(thread_id=thread.id, is_incoming=True)
+            .order_by(models.EmailMessage.received_at.desc(), models.EmailMessage.id.desc())
+            .first()
+        )
+        latest_customer_message = latest.body_text if latest else ""
+    else:
+        latest = None
+
+    from ..schemas import ApprovalRevisionInput
+    revision_input = ApprovalRevisionInput(
+        approval_id=approval.id, instruction=normalized, kind=approval.kind,
+        current_subject=approval.subject, current_body_text=approval.body_text or "",
+        campaign_id=campaign.id if campaign else None,
+        contact_id=contact.id if contact else None,
+        thread_id=thread.id if thread else None,
+        thread_context=build_thread_context(db, thread) if thread else "",
+        latest_customer_message=latest_customer_message,
+        intent=approval.recommended_action or "unknown",
+        recommended_action=approval.recommended_action or "human_review",
+        risk_level=approval.risk_level or "low",
+        mode=mode,
+    )
+    from ..agents.orchestrator import Orchestrator
+    from ..exceptions import AgentUnavailableError
+    try:
+        output = Orchestrator(db).revise_approval(revision_input)
+    except AgentUnavailableError as exc:
+        raise ApprovalRevisionError(f"approval_revision_not_applied:agent_unavailable:{exc.agent}") from exc
+    proposal = _proposal_from_revision_output(output, campaign)
+    if proposal is None or not (proposal.body_text or "").strip():
+        raise ApprovalRevisionError("approval_revision_not_applied", 503)
+
+    # Re-apply deterministic identity cleanup to protect output from every
+    # adapter, including external OpenClaw, before touching a Gmail Draft.
+    from .agent_profile import apply_profile_to_reply, resolve_profile
+    profile = resolve_profile(db, resolved_owner_id, campaign=campaign)
+    try:
+        body_text, _ = apply_profile_to_reply(
+            proposal.body_text, profile,
+            customer_message=latest_customer_message,
+            customer_name=(contact.first_name if contact else "") or "",
+        )
+    except ValueError as exc:
+        raise ApprovalRevisionError("approval_revision_not_applied:profile_validation") from exc
+
+    # Replies and follow-ups always use refreshed Gmail threading headers and
+    # the exact source thread subject.  First outreach may revise its subject.
+    account, oauth = _account_for_campaign(db, campaign) if campaign else _account_for_thread(db, thread)
+    tl = UnifiedEmailToolLayer(db, account, oauth)
+    subject = (proposal.subject or "").strip()
+    if thread is not None:
+        try:
+            reply_context = _thread_reply_context(db, tl, thread, latest)
+        except DraftCreationError as exc:
+            raise ApprovalRevisionError(exc.reason) from exc
+        subject = reply_context["subject"]
+    if not subject:
+        raise ApprovalRevisionError("approval_revision_not_applied", 503)
+
+    from . import quality as quality_svc
+    quality_report = quality_svc.compute_quality(
+        subject, body_text,
+        contact={
+            "first_name": contact.first_name if contact else "",
+            "company": contact.company if contact else "",
+            "title": contact.title if contact else "",
+        },
+        campaign={
+            "product_description": campaign.product_description if campaign else "",
+            "objective": campaign.objective if campaign else "",
+            "target_audience": campaign.target_audience if campaign else "",
+            "sender_company": campaign.sender_company if campaign else "",
+        },
+    )
+    if quality_report.get("fabrication"):
+        raise ApprovalRevisionError("approval_revision_not_applied:fabrication_detected", 503)
+
+    revision_key = "revision:" + hashlib.sha256(
+        f"{approval.id}\0{current_hash}\0{instruction_hash}".encode("utf-8")
+    ).hexdigest()[:32]
+    result = tl.update_draft(
+        draft_db_id=draft.id, to=draft.to_email, subject=subject, body_text=body_text,
+        body_html=proposal.body_html or "",
+        thread_gmail_id=reply_context["thread_gmail_id"] if reply_context else None,
+        in_reply_to=reply_context["in_reply_to"] if reply_context else None,
+        references=reply_context["references"] if reply_context else None,
+        agent=proposal.agent or agent, mode=mode, is_primary=True,
+        campaign_id=campaign.id if campaign else None, idempotency_key=revision_key,
+    )
+    if not result.get("ok"):
+        raise ApprovalRevisionError(
+            "approval_revision_draft_update_failed:" + (result.get("blocked") or result.get("error") or "unknown")
+        )
+
+    approval.subject = subject
+    approval.body_text = body_text
+    approval.body_html = proposal.body_html or ""
+    approval.agent = proposal.agent or agent
+    approval.agent_run_id = proposal.run_id
+    approval.model = proposal.model
+    approval.prompt_version = proposal.prompt_version
+    approval.latency_ms = proposal.latency_ms
+    approval.quality_json = quality_svc.quality_to_json(quality_report)
+    new_hash = _revision_hash(subject, body_text)
+    db.add(models.AuditLog(
+        actor=(editor_email or "agent").strip() or "agent",
+        action="approval_revised", entity="approval", entity_id=str(approval.id),
+        detail=json.dumps({
+            "previous_hash": current_hash, "new_hash": new_hash,
+            "instruction_hash": instruction_hash, "kind": approval.kind,
+            "agent": approval.agent, "revision_key": revision_key,
+        }, ensure_ascii=False),
+        success=True,
+    ))
+    db.flush()
+    return {
+        "ok": True, "approval_id": approval.id, "draft_id": draft.id,
+        "status": approval.status, "kind": approval.kind, "subject": approval.subject,
+        "body_text": approval.body_text, "quality": quality_report,
+        "revision_applied": True, "idempotent_replay": False, "sent": False,
+    }
+
+
 def create_outreach_approval(
     db, cc, proposal, mode="langgraph_only", agent="langgraph", is_primary=True,
     automation_run_id: int | None = None,
@@ -137,6 +389,10 @@ def create_outreach_approval(
     if not cc.membership_active:
         raise DraftCreationError("campaign_contact_removed")
     campaign = db.get(models.Campaign, cc.campaign_id)
+    if campaign is None:
+        raise DraftCreationError("campaign_not_found")
+    if campaign.status != "active":
+        raise DraftCreationError(f"campaign_{campaign.status}")
     contact = db.get(models.Contact, cc.contact_id)
     account, oauth = (
         _account_for_campaign(db, campaign)
@@ -189,6 +445,10 @@ def create_follow_up_approval(
     if cc is None or not cc.membership_active:
         raise DraftCreationError("campaign_contact_removed")
     campaign = db.get(models.Campaign, cc.campaign_id)
+    if campaign is None:
+        raise DraftCreationError("campaign_not_found")
+    if campaign.status != "active":
+        raise DraftCreationError(f"campaign_{campaign.status}")
     contact = db.get(models.Contact, cc.contact_id)
     account, oauth = _account_for_campaign(db, campaign)
     tl = UnifiedEmailToolLayer(db, account, oauth)
@@ -312,7 +572,39 @@ def decide_approval(db, approval_id, decision: str, *, editor_email=None, edited
         return {"ok": False, "error": f"already {ap.status}"}
     if ap.campaign_contact_id:
         member = db.get(models.CampaignContact, ap.campaign_contact_id)
-        if member is None or not member.membership_active:
+        if member is None:
+            if ap.draft_id:
+                blocked_draft = db.get(models.EmailDraft, ap.draft_id)
+                if blocked_draft and blocked_draft.status in ("draft", "approved"):
+                    blocked_draft.status = "cancelled"
+            ap.status = "expired"
+            ap.decided_by = "system"
+            ap.decided_at = datetime.now(timezone.utc)
+            ap.rejection_reason = "campaign_contact_removed"
+            db.flush()
+            return {"ok": False, "blocked": "campaign_contact_removed", "status": ap.status}
+        campaign = db.get(models.Campaign, member.campaign_id)
+        campaign_block = (
+            "campaign_not_found" if campaign is None
+            else f"campaign_{campaign.status}" if campaign.status != "active"
+            else None
+        )
+        if campaign_block:
+            # Pause is reversible, so keep its frozen content pending. Archived
+            # and stopped campaigns are terminal and must close stale send work.
+            if campaign is not None and campaign.status == "paused":
+                return {"ok": False, "blocked": campaign_block, "status": ap.status}
+            if ap.draft_id:
+                blocked_draft = db.get(models.EmailDraft, ap.draft_id)
+                if blocked_draft and blocked_draft.status in ("draft", "approved"):
+                    blocked_draft.status = "cancelled"
+            ap.status = "expired"
+            ap.decided_by = "system"
+            ap.decided_at = datetime.now(timezone.utc)
+            ap.rejection_reason = campaign_block
+            db.flush()
+            return {"ok": False, "blocked": campaign_block, "status": ap.status}
+        if not member.membership_active:
             if ap.draft_id:
                 blocked_draft = db.get(models.EmailDraft, ap.draft_id)
                 if blocked_draft and blocked_draft.status in ("draft", "approved"):
@@ -356,12 +648,24 @@ def decide_approval(db, approval_id, decision: str, *, editor_email=None, edited
             if edited_subject and edited_subject != reply_context["subject"]:
                 return {"ok": False, "blocked": "reply_subject_must_match_thread", "status": ap.status}
             subject = reply_context["subject"]
-        tl.update_draft(draft_db_id=draft.id, to=draft.to_email, subject=subject,
-                        body_text=body_text, body_html=body_html or "",
-                        thread_gmail_id=reply_context["thread_gmail_id"] if reply_context else None,
-                        in_reply_to=reply_context["in_reply_to"] if reply_context else None,
-                        references=reply_context["references"] if reply_context else None,
-                        agent=agent, mode=mode, is_primary=is_primary)
+        update_result = tl.update_draft(
+            draft_db_id=draft.id, to=draft.to_email, subject=subject,
+            body_text=body_text, body_html=body_html or "",
+            thread_gmail_id=reply_context["thread_gmail_id"] if reply_context else None,
+            in_reply_to=reply_context["in_reply_to"] if reply_context else None,
+            references=reply_context["references"] if reply_context else None,
+            agent=agent, mode=mode, is_primary=is_primary,
+        )
+        if not update_result.get("ok"):
+            # Never send a remote Gmail Draft when the requested content update
+            # was not applied. Keep the Approval pending for safe recovery.
+            return {
+                "ok": False,
+                "blocked": "approval_draft_update_failed:" + (
+                    update_result.get("blocked") or update_result.get("error") or "unknown"
+                ),
+                "status": ap.status,
+            }
 
     campaign = (db.get(models.Campaign, ap.campaign_id)
                 if ap.campaign_id and not is_inbox_reply else None)

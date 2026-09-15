@@ -176,11 +176,16 @@ def test_real_person_special_content_requires_review_without_contact_or_reply(cl
     assert response.status_code == 200
     assert response.json()["pending_action"] == "human_review"
     assert response.json()["category"] == "human_review"
-    assert response.json()["review_kind"] == "content_uncertain"
+    assert response.json()["review_kind"] == "contact_admission_uncertain"
     # A verified human Inbox message is not automatically a campaign reply.
     assert response.json()["has_human_reply"] is False
     assert db.query(models.Contact).filter_by(email="applicant@example.com").first() is None
     assert db.query(models.NonCustomerFilter).filter_by(email="applicant@example.com").first() is None
+    approved = client.post(f"/api/inbox/threads/{thread.id}/human-review", json={"decision": "approve"})
+    assert approved.status_code == 200
+    assert approved.json()["result"] == "manual_contact_entry_required"
+    assert approved.json()["resolved"] is False
+    assert db.query(models.Contact).filter_by(email="applicant@example.com").first() is None
     assert client.post(f"/api/inbox/threads/{thread.id}/generate-reply").status_code == 409
 
 
@@ -343,7 +348,7 @@ def test_forwarded_and_scripted_content_require_human_review(client, db):
         assert db.query(models.NonCustomerFilter).filter_by(email=sender).first() is None
 
 
-def test_existing_contact_special_content_requires_no_action_confirmation(client, db):
+def test_existing_contact_special_content_is_automatically_no_action(client, db):
     sender = "known-forwarded@example.com"
     db.add(models.Contact(owner_id=1, email=sender, first_name="Known", category="qualified"))
     db.commit()
@@ -354,13 +359,90 @@ def test_existing_contact_special_content_requires_no_action_confirmation(client
     with patch("app.api.inbox.assess_inbound", return_value=triage):
         response = client.post(f"/api/inbox/threads/{thread.id}/analyze")
     assert response.status_code == 200
-    assert response.json()["review_kind"] == "content_uncertain"
-    assert response.json()["pending_action"] == "human_review"
-
-    resolved = client.post(f"/api/inbox/threads/{thread.id}/human-review", json={"decision": "approve"})
-    assert resolved.status_code == 200
-    assert resolved.json()["result"] == "content_review_no_action"
+    assert response.json()["review_kind"] is None
+    assert response.json()["pending_action"] == "no_action"
     assert db.query(models.Contact).filter_by(email=sender).one()
+
+
+def test_startup_reconcile_clears_legacy_review_for_existing_contact(db):
+    from app.services.inbox_triage import reconcile_existing_contact_reviews
+
+    sender = "known-legacy-review@example.com"
+    db.add(models.Contact(owner_id=1, email=sender, first_name="Known", category="qualified"))
+    db.commit()
+    thread = _thread_with_message(
+        db, sender=sender, subject="Fwd legacy", body="Forwarded message", suffix="known-legacy-review"
+    )
+    thread.intent = "triage_review"
+    thread.pending_action = "human_review"
+    db.commit()
+
+    assert reconcile_existing_contact_reviews(db, owner_id=1) == 1
+    db.commit()
+    db.refresh(thread)
+    assert thread.pending_action == "no_action"
+    assert db.query(models.AuditLog).filter_by(
+        action="existing_contact_review_reconciled", entity_id=str(thread.id)
+    ).one()
+
+
+def test_sender_content_review_ignore_closes_current_items_and_skips_future_prompt(client, db):
+    sender = "known-ignore@example.com"
+    db.add(models.Contact(owner_id=1, email=sender, first_name="Known", category="qualified"))
+    db.commit()
+    first = _thread_with_message(db, sender=sender, subject="Fwd one", body="Forwarded message", suffix="ignore-one")
+    second = _thread_with_message(db, sender=sender, subject="Fwd two", body="Forwarded message", suffix="ignore-two")
+    for item in (first, second):
+        item.intent = "triage_review"
+        item.pending_action = "human_review"
+    db.commit()
+
+    result = client.post(f"/api/inbox/senders/{sender}/content-review/ignore")
+    assert result.status_code == 200
+    assert result.json()["resolved_threads"] == 2
+    assert db.query(models.InboxReviewRule).filter_by(
+        owner_id=1, email=sender, review_kind="content_uncertain", action="no_action"
+    ).one()
+    db.refresh(first); db.refresh(second)
+    assert first.pending_action == second.pending_action == "no_action"
+
+    future = _thread_with_message(db, sender=sender, subject="Fwd later", body="Forwarded message", suffix="ignore-later")
+    triage = TriageResult("human", True, 0.98, ["forwarded"], "Forwarded content requires review")
+    with patch("app.api.inbox.assess_inbound", return_value=triage):
+        response = client.post(f"/api/inbox/threads/{future.id}/analyze")
+    assert response.status_code == 200
+    assert response.json()["pending_action"] == "no_action"
+    assert response.json()["category"] != "human_review"
+
+
+def test_manual_contact_admission_clears_all_current_sender_reviews(client, db):
+    sender = "batch-admission@example.com"
+    first = _thread_with_message(db, sender=sender, subject="Question one", body="Business inquiry", suffix="batch-one")
+    second = _thread_with_message(db, sender=sender, subject="Question two", body="Business inquiry", suffix="batch-two")
+    for item in (first, second):
+        item.intent = "triage_review"
+        item.pending_action = "human_review"
+    db.commit()
+
+    result = client.post(
+        f"/api/inbox/threads/{first.id}/contact",
+        json={"first_name": "Batch", "company": "Example", "category": "qualified", "tags": []},
+    )
+    assert result.status_code == 200
+    db.refresh(first); db.refresh(second)
+    assert first.pending_action == second.pending_action == "no_action"
+
+
+def test_sender_payload_exposes_review_kind_counts_and_rule_state(client, db):
+    sender = "review-summary@example.com"
+    db.add(models.Contact(owner_id=1, email=sender, first_name="Summary", category="qualified"))
+    db.add(models.InboxReviewRule(owner_id=1, email=sender, review_kind="content_uncertain", action="no_action"))
+    db.commit()
+    thread = _thread_with_message(db, sender=sender, subject="Review", body="Forwarded message", suffix="summary")
+    thread.intent = "triage_review"; thread.pending_action = "human_review"; db.commit()
+    row = next(item for item in client.get("/api/inbox/customers").json() if item["email"] == sender)
+    assert row["review_counts"]["content_uncertain"] == 1
+    assert row["content_review_ignore_enabled"] is True
 
 
 def test_unknown_opt_out_does_not_create_contact_or_suppression(client, db):

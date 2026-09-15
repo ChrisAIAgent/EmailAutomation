@@ -4,8 +4,9 @@ import { Bot, ExternalLink, PanelRightClose, PanelRightOpen, Plus, RefreshCw } f
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useLang } from "@/lib/i18n";
 
-const TACWORK_URL = process.env.NEXT_PUBLIC_TACWORK_URL || "http://127.0.0.1:5173";
-const TACWORK_SERVER_URL = process.env.NEXT_PUBLIC_TACWORK_SERVER_URL || "http://127.0.0.1:8787";
+const runtimeConfig = typeof window !== "undefined" ? window.__EMAIL_AUTOMATION_RUNTIME__ : undefined;
+const TACWORK_URL = runtimeConfig?.tacworkUrl || process.env.NEXT_PUBLIC_TACWORK_URL || "http://127.0.0.1:18003";
+const TACWORK_SERVER_URL = runtimeConfig?.tacworkServerUrl || process.env.NEXT_PUBLIC_TACWORK_SERVER_URL || "http://127.0.0.1:18002";
 // Fixed local loopback service identifier exchanged between this Email Automation
 // host and the co-located TACWork server. It is NOT a secret and is intentionally
 // not configurable as a NEXT_PUBLIC_* value (those ship in browser bundles).
@@ -22,6 +23,17 @@ type TacWorkSession = {
 
 const sessionTimestamp = (session: TacWorkSession) => session.time?.updated ?? session.time?.created ?? 0;
 const wait = (milliseconds: number) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+
+function isCurrentWorkspaceSessionUrl(value: string | null, workspaceId: string) {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    const expected = `/workspace/${encodeURIComponent(workspaceId)}/session/`;
+    return url.origin === TACWORK_URL && url.pathname.startsWith(expected);
+  } catch {
+    return false;
+  }
+}
 
 function localClock() {
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "local";
@@ -66,6 +78,8 @@ export default function TacWorkPanel() {
         if (!status.activeWorkspaceId) throw new Error("TACWork has no active workspace");
 
         const workspaceUrl = `${TACWORK_URL}/workspace/${encodeURIComponent(status.activeWorkspaceId)}/session`;
+        let cachedUrl: string | null = null;
+        try { cachedUrl = window.localStorage.getItem(LAST_SESSION_STORAGE_KEY); } catch {}
         const sessionsResponse = await fetch(
           `${TACWORK_SERVER_URL}/workspace/${encodeURIComponent(status.activeWorkspaceId)}/sessions?roots=true&limit=200`,
           { headers: { Authorization: `Bearer ${TACWORK_CLIENT_TOKEN}` } },
@@ -77,7 +91,9 @@ export default function TacWorkPanel() {
           .sort((left, right) => sessionTimestamp(right) - sessionTimestamp(left))[0];
 
         setNewSessionUrl(workspaceUrl);
-        const resolvedUrl = latest ? `${workspaceUrl}/${encodeURIComponent(latest.id)}` : workspaceUrl;
+        const resolvedUrl = latest
+          ? `${workspaceUrl}/${encodeURIComponent(latest.id)}`
+          : (isCurrentWorkspaceSessionUrl(cachedUrl, status.activeWorkspaceId) ? cachedUrl! : workspaceUrl);
         if (agentUrlRef.current === resolvedUrl) return;
         setLoaded(false);
         setAgentUrl(resolvedUrl);
@@ -106,14 +122,6 @@ export default function TacWorkPanel() {
   }, []);
 
   useEffect(() => {
-    try {
-      const cachedUrl = window.localStorage.getItem(LAST_SESSION_STORAGE_KEY);
-      if (cachedUrl?.startsWith(`${TACWORK_URL}/workspace/`) && cachedUrl.includes("/session/")) {
-        setAgentUrl(cachedUrl);
-      }
-    } catch {
-      // Storage may be unavailable in privacy-restricted browser contexts.
-    }
     void restoreLatestSession();
     const timer = window.setInterval(() => void restoreLatestSession(), 15_000);
     return () => window.clearInterval(timer);
@@ -163,14 +171,12 @@ export default function TacWorkPanel() {
       ) : null}
       {!open ? (
         <div className="mt-3 flex flex-col items-center gap-2 text-muted" aria-hidden>
-          <Bot size={17} className="text-accent" />
+          <img src="/brand/agent-avatar.png" alt="" className="h-5 w-5 rounded-full object-cover" />
           <span className="text-[10px] tracking-[0.18em] [writing-mode:vertical-rl]">AGENT NATIVE</span>
         </div>
       ) : null}
       <div className={`${open ? "flex" : "hidden"} h-14 shrink-0 border-b border-border px-3 items-center gap-2`}>
-        <div className="h-8 w-8 rounded-lg bg-accent/10 text-accent flex items-center justify-center">
-          <Bot size={17} />
-        </div>
+        <img src="/brand/agent-avatar.png" alt="" className="h-8 w-8 shrink-0 rounded-full object-cover" />
         <div className="min-w-0 flex-1">
           <div className="text-sm font-semibold">TACWork Agent</div>
           <div className="text-[10px] text-muted truncate">

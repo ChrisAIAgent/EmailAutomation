@@ -21,6 +21,8 @@ class SpaHandler(SimpleHTTPRequestHandler):
             bootstrap = (
                 "<script>"
                 f"localStorage.setItem('openwork.server.token',{json.dumps(self.server.client_token)});"
+                f"localStorage.setItem('openwork.server.urlOverride',{json.dumps(self.server.server_url)});"
+                f"localStorage.setItem('openwork.server.port',{json.dumps(str(self.server.server_port))});"
                 f"localStorage.setItem('openwork.server.active',{json.dumps(self.server.opencode_url)});"
                 f"localStorage.setItem('openwork.server.list',JSON.stringify([{json.dumps(self.server.opencode_url)}]));"
                 "</script>"
@@ -53,6 +55,8 @@ def main() -> None:
     server = ThreadingHTTPServer((args.host, args.port), SpaHandler)
     server.client_token = args.client_token
     server.opencode_url = args.opencode_url
+    server.server_url = args.opencode_url.removesuffix("/opencode").rstrip("/")
+    server.server_port = args.opencode_url.rsplit(":", 1)[-1].split("/", 1)[0]
     print(f"TACWork Web listening on http://{args.host}:{args.port}", flush=True)
     server.serve_forever()
 

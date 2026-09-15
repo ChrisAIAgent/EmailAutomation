@@ -5,6 +5,7 @@ import os
 import secrets
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 
 import requests
@@ -23,7 +24,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/userinfo.email",
 ]
 
-# In-memory OAuth transaction store (demo). Each state keeps its PKCE verifier
+# In-memory OAuth transaction store. Each state keeps its PKCE verifier
 # and expires after 10 minutes.
 _STATE_STORE: dict[str, tuple[float, Optional[str]]] = {}
 
@@ -38,7 +39,7 @@ class OAuthResult:
 
 def _client_config(settings: Settings) -> dict:
     return {
-        "web": {
+        "installed": {
             "client_id": settings.GOOGLE_CLIENT_ID,
             "client_secret": settings.GOOGLE_CLIENT_SECRET,
             "redirect_uris": [settings.GOOGLE_REDIRECT_URI],
@@ -104,6 +105,13 @@ def build_credentials(
     access_token: str, refresh_token: Optional[str], token_expiry: float, settings: Optional[Settings] = None
 ) -> Credentials:
     settings = settings or get_settings()
+    # Credentials.expired depends on this value.  Without it Google only
+    # refreshes after the first 401, and that in-memory refresh is too late for
+    # RealGmailTransport's normal preflight persistence path.
+    # google-auth compares expiry with its own naive UTC clock, so retain that
+    # library convention here rather than passing an aware datetime.
+    expiry = (datetime.fromtimestamp(token_expiry, tz=timezone.utc).replace(tzinfo=None)
+              if token_expiry else None)
     return Credentials(
         token=access_token,
         refresh_token=refresh_token,
@@ -111,6 +119,7 @@ def build_credentials(
         client_id=settings.GOOGLE_CLIENT_ID,
         client_secret=settings.GOOGLE_CLIENT_SECRET,
         scopes=SCOPES,
+        expiry=expiry,
     )
 
 

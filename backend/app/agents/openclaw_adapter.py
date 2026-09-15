@@ -31,6 +31,7 @@ from ..schemas import (
     AnalyzeMessageInput,
     GenerateOutreachInput,
     GenerateFollowUpInput,
+    ApprovalRevisionInput,
     PlanNextActionInput,
 )
 from .base import AgentAdapter
@@ -253,6 +254,10 @@ class OpenClawAdapter(AgentAdapter):
 
     def generate_follow_up(self, inp: GenerateFollowUpInput) -> Optional[EmailProposal]:
         d = self._call("generate_follow_up", inp.model_dump())
+        return self._to_proposal(d) if d else None
+
+    def revise_approval(self, inp: ApprovalRevisionInput) -> Optional[EmailProposal]:
+        d = self._call("revise_approval", inp.model_dump())
         return self._to_proposal(d) if d else None
 
     def plan_next_action(self, inp: PlanNextActionInput) -> Optional[AgentDecision]:

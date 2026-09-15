@@ -94,6 +94,15 @@ _TRAILING_SIGNOFF = re.compile(
 )
 
 
+def validate_profile_signature(agent_name: str, company_name: str, signature_text: str) -> None:
+    """Reject a saved Profile that could never pass send-time checks."""
+    signature = (signature_text or "").strip()
+    if agent_name not in signature or company_name not in signature:
+        raise ValueError("agent_profile_signature_validation_failed")
+    if _BAD_SIGNATURE.search(signature):
+        raise ValueError("unsafe_profile_signature")
+
+
 def apply_profile_to_reply(
     body: str,
     profile: dict,

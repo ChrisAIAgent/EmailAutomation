@@ -4,7 +4,9 @@ from __future__ import annotations
 import base64
 import logging
 import socket
+import ssl
 import time
+from datetime import timezone
 from typing import Optional
 
 import httplib2
@@ -17,6 +19,7 @@ from ..security import Cipher
 from .auth import build_credentials, maybe_refresh
 from .transport import (
     GmailTimeoutError,
+    GmailTransientNetworkError,
     GmailTransport,
     MessageDTO,
     ThreadDTO,
@@ -31,10 +34,52 @@ logger = logging.getLogger("gmail.client")
 _MAX_RETRIES = 4
 _BACKOFF = 1.5
 
+# Gmail's per-minute quota ("Units per minute per user") resets on a ~60s
+# window, so a second-scale backoff can never clear it. Use a minute-scale
+# wait for quota errors, otherwise the initial import's history tail fails
+# outright on every run that followed a large search sweep.
+_RATE_LIMIT_BACKOFF = 65.0
+
 # Network exceptions that mean "the request did not return in time" rather than
 # a retriable server error. These must NOT be retried forever; they surface as a
 # recognizable GmailTimeoutError so the worker can fail the run and move on.
 _TIMEOUT_EXC = (socket.timeout, TimeoutError)
+
+
+def _is_rate_limit(exc: HttpError) -> bool:
+    """True for Gmail quota errors, which may be returned as 403 or 429.
+
+    Google reports per-minute quota exhaustion with HTTP 403, not 429, so a
+    status-code-only retry check misses it entirely and the error propagates
+    unverified into the sync run. Detect it from the response body instead.
+    """
+    if exc.status_code not in (403, 429):
+        return False
+    content = exc.content
+    if isinstance(content, bytes):
+        content = content.decode("utf-8", "ignore")
+    return "rateLimitExceeded" in content or "usageLimits" in content
+
+
+def _is_transient_transport_error(exc: Exception) -> bool:
+    """Bounded retry eligibility for interrupted TLS/proxy connections.
+
+    Do not retry certificate validation or OAuth errors.  EOF/reset failures
+    occur before Gmail returns an application response and are safe to replay.
+    """
+    message = str(exc).lower()
+    if "certificate verify" in message or "certificat" in message and "verify" in message:
+        return False
+    if isinstance(exc, (ssl.SSLError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+        return True
+    return any(marker in message for marker in (
+        "unexpected_eof_while_reading",
+        "eof occurred in violation of protocol",
+        "connection reset",
+        "connection aborted",
+        "remote end closed connection",
+        "remote disconnected",
+    ))
 
 
 class RealGmailTransport(GmailTransport):
@@ -54,6 +99,7 @@ class RealGmailTransport(GmailTransport):
         self._cipher = Cipher()
         self._service = None
         self._creds = None
+        self._persisted_access_token = None
         self._timeout = get_settings().GMAIL_HTTP_TIMEOUT_SECONDS
 
     # --- credential management ---
@@ -82,7 +128,12 @@ class RealGmailTransport(GmailTransport):
         oauth = self._load_oauth()
         access = self._cipher.decrypt(oauth.access_token_enc)
         refresh = self._cipher.decrypt(oauth.refresh_token_enc)
-        expiry = oauth.token_expiry.timestamp() if oauth.token_expiry else 0.0
+        expiry_at = oauth.token_expiry
+        # SQLite returns the UTC timestamp without tzinfo.  Do not let the host
+        # local timezone shift the OAuth expiry when rebuilding Credentials.
+        if expiry_at and expiry_at.tzinfo is None:
+            expiry_at = expiry_at.replace(tzinfo=timezone.utc)
+        expiry = expiry_at.timestamp() if expiry_at else 0.0
         creds = build_credentials(access, refresh, expiry)
         try:
             if maybe_refresh(creds, timeout=self._timeout):
@@ -95,6 +146,7 @@ class RealGmailTransport(GmailTransport):
                 raise GmailTimeoutError(f"gmail_timeout: token_refresh {type(e).__name__}: {e}") from e
             raise
         self._creds = creds
+        self._persisted_access_token = creds.token
         # Explicit socket timeout on the underlying httplib2 transport. Every
         # Gmail API call AND the on-demand token refresh (AuthorizedHttp reuses
         # this same httplib2) inherit this timeout, so neither can block forever.
@@ -121,14 +173,31 @@ class RealGmailTransport(GmailTransport):
 
     def _call(self, fn):
         last = None
+        last_transient = None
         for attempt in range(_MAX_RETRIES):
             try:
                 self._ensure_service()
-                return fn(self._service)
+                result = fn(self._service)
+                # AuthorizedHttp may still refresh after a server-side 401 (for
+                # example, after token revocation).  Persist that successful
+                # in-memory refresh so the next request does not repeat it.
+                if (hasattr(self, "_persisted_access_token") and self._creds
+                        and self._creds.token != self._persisted_access_token):
+                    self._persist_refreshed(self._creds)
+                    self._persisted_access_token = self._creds.token
+                return result
             except HttpError as e:
-                if e.status_code in (429, 500, 502, 503, 504):
+                rate_limited = _is_rate_limit(e)
+                if rate_limited or e.status_code in (429, 500, 502, 503, 504):
                     last = e
-                    time.sleep(_BACKOFF * (attempt + 1))
+                    if rate_limited:
+                        logger.warning(
+                            "gmail_quota_backoff attempt=%s/%s wait=%ss status=%s",
+                            attempt + 1, _MAX_RETRIES, _RATE_LIMIT_BACKOFF, e.status_code,
+                        )
+                        time.sleep(_RATE_LIMIT_BACKOFF)
+                    else:
+                        time.sleep(_BACKOFF * (attempt + 1))
                     self._service = None
                     continue
                 raise
@@ -150,7 +219,25 @@ class RealGmailTransport(GmailTransport):
                         raise e2
                 if _is_timeout(e):
                     raise GmailTimeoutError(f"gmail_timeout: {type(e).__name__}: {e}") from e
+                if _is_transient_transport_error(e):
+                    last_transient = e
+                    # Keep logs credential-free: the exception class and fixed
+                    # category are sufficient for diagnostics.
+                    logger.warning(
+                        "gmail_transient_transport_error category=tls_or_connection "
+                        "attempt=%s/%s type=%s",
+                        attempt + 1, _MAX_RETRIES, type(e).__name__,
+                    )
+                    self._service = None
+                    if attempt < _MAX_RETRIES - 1:
+                        time.sleep(_BACKOFF * (attempt + 1))
+                        continue
+                    break
                 raise
+        if last_transient is not None:
+            raise GmailTransientNetworkError(
+                f"gmail_transport_retry_exhausted: {type(last_transient).__name__}"
+            ) from last_transient
         raise last or RuntimeError("Gmail API retry exhausted")
 
     # --- interface ---
@@ -169,7 +256,7 @@ class RealGmailTransport(GmailTransport):
         for t in res.get("threads", []):
             try:
                 threads.append(self.get_thread(t["id"]))
-            except GmailTimeoutError:
+            except (GmailTimeoutError, GmailTransientNetworkError):
                 # A single thread fetch exceeded the network timeout. The whole
                 # list op is wedged; re-raise immediately so we do NOT keep
                 # fetching the remaining threads (each would wait up to
@@ -177,10 +264,11 @@ class RealGmailTransport(GmailTransport):
                 # ~50x that long). This is a recognizable, fatal signal -- the
                 # worker must fail the run and move on, not serially time out.
                 raise
-            except Exception:
-                # Other per-thread errors (e.g. a malformed thread) are
-                # non-fatal; skip the bad thread and continue with the rest.
-                continue
+            except HttpError as exc:
+                # A deleted thread cannot be fetched again. All other errors
+                # must fail this page so the worker preserves its checkpoint.
+                if exc.status_code != 404:
+                    raise
         return threads, res.get("nextPageToken")
 
     def get_thread(self, thread_id) -> ThreadDTO:
@@ -230,10 +318,10 @@ class RealGmailTransport(GmailTransport):
     def update_draft(self, draft_id, to, subject, body_text, body_html, thread_id=None,
                      in_reply_to=None, references=None) -> dict:
         raw = build_mime(to, subject, body_text, body_html, thread_id, in_reply_to, references)
-        body = {"id": draft_id, "message": {"raw": raw}}
+        body = {"message": {"raw": raw}}
         if thread_id:
             body["message"]["threadId"] = thread_id
-        return self._call(lambda s: s.users().drafts().update(userId="me", body=body).execute())
+        return self._call(lambda s: s.users().drafts().update(userId="me", id=draft_id, body=body).execute())
 
     def send_draft(self, draft_id) -> dict:
         res = self._call(lambda s: s.users().drafts().send(userId="me", body={"id": draft_id}).execute())
@@ -248,15 +336,17 @@ class RealGmailTransport(GmailTransport):
     def archive_thread(self, thread_id):
         self._call(lambda s: s.users().threads().modify(userId="me", id=thread_id, body={"removeLabelIds": ["INBOX"]}).execute())
 
-    def list_history(self, start_history_id, label_id=None):
+    def list_history(self, start_history_id, label_id=None, page_token=None):
         req = {"userId": "me", "startHistoryId": start_history_id, "maxResults": 100}
         if label_id:
             req["labelId"] = label_id
+        if page_token:
+            req["pageToken"] = page_token
         res = self._call(lambda s: s.users().history().list(**req).execute())
         events = res.get("history", [])
         nxt = res.get("nextPageToken")
         new_hist = res.get("historyId")
-        return events, (new_hist or start_history_id)
+        return events, (new_hist or start_history_id), nxt
 
 
 def _is_timeout(e: BaseException) -> bool:

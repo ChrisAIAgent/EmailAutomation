@@ -8,8 +8,10 @@ import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -23,6 +25,9 @@ from ..config import (
     is_gmail_configured,
     is_llm_configured,
 )
+from ..diagnostics import run_diagnostics
+from ..diagnostics_investigate import investigate
+from ..logging_config import get_trace_id
 from ..services import flags as flag_svc
 from ..services.ai_config import peek_email_config
 from .deps import get_db
@@ -35,15 +40,62 @@ def agent_health(db: Session = Depends(get_db)):
     return [h.model_dump() for h in Orchestrator(db).health()]
 
 
+@router.get("/api/system/diagnostics")
+def diagnostics(db: Session = Depends(get_db)):
+    """Unified diagnostic overview across every subsystem.
+
+    One call returns a structured snapshot: ``overall`` (ok/degraded/error),
+    per-link ``items`` (status + detail + remedy), and a ``by_category`` grouping.
+
+    MANUAL ONLY. This endpoint is deliberately never polled: nothing in the
+    Electron shell, the frontend or any script may call it on a timer. It runs
+    only when an operator explicitly opens the Diagnostics page and starts a
+    health check. For root-cause analysis of a specific broken link, use
+    ``POST /api/system/diagnostics/investigate`` instead.
+    """
+    return run_diagnostics(db)
+
+
+class InvestigateRequest(BaseModel):
+    target: str = "system"
+    incident_id: Optional[str] = None
+
+
+@router.post("/api/system/diagnostics/investigate")
+def diagnostics_investigate(
+    payload: InvestigateRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """On-demand root-cause investigation for one broken link (or all failing links).
+
+    MANUAL ONLY, exactly like the overview: nothing may call this on a timer.
+    ``target`` is ``"system"`` (investigate every link the overview flags) or one
+    of the 11 diagnostic item ids, e.g. ``queue.consumer`` / ``gmail.oauth``.
+
+    Returns evidence + root cause + remedies. It never executes a repair and
+    never returns secrets (tokens, keys, recipients, bodies).
+    """
+    trace_id = request.headers.get("X-Request-ID") or get_trace_id()
+    return investigate(
+        db,
+        target=payload.target or "system",
+        trace_id=trace_id,
+        incident_id=payload.incident_id,
+    )
+
+
 def _is_writable(path: str) -> bool:
-    """Best-effort writability probe for a directory (runbook Section 8)."""
+    """Return a read-only writability hint without changing the target path.
+
+    ``/api/system/diagnose`` is a legacy packaging diagnostic, but it must
+    uphold the same no-write guarantee as the unified manual diagnostics API.
+    Windows ACLs can still make this an approximation; callers expose it as a
+    hint rather than proof.
+    """
     try:
         p = Path(path)
-        p.mkdir(parents=True, exist_ok=True)
-        probe = p / ".ea_write_test"
-        probe.write_text("ok")
-        probe.unlink()
-        return True
+        return bool(p.is_dir() and os.access(p, os.W_OK))
     except Exception:
         return False
 
@@ -189,7 +241,7 @@ def restart_services(force: bool = False, db: Session = Depends(get_db)):
        ``force=true``.
     2. Writes a marker file (audit + idempotency guard for the watcher).
     3. Spawns a detached watcher (``scripts/start-restart-watcher.ps1``) that
-       performs ``stop-demo.ps1`` + ``start-demo.ps1`` once the backend exits.
+       performs ``stop-stack.ps1`` + ``start-stack.ps1`` once the backend exits.
     4. Exits the current backend process gracefully after 1 second.
 
     Returns immediately; the actual restart takes ~10-20s. Agents should poll

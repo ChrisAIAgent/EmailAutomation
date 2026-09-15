@@ -4,28 +4,33 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+import uuid
+from pathlib import Path
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from .config import get_settings, is_gmail_configured, is_llm_configured
-from .services.ai_config import peek_email_config
+from .config import get_settings, is_gmail_configured, is_llm_configured, _DATA
+from .services.ai_config import email_config_state
 from .consumer_status import read_consumer_status
 from .db import init_db, SessionLocal
 from .events import queue as event_queue
 from . import models  # noqa: F401  (register models)
+from .logging_config import configure_logging, trace_id_var
 from .api import gmail, campaigns, contacts, inbox, approvals, comparisons, dashboard, system, automation, agent_runs, knowledge, agent_profile, agent_takeover
 from .api.deps import ensure_owner, get_db
 from .errors import register_error_handlers
 from .scheduler import start as start_scheduler
 from .services import flags as flag_svc
 from .services.accounts import resolve_sending_account
+from .services.real_send import is_real_send_enabled
 
-logging.basicConfig(level=logging.INFO)
+configure_logging()
 logger = logging.getLogger("main")
 settings = get_settings()
 
@@ -46,6 +51,14 @@ async def lifespan(app: FastAPI):
     try:
         from .api.deps import ensure_owner
         owner_id = ensure_owner(db)
+        from .services.sync import repair_stored_mail_bodies
+        repaired_bodies = repair_stored_mail_bodies(db)
+        if repaired_bodies:
+            logger.info("Repaired %s locally stored HTML/CSS email bodies.", repaired_bodies)
+        from .services.inbox_triage import reconcile_existing_contact_reviews
+        reconciled_reviews = reconcile_existing_contact_reviews(db, owner_id=owner_id)
+        if reconciled_reviews:
+            logger.info("Closed %s legacy review items for existing Contacts.", reconciled_reviews)
         # Upgrade safety: a Global automation created before takeover scopes
         # existed must not process an unbounded historical backlog.
         from .services.automation import parse_plan
@@ -138,6 +151,32 @@ app.include_router(agent_profile.router)
 app.include_router(agent_takeover.router)
 
 
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    """Assign each request a correlation id and log start/end with timing.
+
+    The id is echoed back as ``X-Request-ID`` and stored in a contextvar so all
+    log lines emitted while handling the request share it (grep by id to trace a
+    single request / run end-to-end). An inbound ``X-Request-ID`` is reused so
+    callers can correlate across services.
+    """
+    rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+    token = trace_id_var.set(rid)
+    start = time.perf_counter()
+    logger.info("req start %s %s", request.method, request.url.path)
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("req error %s %s", request.method, request.url.path)
+        trace_id_var.reset(token)
+        raise
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    logger.info("req done %s %s -> %s (%.1fms)", request.method, request.url.path, response.status_code, elapsed_ms)
+    trace_id_var.reset(token)
+    response.headers["X-Request-ID"] = rid
+    return response
+
+
 def _probe_db(db: Session) -> bool:
     """True iff the DB is reachable. Keeps /api/health from being an empty gate."""
     try:
@@ -160,15 +199,21 @@ def health(db: Session = Depends(get_db)):
     gmail_connected = bool(
         gmail_account and gmail_account.is_connected and gmail_account.oauth
     )
+    _llm_config, llm_state = email_config_state(db)
     return {
         "status": "ok" if db_ok else "error",
         "db_ok": db_ok,
-        "real_send": settings.ENABLE_REAL_SEND,
+        "instance": {
+            "install_root": str(Path(__file__).resolve().parents[2]),
+            "data_root": str(_DATA.root.resolve()),
+        },
+        "real_send": is_real_send_enabled(settings, gmail_account, _oauth),
         "gmail_configured": is_gmail_configured(settings),
         "gmail_connected": gmail_connected,
         "gmail_account": gmail_account.email if gmail_account else None,
         "global_pause": flag_svc.is_globally_paused(db),
-        "llm_configured": bool(peek_email_config(db)) or is_llm_configured(settings),
+        "llm_configured": bool(llm_state["usable"]),
+        "llm_config": llm_state,
         "consumer": read_consumer_status(),
     }
 
