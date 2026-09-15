@@ -20,11 +20,25 @@ $TacWorkRoot = (Resolve-Path -LiteralPath $TacWorkRoot).Path
 if (-not $PnpmStore) { $PnpmStore = Join-Path $root "offline-cache\npm-cache\tacwork-pnpm-store" }
 $pnpm = (Get-Command pnpm.cmd -ErrorAction Stop).Source
 New-Item -ItemType Directory -Force -Path $PnpmStore | Out-Null
-Push-Location $TacWorkRoot
+$commit = [string](& git -C $TacWorkRoot rev-parse HEAD 2>$null | Select-Object -First 1)
+$commit = $commit.Trim()
+if (-not $commit) { throw "TACWorkRoot is not a readable Git checkout: $TacWorkRoot" }
+$tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("ea-tacwork-cache-" + $PID + "-" + [Guid]::NewGuid().ToString("N"))
+$created = $false
 try {
-    & $pnpm fetch --frozen-lockfile --store-dir $PnpmStore
-    if ($LASTEXITCODE -ne 0) { throw "TACWork cache seed failed." }
+    & git -C $TacWorkRoot worktree add --detach $tempRoot $commit
+    if ($LASTEXITCODE -ne 0) { throw "Could not create clean TACWork cache worktree." }
+    $created = $true
+    $oldCi = $env:CI; $env:CI = "true"
+    Push-Location $tempRoot
+    try {
+        & $pnpm fetch --frozen-lockfile --store-dir $PnpmStore
+        if ($LASTEXITCODE -ne 0) { throw "TACWork cache seed failed." }
+    } finally {
+        Pop-Location
+        $env:CI = $oldCi
+    }
 } finally {
-    Pop-Location
+    if ($created -and (Test-Path -LiteralPath $tempRoot)) { & git -C $TacWorkRoot worktree remove --force $tempRoot }
 }
 Write-Output "TACWork pnpm cache seeded: $PnpmStore"
