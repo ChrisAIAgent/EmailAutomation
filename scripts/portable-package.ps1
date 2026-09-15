@@ -94,7 +94,6 @@ $xdNames = @(
     ".tmp-*",
     ".next",
     ".next-dev",
-    ".next-prod",
     # Interrupted local installer builds may leave disposable frontend repair
     # trees or a rollback copy. They are never application runtime payload.
     ".frontend-repair-*",
@@ -131,6 +130,10 @@ $xdPaths = @(
     (Join-Path $root "backend\tests"),
     (Join-Path $root "offline-cache"),
     (Join-Path $root "runtime\.frontend-build")
+    # Source build output is renewable.  Do not use a bare .next-prod rule:
+    # runtime/frontend/.next-prod is the transition Web runtime shipped in the
+    # formal installer and must survive StageDir packaging.
+    (Join-Path $root "frontend\.next-prod")
 )
 if (-not $IncludeData) {
     # Runtime data can exist under these app-mode directories even when the
@@ -305,8 +308,9 @@ if ($StageDir) {
     # build-runtime.ps1 generates the manifest against runtime/ on the
     # build machine (where runtime/frontend/.next-prod/ exists, because
     # it is produced by `next build` and kept in runtime/ for local dev).
-    # The staging exclusions above deliberately strip .next-prod,
-    # .frontend-build, .frontend-repair-*, etc. from the payload.
+    # The source frontend build output is stripped, while
+    # runtime/frontend/.next-prod is retained for the supported transition Web
+    # entrypoint. .frontend-build and repair trees remain excluded.
     # Shipping a manifest that lists files the payload does not contain
     # makes verify-runtime.ps1 fail on the customer machine with
     # runtime_integrity_failed:missing:<file>. Regenerating from the

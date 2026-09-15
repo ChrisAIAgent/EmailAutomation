@@ -1,5 +1,7 @@
 param(
     [string]$TacWorkRoot = $env:TACWORK_ROOT,
+    [string]$ExpectedCommit = "",
+    [string]$ExpectedBranch = "Dev",
     [switch]$SkipWebBuild
 )
 
@@ -8,6 +10,29 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $root = Split-Path -Parent $scriptDir
 if (-not $TacWorkRoot) { $TacWorkRoot = Join-Path (Split-Path -Parent $root) "TACWork" }
 $TacWorkRoot = (Resolve-Path -LiteralPath $TacWorkRoot).Path
+
+# A release runtime is only meaningful when its exact upstream source can be
+# reproduced.  Passing -ExpectedCommit turns these into hard gates; developers
+# may still use the script locally without it.
+$sourceCommit = [string](& git -C $TacWorkRoot rev-parse HEAD 2>$null | Select-Object -First 1)
+$sourceCommit = $sourceCommit.Trim()
+if (-not $sourceCommit) { throw "TACWorkRoot is not a readable Git checkout: $TacWorkRoot" }
+$sourceBranchValue = (& git -C $TacWorkRoot branch --show-current 2>$null | Select-Object -First 1)
+$sourceBranch = if ($null -eq $sourceBranchValue) { "" } else { ([string]$sourceBranchValue).Trim() }
+$sourceDirty = [bool](& git -C $TacWorkRoot status --porcelain 2>$null)
+if ($ExpectedCommit) {
+    if ($sourceCommit -ne $ExpectedCommit) {
+        throw "TACWork source commit mismatch. Expected $ExpectedCommit, found $sourceCommit. Build from a clean worktree at the approved commit."
+    }
+    if ($sourceDirty) { throw "TACWork source is dirty. Formal runtime builds require a clean worktree." }
+    # A formal builder uses a detached temporary worktree at ExpectedCommit.
+    # A detached checkout has no current branch, so validate a non-empty branch
+    # when present and record the approved source branch in the manifest.
+    if ($ExpectedBranch -and $sourceBranch -and $sourceBranch -ne $ExpectedBranch) {
+        throw "TACWork source branch mismatch. Expected $ExpectedBranch, found $sourceBranch."
+    }
+}
+$manifestBranch = if ($ExpectedCommit -and $ExpectedBranch) { $ExpectedBranch } else { $sourceBranch }
 
 $serverSource = Join-Path $TacWorkRoot "apps\server\dist\bin\openwork-server.exe"
 $engineSource = Join-Path $TacWorkRoot "apps\desktop\resources\sidecars\opencode.exe"
@@ -46,7 +71,11 @@ Copy-Item -Path (Join-Path $webSource "*") -Destination $webTarget -Recurse -For
 Copy-Item -LiteralPath $licenseSource -Destination (Join-Path $target "LICENSE-TACWORK.txt") -Force
 
 [ordered]@{
-    prepared_at = (Get-Date).ToString("o"); source = $TacWorkRoot; server_version = "0.18.12"
+    prepared_at = (Get-Date).ToString("o")
+    source_branch = $manifestBranch
+    source_commit = $sourceCommit
+    source_dirty = $sourceDirty
+    server_version = "0.18.12"
     server_port = 8787; web_port = 5173; workspace = "Email Automation root (resolved at launch)"
     contents = @("server/openwork-server.exe", "engine/opencode.exe", "web/", "LICENSE-TACWORK.txt")
 } | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 (Join-Path $target "runtime-manifest.json")

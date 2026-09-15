@@ -22,7 +22,7 @@ from typing import Any
 
 API_BASE = os.environ.get("EMAIL_AUTOMATION_API_URL", "http://127.0.0.1:18000").rstrip("/")
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
-SERVER_INFO = {"name": "email-automation", "version": "1.2.3"}
+SERVER_INFO = {"name": "email-automation", "version": "1.2.4"}
 MCP_DIAGNOSTIC_LOG = Path(os.environ.get("EMAIL_AUTOMATION_DATA_DIR", str(WORKSPACE_ROOT))) / "logs" / "mcp-server.log"
 
 

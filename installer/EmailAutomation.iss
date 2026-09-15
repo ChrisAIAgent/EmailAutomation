@@ -4,7 +4,7 @@
 ;          and calls ISCC on this file)
 
 #define MyAppName "Email Automation"
-#define MyAppVersion "1.2.3"
+#define MyAppVersion "1.2.4"
 #define MyAppPublisher "TAC AISolution"
 #define MyAppId "B8C9D0F2-2E6D-4C89-9A1D-EMAILAUTOMATION"
 
@@ -52,6 +52,13 @@ Source: "..\TACWork-Logo-Black.PNG"; DestDir: "{app}\branding"; Flags: ignorever
 Source: "..\frontend\public\tac-logo.png"; DestDir: "{app}\branding"; Flags: ignoreversion
 ; Installer icon (also used as the uninstall icon).
 Source: "assets\EmailAutomation.ico"; DestDir: "{app}\branding"; Flags: ignoreversion
+; The official, pinned Microsoft x64 redistributable is validated by
+; scripts\verify-vc-redist.ps1 before ISCC runs. Keep it app-local so upgrades
+; and repair installs remain offline and do not require a customer download.
+Source: "prerequisites\vc_redist.x64.exe"; DestDir: "{app}\prerequisites"; Flags: ignoreversion
+; A release-specific, explicit upgrade cleanup list. It is embedded rather than
+; read from disk at install time, and only relative {app} paths are accepted.
+Source: "obsolete-files-1.2.4.txt"; Flags: dontcopy
 
 [Dirs]
 ; The program directory ({app}) is kept read-only. All mutable data (DB, queue,
@@ -96,13 +103,54 @@ begin
         Exec('cmd.exe', '/c "{app}\stop-stack.bat"', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode);
       end;
     end;
+    RemoveObsoleteFiles();
   end;
   if CurStep = ssPostInstall then begin
+    InstallVcRedist();
     RepairDir := ExpandConstant('{app}\repair');
     RepairExe := RepairDir + '\Email-Automation-Repair.exe';
     ForceDirectories(RepairDir);
     CopyFile(ExpandConstant('{srcexe}'), RepairExe, False);
   end;
+end;
+
+procedure RemoveObsoleteFiles();
+var
+  Lines: TArrayOfString;
+  I: Integer;
+  Rel, Target, AppRoot: string;
+begin
+  ExtractTemporaryFile('obsolete-files-1.2.4.txt');
+  if not LoadStringsFromFile(ExpandConstant('{tmp}\obsolete-files-1.2.4.txt'), Lines) then
+    RaiseException('Unable to load the release obsolete-file list.');
+  AppRoot := AddBackslash(ExpandConstant('{app}'));
+  for I := 0 to GetArrayLength(Lines) - 1 do begin
+    Rel := Trim(Lines[I]);
+    if (Rel = '') or (Rel[1] = '#') then continue;
+    StringChangeEx(Rel, '/', '\\', True);
+    if (Pos('..', Rel) > 0) or (Pos(':', Rel) > 0) or (Copy(Rel, 1, 1) = '\\') then
+      RaiseException('Unsafe obsolete-file path in release list: ' + Rel);
+    Target := AppRoot + Rel;
+    if FileExists(Target) then DeleteFile(Target)
+    else if DirExists(Target) then DelTree(Target, False, True, False);
+  end;
+end;
+
+procedure InstallVcRedist();
+var
+  ResultCode: Integer;
+  Redist: string;
+begin
+  Redist := ExpandConstant('{app}\prerequisites\vc_redist.x64.exe');
+  if not FileExists(Redist) then
+    RaiseException('Bundled Microsoft Visual C++ x64 runtime is missing.');
+  if not Exec(Redist, '/install /quiet /norestart', ExpandConstant('{app}'), SW_HIDE,
+              ewWaitUntilTerminated, ResultCode) then
+    RaiseException('Could not start the bundled Microsoft Visual C++ x64 runtime installer.');
+  // 0 = installed, 1638 = a newer version is already installed,
+  // 3010 = installed and a restart is recommended. All preserve launch safety.
+  if (ResultCode <> 0) and (ResultCode <> 1638) and (ResultCode <> 3010) then
+    RaiseException('Bundled Microsoft Visual C++ x64 runtime installation failed (exit ' + IntToStr(ResultCode) + ').');
 end;
 function IsSilentUninstall(): Boolean;
 var

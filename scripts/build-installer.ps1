@@ -33,7 +33,12 @@
 param(
     [string]$Version = "",
     [string]$InnoCompiler = "",
-    [switch]$AllowUncommitted
+    [switch]$AllowUncommitted,
+    [string]$TacWorkRoot = $env:TACWORK_ROOT,
+    [string]$TacWorkCommit = "a8a6156",
+    [string]$PreviousReleaseTag = "v1.2.3",
+    [string]$SigningCertificateThumbprint = $env:EMAIL_AUTOMATION_SIGNING_CERT_THUMBPRINT,
+    [string]$TimestampUrl = $env:EMAIL_AUTOMATION_TIMESTAMP_URL
 )
 
 $ErrorActionPreference = "Stop"
@@ -100,16 +105,46 @@ $distDir      = Join-Path $root "dist"
 $iss          = Join-Path $installerDir "EmailAutomation.iss"
 $pkgScript    = Join-Path $root "scripts\portable-package.ps1"
 $runtimeScript = Join-Path $root "scripts\build-runtime.ps1"
+$tacWorkRuntimeScript = Join-Path $root "scripts\build-tacwork-release-runtime.ps1"
+$vcRedistCheckScript = Join-Path $root "scripts\verify-vc-redist.ps1"
 $logoPng      = Join-Path $root "TACWork-Logo-Black.PNG"
 $webLogo      = Join-Path $root "frontend\public\tac-logo.png"
 $icoPath      = Join-Path $assetsDir "EmailAutomation.ico"
 $exeName      = "Email-Automation-Setup-$Version.exe"
 $exePath      = Join-Path $distDir $exeName
 
+# File overwrites replace changed lines normally. Only a deleted or renamed
+# file can survive an in-place Inno upgrade, so make each such path an explicit
+# reviewed installer action. This is deliberately conservative: if a source
+# file disappears, formal release stops until it is listed below.
+$obsoleteListPath = Join-Path $installerDir ("obsolete-files-" + $Version + ".txt")
+if (-not (Test-Path -LiteralPath $obsoleteListPath)) { Fail "Missing explicit obsolete-file list: $obsoleteListPath" }
+$allowedObsolete = @(
+    Get-Content -LiteralPath $obsoleteListPath | ForEach-Object { $_.Trim().Replace('/', '\\') } |
+        Where-Object { $_ -and -not $_.StartsWith('#') }
+)
+if ($allowedObsolete | Where-Object { $_ -match '(^|\\)\.\.(\\|$)|^[A-Za-z]:|^\\' }) {
+    Fail "obsolete-files list contains an unsafe path. Entries must be relative to {app}."
+}
+$previousRef = (& git -C $root rev-parse ($PreviousReleaseTag + "^{commit}") 2>$null | Select-Object -First 1)
+if (-not $previousRef) { Fail "Previous release tag is unavailable: $PreviousReleaseTag" }
+$removedPaths = New-Object System.Collections.Generic.List[string]
+& git -C $root diff --name-status --find-renames ($PreviousReleaseTag + "..HEAD") | ForEach-Object {
+    $parts = $_ -split "`t"
+    if ($parts[0] -eq 'D' -and $parts.Count -ge 2) { [void]$removedPaths.Add($parts[1].Replace('/', '\\')) }
+    elseif ($parts[0] -like 'R*' -and $parts.Count -ge 3) { [void]$removedPaths.Add($parts[1].Replace('/', '\\')) }
+}
+$unhandledObsolete = @($removedPaths | Where-Object { $_ -notin $allowedObsolete })
+$staleObsolete = @($allowedObsolete | Where-Object { $_ -notin $removedPaths })
+if ($unhandledObsolete.Count -gt 0 -or $staleObsolete.Count -gt 0) {
+    Fail ("Obsolete-file gate failed. Unhandled removed paths: " + ($unhandledObsolete -join ', ') + "; stale list paths: " + ($staleObsolete -join ', '))
+}
+
 Write-Output "=================================================================="
 Write-Output " Email Automation - Windows installer build"
 Write-Output (" Version : " + $Version + "  (source: root VERSION file)")
 Write-Output (" Root    : " + $root)
+Write-Output (" TACWork : " + $TacWorkCommit + " from clean temporary worktree")
 Write-Output "=================================================================="
 
 # --- 1. Locate Inno Setup compiler ---------------------------------------
@@ -194,8 +229,17 @@ if (Test-Path -LiteralPath $exePath) { try { [System.IO.File]::Delete("\\?\" + $
 New-Item -ItemType Directory -Force -Path $distDir | Out-Null
 
 # --- 3. Build the runtime before staging ---------------------------------
+Write-Output "Preparing TACWork runtime from approved clean worktree..."
+& $tacWorkRuntimeScript -TacWorkRoot $TacWorkRoot -ExpectedCommit $TacWorkCommit
+if (-not $?) { Fail "TACWork runtime preparation failed." }
+$tacworkManifestPath = Join-Path $root "tacwork-runtime\runtime-manifest.json"
+if (-not (Test-Path -LiteralPath $tacworkManifestPath)) { Fail "TACWork runtime manifest is missing." }
+$tacworkManifest = Get-Content -LiteralPath $tacworkManifestPath -Raw | ConvertFrom-Json
+if ($tacworkManifest.source_commit -notlike ($TacWorkCommit + "*") -or $tacworkManifest.source_dirty -ne $false) {
+    Fail "TACWork runtime provenance is not the approved clean source."
+}
 Write-Output "Building prebuilt runtime (customer startup will not use pip/npm)..."
-& $runtimeScript
+& $runtimeScript -Clean
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path (Join-Path $root "runtime\runtime-manifest.json"))) {
     Fail "Prebuilt runtime build failed."
 }
@@ -337,6 +381,13 @@ Get-ChildItem $payloadDir -Recurse -Force -File -ErrorAction SilentlyContinue | 
 if ($scanErrs.Count -gt 0) { Fail ("Secret scan found: " + ($scanErrs -join "; ")) }
 Write-Output "Secret scan: clean."
 
+# --- 7c. Native prerequisite proof ---------------------------------------
+# The installer embeds the verified Microsoft-signed VC++ redistributable.
+# It is not a customer download and no system PATH change is required.
+$vcStatus = & $vcRedistCheckScript -Root $root | ConvertFrom-Json
+if (-not $vcStatus -or $vcStatus.status -ne 'verified') { Fail "VC++ prerequisite verification did not return verified status." }
+Write-Output ("VC++ redist: " + $vcStatus.product_version + " verified.")
+
 # --- 8. Inject version into .iss -----------------------------------------
 if (-not (Test-Path $iss)) { Fail "installer/EmailAutomation.iss not found." }
 $issText = Get-Content $iss -Raw -Encoding UTF8
@@ -352,6 +403,17 @@ Write-Output "Compiling installer with Inno Setup..."
 if ($LASTEXITCODE -ne 0) { Fail ("ISCC compilation failed (exit " + $LASTEXITCODE + ").") }
 if (-not (Test-Path $exePath)) { Fail ("ISCC did not produce " + $exePath + ".") }
 
+# A formal installer cannot be released unsigned. The certificate is selected
+# by thumbprint from the protected build-machine certificate store; its private
+# material is never read from or written to this repository.
+if (-not $SigningCertificateThumbprint) { Fail "Formal build requires EMAIL_AUTOMATION_SIGNING_CERT_THUMBPRINT (or -SigningCertificateThumbprint)." }
+$signingCert = Get-ChildItem -Path ("Cert:\CurrentUser\My\" + $SigningCertificateThumbprint) -ErrorAction SilentlyContinue
+if (-not $signingCert -or -not $signingCert.HasPrivateKey) { Fail "Configured signing certificate is unavailable or lacks a private key." }
+$signArgs = @{ FilePath = $exePath; Certificate = $signingCert; HashAlgorithm = 'SHA256' }
+if ($TimestampUrl) { $signArgs.TimestampServer = $TimestampUrl }
+$signResult = Set-AuthenticodeSignature @signArgs
+if ($signResult.Status -ne 'Valid') { Fail ("Authenticode signing failed: " + $signResult.Status) }
+
 # Refuse a deceptively successful compile that omitted the staged runtime payload.
 $payloadBytes = (Get-ChildItem $payloadDir -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
 $installerBytes = (Get-Item $exePath).Length
@@ -366,6 +428,8 @@ $payloadFiles = (Get-ChildItem $payloadDir -Recurse -Force -File -ErrorAction Si
 $pyVer = & (Join-Path $payloadDir "tools\python\python.exe") --version 2>&1
 $nodeVer = & (Join-Path $payloadDir "tools\node\node.exe") --version 2>&1
 $installerSha256 = (Get-FileHash -LiteralPath $exePath -Algorithm SHA256).Hash
+$shaPath = $exePath + ".sha256"
+($installerSha256 + " *" + $exeName) | Set-Content -LiteralPath $shaPath -Encoding ASCII
 $gitCommit = $buildGitCommit
 $gitTag = $buildGitTag
 if (-not $gitTag -or $gitTag -ne ("v" + $Version)) { $gitTag = "unreleased" }
@@ -378,12 +442,16 @@ $report = [ordered]@{
     build_time_utc=[DateTime]::UtcNow.ToString("o"); installer=$exeName; installer_sha256=$installerSha256
     installer_bytes=$installerBytes; payload_files=$payloadFiles; payload_bytes=$payloadBytes
     python_runtime=($pyVer -join " "); node_runtime=($nodeVer -join " "); runtime_manifest_valid=$true; secret_scan="clean"
+    tacwork_source_commit=$tacworkManifest.source_commit; tacwork_source_dirty=[bool]$tacworkManifest.source_dirty
+    electron_version=((Get-Content -LiteralPath (Join-Path $payloadDir "runtime\electron\version") -Raw -ErrorAction SilentlyContinue).Trim())
+    tacwork_server_version=$tacworkManifest.server_version; native_dependency_status=$vcStatus.status
+    frontend_mode="electron_app_and_transition_web"; authenticode_status=$signResult.Status
     largest_payload_files=$largestFiles
 }
 $reportJson = Join-Path $distDir ("build-report-" + $Version + ".json")
 $reportMd = Join-Path $distDir ("build-report-" + $Version + ".md")
 $report | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $reportJson -Encoding UTF8
-@("# Email Automation $Version build report", "", "- Git commit: ``$($report.git_commit)``", "- Git tag: ``$($report.git_tag)``", "- Working tree dirty: ``$gitDirty``", "- Installer: ``$exeName``", "- Installer SHA-256: ``$installerSha256``", "- Installer bytes: ``$installerBytes``", "- Payload files: ``$payloadFiles``", "- Runtime manifest: valid", "- Secret scan: clean") | Set-Content -LiteralPath $reportMd -Encoding UTF8
+@("# Email Automation $Version build report", "", "- Git commit: ``$($report.git_commit)``", "- Git tag: ``$($report.git_tag)``", "- Working tree dirty: ``$gitDirty``", "- Installer: ``$exeName``", "- Installer SHA-256: ``$installerSha256``", "- Authenticode: ``$($report.authenticode_status)``", "- TACWork source: ``$($report.tacwork_source_commit)`` (dirty=``$($report.tacwork_source_dirty)``)", "- Electron version: ``$($report.electron_version)``", "- TACWork server version: ``$($report.tacwork_server_version)``", "- Native dependency: ``$($report.native_dependency_status)``", "- Frontend mode: ``$($report.frontend_mode)``", "- Installer bytes: ``$installerBytes``", "- Payload files: ``$payloadFiles``", "- Runtime manifest: valid", "- Secret scan: clean") | Set-Content -LiteralPath $reportMd -Encoding UTF8
 Write-Output ""
 Write-Output "==================== BUILD REPORT ===================="
 Write-Output ("Build time     : " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
@@ -394,6 +462,7 @@ Write-Output ("Payload files  : " + $payloadFiles)
 Write-Output ("Python runtime : " + $pyVer)
 Write-Output ("Node runtime   : " + $nodeVer)
 Write-Output ("Installer SHA  : " + $installerSha256)
+Write-Output ("SHA256 file    : " + $shaPath)
 Write-Output ("Git commit/tag : " + $report.git_commit + " / " + $report.git_tag + " (dirty=" + $gitDirty + ")")
 Write-Output ("Reports         : " + $reportJson + ", " + $reportMd)
 Write-Output ("Secrets scanned: clean (name + content, first-party)")

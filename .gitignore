@@ -59,6 +59,7 @@ tacwork-runtime/
 installer/payload/
 installer/output/
 installer/*.exe
+installer/prerequisites/*.exe
 dist/
 .portable_stage/
 runtime/
@@ -82,6 +83,7 @@ audit/
 
 # ---------------- Agent workspace memory (private) -------------------------
 .workbuddy/
+.opencode/
 
 # ---------------- Misc -----------------------------------------------------
 *.docx
