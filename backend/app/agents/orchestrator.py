@@ -7,6 +7,7 @@ never execute Gmail writes (enforced downstream at the tool layer).
 from __future__ import annotations
 
 import json
+import hashlib
 from typing import Optional
 
 from .. import models
@@ -19,6 +20,7 @@ from ..schemas import (
     AnalyzeMessageInput,
     GenerateOutreachInput,
     GenerateFollowUpInput,
+    ApprovalRevisionInput,
     PlanNextActionInput,
 )
 from .base import AgentAdapter
@@ -167,6 +169,37 @@ class Orchestrator:
             from ..exceptions import AgentUnavailableError
             raise AgentUnavailableError(agent)
         return p
+
+    def revise_approval(self, inp: ApprovalRevisionInput) -> EmailProposal | ComparisonView:
+        """Revise an existing pending Approval without performing any Gmail action."""
+        mode = inp.mode
+        if mode == "compare":
+            primary = self._primary_agent(inp.campaign_id)
+            lg = self._make("langgraph")
+            oc = self._make("openclaw")
+            p_lg = lg.revise_approval(inp)
+            p_oc = oc.revise_approval(inp)
+            self._record_decision("langgraph", mode, _as_decision(p_lg), inp, "revise_approval")
+            self._record_decision("openclaw", mode, _as_decision(p_oc), inp, "revise_approval")
+            digest = hashlib.sha256(inp.instruction.encode("utf-8")).hexdigest()[:12]
+            key = f"revision:{inp.approval_id}:{digest}"
+            cmp = self._store_comparison(
+                "revise_approval", key, _as_decision(p_lg), _as_decision(p_oc),
+                inp.campaign_id, inp.thread_id, inp.contact_id,
+            )
+            return ComparisonView(
+                comparison_key=key, task_type="revise_approval", thread_id=inp.thread_id,
+                langgraph=_as_decision(p_lg), openclaw=_as_decision(p_oc),
+                intent_agree=cmp.intent_agree, action_agree=cmp.action_agree,
+                selected=cmp.selected or primary, adopted=cmp.adopted,
+            )
+        agent = "openclaw" if mode == "openclaw_only" else "langgraph"
+        proposal = self._make(agent).revise_approval(inp)
+        self._record_decision(agent, mode, _as_decision(proposal), inp, "revise_approval")
+        if proposal is None:
+            from ..exceptions import AgentUnavailableError
+            raise AgentUnavailableError(agent)
+        return proposal
 
     def plan_next_action(self, inp: PlanNextActionInput) -> AgentDecision | ComparisonView:
         mode = inp.mode

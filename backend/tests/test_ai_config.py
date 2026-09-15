@@ -68,3 +68,26 @@ def test_legacy_unified_flag_is_migrated(client, db):
     assert email.json()["model"] == "legacy-model"
     assert db.get(models.SystemFlag, "unified_ai_config") is None
     assert db.get(models.SystemFlag, "tacwork_ai_config") is None
+
+
+def test_unreadable_saved_email_credential_is_reported_without_fallback_copy(client, db):
+    db.add(models.SystemFlag(key="email_ai_config", value="not-a-readable-encrypted-value"))
+    db.commit()
+
+    read = client.get("/api/agent-profile/email-ai-config")
+    assert read.status_code == 200
+    body = read.json()
+    assert body["db_config_present"] is True
+    assert body["db_config_readable"] is False
+    assert body["error_code"] == "credential_unreadable"
+    assert body["usable"] is False
+    assert "api_key" not in body
+
+    # A blank save cannot silently copy a runtime/environment credential over
+    # an unreadable stored value. The operator must explicitly re-enter it.
+    save = client.put("/api/agent-profile/email-ai-config", json={
+        "provider_name": "openai-compatible", "base_url": "https://provider.example/v1",
+        "model": "example-model", "api_key": "",
+    })
+    assert save.status_code == 422
+    assert save.json()["detail"] == "api_key_required_for_new_or_unreadable_credential"

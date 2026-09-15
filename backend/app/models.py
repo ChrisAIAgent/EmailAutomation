@@ -278,6 +278,9 @@ class Contact(TimestampMixin, Base):
     category = Column(String(40), default="prospect", nullable=False, index=True)
     # prospect | qualified | customer | partner | won | invalid
     tags = Column(Text, nullable=True)  # JSON string array
+    # User-managed industry/customer segments. Kept separate from the operational
+    # category so segmentation never changes delivery eligibility or stop rules.
+    segments = Column(Text, nullable=True)  # JSON string array
     intent_level = Column(String(20), default="unknown", nullable=False, index=True)
     # high | medium | low | unknown
     notes = Column(Text, nullable=True)
@@ -323,6 +326,32 @@ class CampaignContact(TimestampMixin, Base):
 
     __table_args__ = (
         UniqueConstraint("campaign_id", "contact_id", name="uq_campaign_contact"),
+    )
+
+
+class CampaignGenerationRun(TimestampMixin, Base):
+    """Durable draft-generation progress; prevents duplicate in-flight batches."""
+
+    __tablename__ = "campaign_generation_runs"
+    id = Column(Integer, primary_key=True)
+    campaign_id = Column(Integer, ForeignKey("campaigns.id"), nullable=False, index=True)
+    status = Column(String(20), default="running", nullable=False, index=True)
+    # running | completed | partial | failed
+    started_at = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    total_contacts = Column(Integer, default=0, nullable=False)
+    generated = Column(Integer, default=0, nullable=False)
+    failed = Column(Integer, default=0, nullable=False)
+    approvals_json = Column(Text, nullable=True)
+    failures_json = Column(Text, nullable=True)
+    error = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index(
+            "uq_campaign_generation_inflight", "campaign_id", unique=True,
+            sqlite_where=text("status = 'running'"),
+            postgresql_where=text("status = 'running'"),
+        ),
     )
 
 

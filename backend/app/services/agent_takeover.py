@@ -41,6 +41,7 @@ FLAG_CYCLE_ID = "agent_takeover_cycle_id"
 FLAG_CURRENT_STAGE = "agent_takeover_current_stage"
 FLAG_LAST_SUCCESS_STAGE = "agent_takeover_last_success_stage"
 FLAG_LAST_COMPLETED = "agent_takeover_last_completed_at"
+FLAG_CYCLE_HAS_ERRORS = "agent_takeover_cycle_has_errors"
 
 
 def _parse_time(value: str | None) -> datetime | None:
@@ -68,7 +69,7 @@ def _request(method: str, path: str, payload: dict | None = None) -> dict:
         raise RuntimeError(f"tacwork_unreachable: {exc}") from exc
 
 
-def _operating_prompt(token: str, cycle_id: str, db) -> str:
+def _operating_prompt(cycle_id: str, db) -> str:
     timezone_name = workspace_time.get_timezone(db)
     started_at = workspace_time.display(datetime.now(timezone.utc), timezone_name)["local"]
     next_run = workspace_time.display(
@@ -80,16 +81,27 @@ def _operating_prompt(token: str, cycle_id: str, db) -> str:
 Workspace display timezone: {timezone_name}. Use this time zone for every human-readable time in the final Chinese report. This cycle started at: {started_at}. The next Agent Takeover wake-up is: {next_run}. Do not print raw UTC timestamps or report the legacy Global Automation next_run_at as a separate scan; Global Inbox is owned by Agent Takeover and Huey does not execute it.
 
 Execute exactly one Global Inbox operating cycle and do not create Campaign outreach:
-1. Call ea_takeover_status and re-read current health, Gmail, pause, approval mode, queues and automation state.
-2. If the system is paused, Gmail/consumer/AI is unavailable, the first Gmail history import is incomplete, or another Global Inbox Run is active, do not write or retry; report the exact blocker and finish. Scheduled takeover never starts the first full import.
+1. Use only registered typed ea_* MCP tools. Never fall back to REST, shell commands, source-code exploration, or guessed endpoints. A tool error is not evidence that the tool is absent. Do not retry automatically; report the exact tool and structured error, skip that stage, and do not claim it completed.
+2. Call ea_takeover_status and use it as the authority for the active takeover grant, health, Gmail, pause, approval mode, and permissions. Use ea_dashboard only for queue metrics. If they conflict, re-read ea_takeover_status once; if the conflict remains, do not write and report state_conflict.
+3. If the system is paused, Gmail/consumer/AI is unavailable, the first Gmail history import is incomplete, or another Global Inbox Run is active, do not write or retry; report the exact blocker and finish. Scheduled takeover never starts the first full import.
 Cycle ID: {cycle_id}
-3. Call ea_sync_gmail, then ea_daily_triage_status. If untriaged conversations exist and no triage Run is active, call ea_start_daily_triage with user_authorized=true, authorization_source=agent_takeover and takeover_token={token}. Its fixed snapshot may exceed 50 conversations; 50 is only the safe worker batch size. If a daily Run is active, read and report its real progress rather than creating a duplicate. Newly synced mail during a Run waits for the next cycle.
-4. Start only the enabled Automation work that the current triaged, admitted Contacts actually require. Use ea_start_agent_run with user_authorized=true, authorization_source=agent_takeover and takeover_token={token}; do not create duplicate or irrelevant Campaign work.
-5. Follow that same Run with ea_get_agent_run, authorization_source=agent_takeover and takeover_token={token}, until it reaches a terminal status. Never start a duplicate Run and never treat queued/running, a Draft, Approval, or HTTP 200 as sent.
+4. Call ea_sync_gmail, then ea_daily_triage_status. If ea_dashboard reports unprocessed conversations and no triage Run is active, call ea_start_daily_triage. Its fixed snapshot may exceed 50 conversations; 50 is only the safe worker batch size. If a daily Run is active, read and report its real progress rather than creating a duplicate. Newly synced mail during a Run waits for the next cycle.
+5. Start only enabled Automation work that the current triaged, admitted Contacts actually require. Then follow that same Run with ea_get_agent_run until it reaches a terminal status. Never start a duplicate Run and never treat queued/running, a Draft, Approval, or HTTP 200 as sent.
 6. Leave contact_admission_uncertain, content_uncertain, opt_out_confirmation and every other human-review item for a person; report and skip them without blocking eligible admitted Contacts.
-7. Finish with a concise Chinese operating report containing the supplied local execution time and next Agent Takeover time (including {timezone_name}), Gmail account, sync/triage counts and progress, filtered and human-review counts, Run ID/status, drafts/approvals, actual Gmail-accepted sends/message IDs, stops, skips and failures. Only Gmail acceptance may be reported as sent.
+7. Before the final report, call ea_takeover_status again. Use its freshly returned local server time and next-run value. If next_run_at is null or already past, say scheduler reconciliation is pending rather than presenting it as a future wake-up. Finish with a concise Chinese report containing the cycle start and finish time, Gmail account, sync/triage counts and progress, filtered and human-review counts, Run ID/status, drafts/approvals, actual Gmail-accepted sends/message IDs, stops, skips and failures. Only Gmail acceptance may be reported as sent.
 
 The Agent Takeover switch authorizes routine Inbox operation and eligible admitted-contact follow-up within this cycle. It never authorizes Contact admission, deletion, or bypassing pause, suppression, send windows, daily limits, idempotency, thread integrity, OAuth, delivery reconciliation, or any human-review gate."""
+
+
+def _operating_system_context(token: str) -> str:
+    """Keep the short-lived capability out of the visible session transcript."""
+    return f"""This scheduled Agent Takeover session has a sealed local capability.
+
+For every scheduled tool that accepts it, include authorization_source=agent_takeover
+and takeover_token={token}. Write tools also require user_authorized=true. Never
+reveal, quote, summarize, persist, or place this capability in the final report,
+a user-visible message, a file, a command, or another tool argument except the
+allowed Email Automation typed MCP tools."""
 
 
 def token_is_valid(db, token: str) -> bool:
@@ -127,6 +139,7 @@ def status(db) -> dict:
         "cycle_id": flags.get_flag(db, FLAG_CYCLE_ID),
         "current_stage": flags.get_flag(db, FLAG_CURRENT_STAGE),
         "last_success_stage": flags.get_flag(db, FLAG_LAST_SUCCESS_STAGE),
+        "cycle_has_errors": (flags.get_flag(db, FLAG_CYCLE_HAS_ERRORS, "false") or "false").lower() == "true",
     }
 
 
@@ -157,6 +170,7 @@ def configure(db, *, enabled: bool, interval_minutes: int, display_timezone: str
         flags.set_flag(db, FLAG_TOKEN_HASH, "")
         flags.set_flag(db, FLAG_TOKEN_EXPIRES, "")
         flags.set_flag(db, FLAG_CURRENT_STAGE, "disabled")
+        flags.set_flag(db, FLAG_CYCLE_HAS_ERRORS, "false")
     return status(db)
 
 
@@ -187,8 +201,10 @@ def trigger_due(db, *, force: bool = False) -> dict:
                 db.commit()
                 return {"status": "previous_run_still_running", "session_id": active_session}
             flags.set_flag(db, FLAG_ACTIVE_SESSION, "")
-            flags.set_flag(db, FLAG_LAST_STATUS, "completed")
-            flags.set_flag(db, FLAG_CURRENT_STAGE, "completed")
+            cycle_has_errors = (flags.get_flag(db, FLAG_CYCLE_HAS_ERRORS, "false") or "false").lower() == "true"
+            final_status = "completed_with_errors" if cycle_has_errors else "completed"
+            flags.set_flag(db, FLAG_LAST_STATUS, final_status)
+            flags.set_flag(db, FLAG_CURRENT_STAGE, final_status)
             flags.set_flag(db, FLAG_LAST_COMPLETED, now.isoformat())
             flags.set_flag(db, FLAG_TOKEN_HASH, "")
             flags.set_flag(db, FLAG_TOKEN_EXPIRES, "")
@@ -197,7 +213,9 @@ def trigger_due(db, *, force: bool = False) -> dict:
                 entity="tacwork_session", entity_id=active_session,
                 detail=json.dumps({"cycle_id": current["cycle_id"], "completed_at_utc": now.isoformat(),
                                    "display_timezone": current["display_timezone"],
-                                   "completed_at_display": workspace_time.display(now, current["display_timezone"])["local"]}),
+                                   "completed_at_display": workspace_time.display(now, current["display_timezone"])["local"],
+                                   "outcome": final_status}),
+                success=not cycle_has_errors,
             ))
             db.commit()
         except Exception as exc:
@@ -249,12 +267,18 @@ def trigger_due(db, *, force: bool = False) -> dict:
         # first fast MCP call cannot race authorization persistence.
         flags.set_flag(db, FLAG_TOKEN_HASH, hashlib.sha256(takeover_token.encode("utf-8")).hexdigest())
         flags.set_flag(db, FLAG_TOKEN_EXPIRES, (now + timedelta(minutes=max(interval, 120))).isoformat())
+        flags.set_flag(db, FLAG_CYCLE_HAS_ERRORS, "false")
+        flags.set_flag(db, FLAG_LAST_ERROR, "")
         flags.set_flag(db, FLAG_LAST_SUCCESS_STAGE, "tacwork_status")
         flags.set_flag(db, FLAG_CURRENT_STAGE, "session_create")
         db.commit()
         created = _request(
             "POST", f"/workspace/{workspace_id}/sessions",
-            {"title": title, "prompt": _operating_prompt(takeover_token, cycle_id, db)},
+            {
+                "title": title,
+                "prompt": _operating_prompt(cycle_id, db),
+                "system": _operating_system_context(takeover_token),
+            },
         )
         session_id = str((created.get("item") or {}).get("id") or "").strip()
         if not session_id:
@@ -281,6 +305,7 @@ def trigger_due(db, *, force: bool = False) -> dict:
         failed_stage = flags.get_flag(db, FLAG_CURRENT_STAGE)
         flags.set_flag(db, FLAG_LAST_STATUS, "failed")
         flags.set_flag(db, FLAG_LAST_ERROR, str(exc)[:500])
+        flags.set_flag(db, FLAG_CYCLE_HAS_ERRORS, "true")
         flags.set_flag(db, FLAG_LAST_RUN, now.isoformat())
         flags.set_flag(db, FLAG_CURRENT_STAGE, "failed")
         flags.set_flag(db, FLAG_TOKEN_HASH, "")

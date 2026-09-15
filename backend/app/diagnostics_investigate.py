@@ -406,11 +406,11 @@ def _investigate_gmail(db, s) -> dict:
             )
         if secs <= 0:
             return _report(
-                "gmail.oauth", "suspected", "token_expired_no_refresh", "令牌已过期（可尝试刷新）", "medium",
-                "令牌已过期，但存在刷新令牌；若刷新失败需重新授权。",
+                "gmail.oauth", "healthy", None, None, "high",
+                "访问令牌已过期，但刷新令牌可用；下一次 Gmail 调用会自动刷新。",
                 evidence,
-                [_remedy("reauthorize", "如刷新持续失败，重新连接 Gmail", "low")],
-                ["观察下一次真实调用是否自动刷新成功"],
+                [],
+                ["观察下一次真实调用是否自动刷新并更新本地令牌。"],
             )
 
     history_id = getattr(account, "history_id", None)
@@ -680,6 +680,13 @@ def investigate(db, target: str = "system", trace_id: Optional[str] = None, inci
     """
     now = datetime.now(timezone.utc)
     incident = incident_id or f"inc-{now.strftime('%Y%m%d-%H%M%S')}"
+
+    # ``diagnostics.overview`` is a synthetic failure item returned only when
+    # the aggregate itself cannot run. It is not a collector and must never be
+    # presented as an unknown investigation target. Older UI clients may still
+    # send it, so route it to the system-level fallback instead.
+    if target == "diagnostics.overview":
+        target = "system"
 
     if target in (None, "", "system", "all"):
         overview_error = None

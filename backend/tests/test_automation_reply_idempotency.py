@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from app import models
@@ -18,7 +18,7 @@ def _approval(thread_id: int, created_at: datetime):
 
 
 def test_reply_approval_marks_same_inbound_message_processed(db):
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     approval = _approval(thread_id=41, created_at=now + timedelta(seconds=1))
     db.add(approval)
     db.commit()
@@ -28,7 +28,7 @@ def test_reply_approval_marks_same_inbound_message_processed(db):
 
 
 def test_newer_inbound_message_is_not_blocked_by_old_approval(db):
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     approval = _approval(thread_id=42, created_at=now)
     db.add(approval)
     db.commit()

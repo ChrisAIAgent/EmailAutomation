@@ -171,14 +171,12 @@ export default function TacWorkPanel() {
       ) : null}
       {!open ? (
         <div className="mt-3 flex flex-col items-center gap-2 text-muted" aria-hidden>
-          <Bot size={17} className="text-accent" />
+          <img src="/brand/agent-avatar.png" alt="" className="h-5 w-5 rounded-full object-cover" />
           <span className="text-[10px] tracking-[0.18em] [writing-mode:vertical-rl]">AGENT NATIVE</span>
         </div>
       ) : null}
       <div className={`${open ? "flex" : "hidden"} h-14 shrink-0 border-b border-border px-3 items-center gap-2`}>
-        <div className="h-8 w-8 rounded-lg bg-accent/10 text-accent flex items-center justify-center">
-          <Bot size={17} />
-        </div>
+        <img src="/brand/agent-avatar.png" alt="" className="h-8 w-8 shrink-0 rounded-full object-cover" />
         <div className="min-w-0 flex-1">
           <div className="text-sm font-semibold">TACWork Agent</div>
           <div className="text-[10px] text-muted truncate">

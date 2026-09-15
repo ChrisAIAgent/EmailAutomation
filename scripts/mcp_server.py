@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import urllib.error
 import urllib.parse
@@ -23,6 +24,27 @@ API_BASE = os.environ.get("EMAIL_AUTOMATION_API_URL", "http://127.0.0.1:18000").
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 SERVER_INFO = {"name": "email-automation", "version": "1.2.3"}
 MCP_DIAGNOSTIC_LOG = Path(os.environ.get("EMAIL_AUTOMATION_DATA_DIR", str(WORKSPACE_ROOT))) / "logs" / "mcp-server.log"
+
+
+class ApiRequestError(RuntimeError):
+    """Structured, non-secret loopback failure for MCP clients."""
+
+    def __init__(self, message: str, *, boundary: str, request_id: str, status: int | None = None):
+        super().__init__(message)
+        self.boundary = boundary
+        self.request_id = request_id
+        self.status = status
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "code": "api_request_failed",
+            "message": str(self),
+            "boundary": self.boundary,
+            "request_id": self.request_id,
+            "status": self.status,
+            "result_unknown": self.boundary == "mcp_http_timeout",
+            "retry_automatically": False,
+        }
 
 
 def _diagnostic(event: str, **fields: Any) -> None:
@@ -50,17 +72,36 @@ def _tool(name: str, description: str, properties: dict[str, Any] | None = None,
     }
 
 
+TAKEOVER_CONTEXT_PROPERTIES = {
+    "authorization_source": {"type": "string", "enum": ["agent_takeover"]},
+    "takeover_token": {"type": "string"},
+}
+
+# Read failures otherwise have no write-operation telemetry path. These are the
+# scheduled-cycle reads the operating prompt depends on; recording their failure
+# means an idle TACWork session cannot be reported as a clean completion.
+TAKEOVER_READ_FAILURE_STAGES = {
+    "ea_takeover_status": "read_operating_state",
+    "ea_dashboard": "read_operating_state",
+    "ea_list_inbox": "read_inbox",
+    "ea_daily_triage_status": "read_daily_triage",
+    "ea_get_agent_run": "poll_agent_run",
+}
+
+
 TOOLS = [
-    _tool("ea_takeover_status", "Read-only first-takeover summary for the Email Automation Workspace. Use on the first user message or whenever session context is uncertain. It checks service health, Gmail, AI configuration status, pause state, readiness, business counts and blockers. It never syncs Gmail, writes data, creates Drafts/Approvals or sends mail."),
+    _tool("ea_takeover_status", "Read-only first-takeover summary for the Email Automation Workspace. Use on the first user message or whenever session context is uncertain. It checks service health, Gmail, AI configuration status, pause state, readiness, business counts and blockers. It never syncs Gmail, writes data, creates Drafts/Approvals or sends mail.", TAKEOVER_CONTEXT_PROPERTIES),
     _tool("ea_health", "Read service and Consumer health. Use before every write action."),
     _tool("ea_gmail_status", "Read Gmail connection/account state. Never exposes OAuth tokens."),
     _tool("ea_system_pause", "Read the global pause safety state."),
     _tool("ea_list_contacts", "List CRM contacts. Read-only.", {"query": {"type": "string", "description": "Optional URL query string without ?"}}),
     _tool("ea_list_campaigns", "List non-archived Campaigns. Read-only."),
     _tool("ea_list_approvals", "List Approvals for review. Read-only; pending is the default.", {"status": {"type": "string", "default": "pending"}, "kind": {"type": "string"}}),
+    _tool("ea_revise_approval", "WRITE, NO SEND: Revise exactly one pending Approval and its existing Gmail Draft from an explicit user instruction. It never creates another Approval, never changes Inbox thread identity, and never confirms or sends mail.", {"approval_id": {"type": "integer", "minimum": 1}, "instruction": {"type": "string", "minLength": 1, "maxLength": 2000}, "editor_email": {"type": "string"}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["approval_id", "instruction", "user_authorized"]),
     _tool("ea_list_automations", "List Global and Campaign Automations and their schedules. Read-only."),
-    _tool("ea_dashboard", "Read readiness, metrics, Inbox stats and scheduler status. Read-only."),
-    _tool("ea_list_inbox", "List Inbox threads by effective category. human_review is not needs_reply.", {"category": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}}),
+    _tool("ea_dashboard", "Read readiness, metrics, Inbox stats and scheduler status. Read-only.", TAKEOVER_CONTEXT_PROPERTIES),
+    _tool("ea_list_inbox", "List Inbox threads by effective category. human_review is not needs_reply.", {"category": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}, **TAKEOVER_CONTEXT_PROPERTIES}),
+    _tool("ea_generate_inbox_reply", "WRITE, NO SEND: Generate one eligible Inbox reply in its existing Gmail thread. It creates a Gmail Draft and pending Approval only after the existing human/contact and sales gates pass; it never confirms or sends mail.", {"thread_id": {"type": "integer", "minimum": 1}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["thread_id", "user_authorized"]),
     _tool("ea_get_agent_run", "Read one Agent Run, including plan, timeline and status. Scheduled takeover sessions should include their capability so progress is traced.", {"run_id": {"type": "integer", "minimum": 1}, "authorization_source": {"type": "string", "enum": ["agent_takeover"]}, "takeover_token": {"type": "string"}}, ["run_id"]),
     _tool("ea_gmail_import_status", "READ: Check whether the one-time full mailbox import is required, running, paused or complete, including non-sensitive progress counters."),
     _tool("ea_start_gmail_import", "WRITE, NO SEND: Start the one-time full mailbox import after explicit user authorization. Imports all accessible mail except Spam and Trash into local data; it does not sort, create Contacts/Drafts/Approvals or send.", {"user_authorized": {"type": "boolean"}}, ["user_authorized"]),
@@ -68,7 +109,7 @@ TOOLS = [
     _tool("ea_initial_triage_status", "READ: Check the one-time first-history Inbox triage after mailbox import, including progress and non-sensitive classification counters."),
     _tool("ea_start_initial_triage", "WRITE, NO SEND: Start the one-time first-history Inbox triage after the full mailbox import is complete. It classifies a frozen local snapshot in 50-thread batches; it never creates Drafts, Approvals or sends mail.", {"user_authorized": {"type": "boolean"}}, ["user_authorized"]),
     _tool("ea_control_initial_triage", "WRITE, NO SEND: Pause, resume, cancel or retry failed items in the first-history Inbox triage after explicit user authorization.", {"run_id": {"type": "integer", "minimum": 1}, "action": {"type": "string", "enum": ["pause", "resume", "cancel", "retry_failed"]}, "user_authorized": {"type": "boolean"}}, ["run_id", "action", "user_authorized"]),
-    _tool("ea_daily_triage_status", "READ: Check the current or latest daily incremental triage Run, its fixed snapshot, progress and results.", {}, []),
+    _tool("ea_daily_triage_status", "READ: Check the current or latest daily incremental triage Run, its fixed snapshot, progress and results.", TAKEOVER_CONTEXT_PROPERTIES, []),
     _tool("ea_recent_triage_result", "READ: Get the latest first-history or daily Inbox triage summary and its completed/progress time.", {}, []),
     _tool("ea_start_daily_triage", "WRITE, NO SEND: Freeze all currently untriaged newly synced or changed conversations into one resumable daily triage Run. It processes every snapshot item in safe 50-thread worker batches; it never drafts or sends mail.", {"user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["user_authorized"]),
     _tool("ea_control_daily_triage", "WRITE, NO SEND: Pause, resume, cancel or retry failed items in a daily incremental triage Run.", {"run_id": {"type": "integer", "minimum": 1}, "action": {"type": "string", "enum": ["pause", "resume", "cancel", "retry_failed"]}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["run_id", "action", "user_authorized"]),
@@ -76,11 +117,27 @@ TOOLS = [
     _tool("ea_sort_inbox", "Deprecated compatibility alias for ea_start_daily_triage. It creates a resumable snapshot Run; 50 is only the worker batch size. Requires explicit user authorization or a valid Agent Takeover capability; never sends mail.", {"user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["user_authorized"]),
     _tool("ea_create_contact", "WRITE: Create one confirmed-human Contact through the API. Never infer identity from forwarded/system mail.", {"contact": {"type": "object"}, "user_authorized": {"type": "boolean"}}, ["contact", "user_authorized"]),
     _tool("ea_import_contacts", "WRITE: Preview or import a UTF-8 CSV/XLSX file located inside this Workspace. Confirm=false is preview-only.", {"path": {"type": "string"}, "confirm": {"type": "boolean", "default": False}, "user_authorized": {"type": "boolean"}}, ["path", "user_authorized"]),
-    _tool("ea_create_campaign", "WRITE: Create a Campaign configuration; does not generate or send mail. A valid Agent Takeover capability may create it as part of full operating authority.", {"campaign": {"type": "object"}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign", "user_authorized"]),
+    _tool("ea_create_campaign", "WRITE: Create a Campaign configuration; does not generate or send mail. An empty Campaign list is normal, not a missing configuration file: with complete user-provided details and authorization, call this tool directly. A valid Agent Takeover capability may create it as part of full operating authority.", {"campaign": {"type": "object"}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign", "user_authorized"]),
+    _tool("ea_get_campaign", "READ: Get one Campaign by id, including its current configuration and lifecycle status.", {"campaign_id": {"type": "integer", "minimum": 1}}, ["campaign_id"]),
+    _tool("ea_list_campaign_members", "READ: List active or historical members of one Campaign. Use before and after membership changes; never searches source code for this operation.", {"campaign_id": {"type": "integer", "minimum": 1}, "include_removed": {"type": "boolean", "default": False}}, ["campaign_id"]),
+    _tool("ea_add_campaign_contacts", "WRITE, NO SEND: Add or re-add existing Contacts to one Campaign. The server preserves history, skips suppressed/ineligible Contacts, and returns exact added/skipped results.", {"campaign_id": {"type": "integer", "minimum": 1}, "contact_ids": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign_id", "contact_ids", "user_authorized"]),
+    _tool("ea_remove_campaign_contact", "DESTRUCTIVE WRITE, NO SEND: Remove one Contact only after the operator explicitly asks to remove that Contact from this Campaign. It expires unsent pending Approvals and cancels Drafts/follow-ups. Never use it to recover a failed copy revision, reset outreach_generated, or regenerate an email.", {"campaign_id": {"type": "integer", "minimum": 1}, "contact_id": {"type": "integer", "minimum": 1}, "confirmed_removal": {"type": "boolean", "description": "Must be true only after a direct operator request to remove this Campaign member; never infer it from a revision or generation failure."}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign_id", "contact_id", "confirmed_removal", "user_authorized"]),
+    _tool("ea_update_campaign", "WRITE, NO SEND: Replace one Campaign's configuration with a complete valid Campaign payload. Read it first so unchanged fields are preserved.", {"campaign_id": {"type": "integer", "minimum": 1}, "campaign": {"type": "object"}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign_id", "campaign", "user_authorized"]),
+    _tool("ea_generate_campaign_outreach", "WRITE, NO SEND: Generate first-email Drafts and pending Approvals for currently queued active Campaign members. Requires explicit authorization; it never proves a send. A timeout is result_unknown: reconcile using generation status, Approvals, and members; never retry automatically. A new call after terminal failed/partial needs new explicit user authorization.", {"campaign_id": {"type": "integer", "minimum": 1}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign_id", "user_authorized"]),
+    _tool("ea_get_campaign_generation", "READ: Get latest Campaign generation status, including partial successes and retryable contact failures. After timeout: running means wait/reconcile; terminal failed/partial may be retried only with new explicit user authorization after checking pending Approvals and queued active members.", {"campaign_id": {"type": "integer", "minimum": 1}}, ["campaign_id"]),
+    _tool("ea_start_campaign", "WRITE, NO SEND: Mark one Campaign active. Sending still requires the existing Approval, policy, and Gmail checks.", {"campaign_id": {"type": "integer", "minimum": 1}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign_id", "user_authorized"]),
+    _tool("ea_pause_campaign", "WRITE, NO SEND: Pause one Campaign without deleting its history.", {"campaign_id": {"type": "integer", "minimum": 1}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign_id", "user_authorized"]),
+    _tool("ea_stop_campaign", "WRITE, NO SEND: Stop one Campaign and cancel its scheduled follow-ups while preserving history.", {"campaign_id": {"type": "integer", "minimum": 1}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign_id", "user_authorized"]),
+    _tool("ea_get_automation", "READ: Get one Automation and its recent Runs.", {"automation_id": {"type": "integer", "minimum": 1}}, ["automation_id"]),
+    _tool("ea_generate_automation_plan", "WRITE, NO SEND: Generate a conservative structured Automation plan from a prompt. It creates no Automation, Draft, Approval, or send.", {"prompt": {"type": "string", "minLength": 1}, "campaign_id": {"type": "integer", "minimum": 1}, "scope": {"type": "string", "enum": ["campaign", "global"], "default": "campaign"}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["prompt", "user_authorized"]),
+    _tool("ea_create_automation", "WRITE, NO SEND: Create one Campaign or Global Automation from an explicit structured plan. It remains subject to enablement, approval mode, and all server safety gates.", {"prompt": {"type": "string", "minLength": 1}, "campaign_id": {"type": "integer", "minimum": 1}, "scope": {"type": "string", "enum": ["campaign", "global"], "default": "campaign"}, "plan": {"type": "object"}, "name": {"type": "string"}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["prompt", "plan", "user_authorized"]),
+    _tool("ea_enable_automation", "WRITE, NO SEND: Enable one existing Automation. This changes scheduling configuration only; a later Run still performs policy checks.", {"automation_id": {"type": "integer", "minimum": 1}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["automation_id", "user_authorized"]),
+    _tool("ea_pause_automation", "WRITE, NO SEND: Pause one existing Automation without deleting history.", {"automation_id": {"type": "integer", "minimum": 1}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["automation_id", "user_authorized"]),
+    _tool("ea_schedule_automation", "WRITE, NO SEND: Set one Automation's cadence in whole minutes (1-1440).", {"automation_id": {"type": "integer", "minimum": 1}, "tick_interval_minutes": {"type": "integer", "minimum": 1, "maximum": 1440}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["automation_id", "tick_interval_minutes", "user_authorized"]),
     _tool("ea_start_agent_run", "HIGH IMPACT: Start an owned enabled Automation Run. A scheduled Agent Takeover capability may use full operating authority; server safety gates still apply.", {"automation_id": {"type": "integer", "minimum": 1}, "mode": {"type": "string", "enum": ["full_auto", "semi_auto"]}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["automation_id", "mode", "user_authorized"]),
     _tool("ea_confirm_run", "SEND-CAPABLE: Confirm the exact frozen semi-auto plan. May send mail through server safeguards. Use only after explicit confirmation of recipients and full content.", {"run_id": {"type": "integer", "minimum": 1}, "confirmed_by": {"type": "string"}, "user_authorized": {"type": "boolean"}}, ["run_id", "user_authorized"]),
     _tool("ea_cancel_run", "WRITE, NO SEND: Cancel one exact prepared semi-auto Run. Does not generate or send mail.", {"run_id": {"type": "integer", "minimum": 1}, "user_authorized": {"type": "boolean"}}, ["run_id", "user_authorized"]),
-    _tool("ea_invalidate_approval", "WRITE, NO SEND: Expire one pending Approval and cancel its unsent Draft.", {"approval_id": {"type": "integer", "minimum": 1}, "reason": {"type": "string"}, "editor_email": {"type": "string"}, "user_authorized": {"type": "boolean"}}, ["approval_id", "reason", "user_authorized"]),
+    _tool("ea_invalidate_approval", "DESTRUCTIVE WRITE, NO SEND: Expire one pending Approval only when the operator explicitly says it is obsolete or already sent. It cancels the unsent Draft. Never use it because a revision, Draft update, or generation failed.", {"approval_id": {"type": "integer", "minimum": 1}, "reason": {"type": "string"}, "reason_category": {"type": "string", "enum": ["obsolete", "already_sent"], "description": "The direct operator reason for invalidation; revision or generation failure is not valid."}, "editor_email": {"type": "string"}, "user_authorized": {"type": "boolean"}}, ["approval_id", "reason", "reason_category", "user_authorized"]),
     _tool("ea_create_knowledge", "WRITE: Create draft or published knowledge. Published content may influence future replies.", {"title": {"type": "string"}, "category": {"type": "string", "default": "general"}, "content": {"type": "string"}, "publish": {"type": "boolean", "default": False}, "user_authorized": {"type": "boolean"}}, ["title", "content", "user_authorized"]),
     # Knowledge self-management (Agent Native): the Agent can fully manage its own KB lifecycle.
     _tool("ea_list_knowledge", "READ: List current knowledge documents.", {}, []),
@@ -106,6 +163,7 @@ def _request(method: str, path: str, body: Any = None, timeout: int = 90,
     if data is not None:
         request_headers["Content-Type"] = "application/json"
     request_headers.update(headers or {})
+    request_id = request_headers.setdefault("X-Request-ID", uuid.uuid4().hex[:12])
     req = urllib.request.Request(url, data=data, headers=request_headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as response:
@@ -113,9 +171,22 @@ def _request(method: str, path: str, body: Any = None, timeout: int = 90,
             return json.loads(raw.decode("utf-8")) if raw else {"ok": True}
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Email Automation API {exc.code}: {detail[:2000]}") from exc
+        raise ApiRequestError(
+            f"Email Automation API {exc.code}: {detail[:2000]}",
+            boundary="email_automation_api", request_id=request_id, status=exc.code,
+        ) from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise ApiRequestError(
+            f"Email Automation API request timed out after {timeout}s; the server result is unknown. Check the Campaign generation status before trying again.",
+            boundary="mcp_http_timeout", request_id=request_id,
+        ) from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"Email Automation API unavailable at {API_BASE}: {exc.reason}") from exc
+        reason = str(exc.reason)
+        boundary = "mcp_http_timeout" if "timed out" in reason.lower() else "mcp_http_transport"
+        raise ApiRequestError(
+            f"Email Automation API unavailable at {API_BASE}: {reason}",
+            boundary=boundary, request_id=request_id,
+        ) from exc
 
 
 def _authorized(args: dict[str, Any], operation: str | None = None) -> None:
@@ -124,11 +195,14 @@ def _authorized(args: dict[str, Any], operation: str | None = None) -> None:
     if args.get("authorization_source") == "agent_takeover":
         if not operation:
             raise ValueError("Agent Takeover does not authorize this operation")
-        _request("POST", "/api/agent-takeover/authorize", {
+        takeover_request = {
             "token": args.get("takeover_token") or "",
             "operation": operation,
-            **({"automation_id": args.get("automation_id")} if operation == "start_agent_run" else {}),
-        })
+        }
+        for key in ("automation_id", "campaign_id", "thread_id", "approval_id"):
+            if args.get(key) is not None:
+                takeover_request[key] = int(args[key])
+        _request("POST", "/api/agent-takeover/authorize", takeover_request)
 
 
 def _takeover_telemetry(args: dict[str, Any], stage: str, status: str, detail: dict[str, Any] | None = None) -> None:
@@ -160,7 +234,7 @@ def _takeover_operation(args: dict[str, Any], stage: str, operation: str, action
         raise
     safe_detail = {}
     if isinstance(result, dict):
-        for key in ("threads", "messages", "sorted", "failed", "run_id", "status", "mode"):
+        for key in ("threads", "messages", "sorted", "failed", "run_id", "status", "mode", "added", "generated", "automation_id", "campaign_id", "approval_id", "draft_id", "revision_applied"):
             if key in result:
                 safe_detail[key] = result[key]
     try:
@@ -198,7 +272,14 @@ def _takeover_status() -> dict[str, Any]:
     scheduler = _request("GET", "/api/automation/scheduler/status")
     takeover = _request("GET", "/api/agent-takeover")
 
-    langgraph = agent_health.get("langgraph", {}) if isinstance(agent_health, dict) else {}
+    if isinstance(agent_health, list):
+        langgraph = next((item for item in agent_health if isinstance(item, dict) and item.get("agent") == "langgraph"), {})
+    elif isinstance(agent_health, dict):
+        # Compatibility with the short-lived object-shaped health response.
+        candidate = agent_health.get("langgraph", agent_health)
+        langgraph = candidate if isinstance(candidate, dict) else {}
+    else:
+        langgraph = {}
     ai_configured = bool(
         langgraph.get("configured")
         or (metrics.get("langgraph_configured") if isinstance(metrics, dict) else False)
@@ -262,6 +343,11 @@ def _takeover_status() -> dict[str, Any]:
         "ai": {
             "configured": ai_configured,
             "langgraph_reachable": bool(langgraph.get("reachable")),
+            "provider_reachable": None,
+            "provider_check": "use_email_ai_config_test",
+            "detail": langgraph.get("detail") or None,
+            "latency_ms": langgraph.get("latency_ms"),
+            "config": health.get("llm_config") if isinstance(health, dict) else None,
         },
         "profile": {
             "configured": bool(profile.get("configured")),
@@ -324,6 +410,14 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
     if name == "ea_list_approvals":
         query = urllib.parse.urlencode({k: v for k, v in {"status": args.get("status", "pending"), "kind": args.get("kind")}.items() if v})
         return _request("GET", "/api/approvals?" + query)
+    if name == "ea_revise_approval":
+        body = {"instruction": args["instruction"]}
+        if args.get("editor_email"):
+            body["editor_email"] = args["editor_email"]
+        return _takeover_operation(
+            args, "revise_approval", "revise_approval",
+            lambda: _request("POST", f"/api/approvals/{int(args['approval_id'])}/revise", body),
+        )
     if name == "ea_list_automations": return _request("GET", "/api/automation")
     if name == "ea_dashboard":
         return {key: _request("GET", path) for key, path in {
@@ -333,6 +427,8 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
     if name == "ea_list_inbox":
         query = urllib.parse.urlencode({k: v for k, v in {"category": args.get("category"), "limit": args.get("limit", 100)}.items() if v is not None})
         return _request("GET", "/api/inbox/threads?" + query)
+    if name == "ea_generate_inbox_reply":
+        return _takeover_operation(args, "generate_inbox_reply", "generate_inbox_reply", lambda: _request("POST", f"/api/inbox/threads/{int(args['thread_id'])}/generate-reply"))
     if name == "ea_get_agent_run":
         result = _request("GET", f"/api/agent-runs/{int(args['run_id'])}")
         if args.get("authorization_source") == "agent_takeover":
@@ -375,6 +471,50 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
     if name == "ea_import_contacts": return _upload_contacts(args)
     if name == "ea_create_campaign":
         return _takeover_operation(args, "create_campaign", "create_campaign", lambda: _request("POST", "/api/campaigns", args["campaign"]))
+    if name == "ea_get_campaign":
+        return _request("GET", f"/api/campaigns/{int(args['campaign_id'])}")
+    if name == "ea_list_campaign_members":
+        query = urllib.parse.urlencode({"include_removed": str(bool(args.get("include_removed", False))).lower()})
+        return _request("GET", f"/api/campaigns/{int(args['campaign_id'])}/contacts?{query}")
+    if name == "ea_add_campaign_contacts":
+        return _takeover_operation(args, "add_campaign_contacts", "add_campaign_contacts", lambda: _request("POST", f"/api/campaigns/{int(args['campaign_id'])}/contacts", {"contact_ids": args["contact_ids"]}))
+    if name == "ea_remove_campaign_contact":
+        if args.get("confirmed_removal") is not True:
+            raise ValueError("confirmed_removal=true is required after a direct operator request to remove this Campaign member")
+        return _takeover_operation(args, "remove_campaign_contact", "remove_campaign_contact", lambda: _request("DELETE", f"/api/campaigns/{int(args['campaign_id'])}/contacts/{int(args['contact_id'])}"))
+    if name == "ea_update_campaign":
+        return _takeover_operation(args, "update_campaign", "update_campaign", lambda: _request("PUT", f"/api/campaigns/{int(args['campaign_id'])}", args["campaign"]))
+    if name == "ea_generate_campaign_outreach":
+        return _takeover_operation(args, "generate_campaign_outreach", "generate_campaign_outreach", lambda: _request("POST", f"/api/campaigns/{int(args['campaign_id'])}/generate"))
+    if name == "ea_get_campaign_generation":
+        return _request("GET", f"/api/campaigns/{int(args['campaign_id'])}/generation-status")
+    campaign_actions = {
+        "ea_start_campaign": "start_campaign",
+        "ea_pause_campaign": "pause_campaign",
+        "ea_stop_campaign": "stop_campaign",
+    }
+    if name in campaign_actions:
+        operation = campaign_actions[name]
+        action = operation.removesuffix("_campaign")
+        return _takeover_operation(args, operation, operation, lambda: _request("POST", f"/api/campaigns/{int(args['campaign_id'])}/{action}"))
+    if name == "ea_get_automation":
+        return _request("GET", f"/api/automation/{int(args['automation_id'])}")
+    if name == "ea_generate_automation_plan":
+        body = {key: args[key] for key in ("prompt", "campaign_id", "scope") if key in args}
+        return _takeover_operation(args, "generate_automation_plan", "generate_automation_plan", lambda: _request("POST", "/api/automation/generate", body))
+    if name == "ea_create_automation":
+        body = {key: args[key] for key in ("prompt", "campaign_id", "scope", "plan", "name") if key in args}
+        return _takeover_operation(args, "create_automation", "create_automation", lambda: _request("POST", "/api/automation", body))
+    automation_actions = {
+        "ea_enable_automation": "enable_automation",
+        "ea_pause_automation": "pause_automation",
+    }
+    if name in automation_actions:
+        operation = automation_actions[name]
+        action = operation.removesuffix("_automation")
+        return _takeover_operation(args, operation, operation, lambda: _request("POST", f"/api/automation/{int(args['automation_id'])}/{action}"))
+    if name == "ea_schedule_automation":
+        return _takeover_operation(args, "schedule_automation", "schedule_automation", lambda: _request("POST", f"/api/automation/{int(args['automation_id'])}/schedule", {"tick_interval_minutes": args["tick_interval_minutes"]}))
     if name == "ea_start_agent_run":
         if args.get("authorization_source") == "agent_takeover":
             return _takeover_operation(args, "start_agent_run", "start_agent_run", lambda: _request("POST", "/api/agent-runs", {"automation_id": args["automation_id"], "mode": args["mode"]}))
@@ -382,6 +522,8 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
     if name == "ea_confirm_run": _authorized(args); return _request("POST", f"/api/agent-runs/{int(args['run_id'])}/confirm", {"confirmed_by": args.get("confirmed_by")})
     if name == "ea_cancel_run": _authorized(args); return _request("POST", f"/api/agent-runs/{int(args['run_id'])}/cancel")
     if name == "ea_invalidate_approval":
+        if args.get("reason_category") not in {"obsolete", "already_sent"}:
+            raise ValueError("reason_category must be obsolete or already_sent; revision or generation failure must preserve the pending Approval")
         _authorized(args); return _request("POST", f"/api/approvals/{int(args['approval_id'])}/invalidate", {"reason": args["reason"], "editor_email": args.get("editor_email")})
     if name == "ea_create_knowledge":
         _authorized(args); return _request("POST", "/api/knowledge", {"title": args["title"], "category": args.get("category", "general"), "content": args["content"], "publish": bool(args.get("publish", False))})
@@ -445,10 +587,22 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
                 "structuredContent": structured,
             })
         except Exception as exc:
+            # Scheduled read tools do not pass through _takeover_operation. If
+            # one fails, persist that fact before returning the original MCP
+            # error so the scheduler can surface completed_with_errors rather
+            # than a misleading clean completion. Telemetry is best-effort and
+            # must never replace or hide the actual tool error.
+            stage = TAKEOVER_READ_FAILURE_STAGES.get(str(params.get("name", "")))
+            if stage:
+                try:
+                    _takeover_telemetry(params.get("arguments") or {}, stage, "failed", {"error": str(exc)[:300]})
+                except Exception:
+                    pass
             _diagnostic("tool_error", tool=str(params.get("name", "")), error=str(exc)[:300])
+            structured_error = exc.as_dict() if isinstance(exc, ApiRequestError) else {"error": str(exc)}
             return _result(request_id, {
                 "content": [{"type": "text", "text": str(exc)}],
-                "structuredContent": {"error": str(exc)},
+                "structuredContent": structured_error,
                 "isError": True,
             })
     if request_id is None: return None

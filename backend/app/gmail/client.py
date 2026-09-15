@@ -6,6 +6,7 @@ import logging
 import socket
 import ssl
 import time
+from datetime import timezone
 from typing import Optional
 
 import httplib2
@@ -98,6 +99,7 @@ class RealGmailTransport(GmailTransport):
         self._cipher = Cipher()
         self._service = None
         self._creds = None
+        self._persisted_access_token = None
         self._timeout = get_settings().GMAIL_HTTP_TIMEOUT_SECONDS
 
     # --- credential management ---
@@ -126,7 +128,12 @@ class RealGmailTransport(GmailTransport):
         oauth = self._load_oauth()
         access = self._cipher.decrypt(oauth.access_token_enc)
         refresh = self._cipher.decrypt(oauth.refresh_token_enc)
-        expiry = oauth.token_expiry.timestamp() if oauth.token_expiry else 0.0
+        expiry_at = oauth.token_expiry
+        # SQLite returns the UTC timestamp without tzinfo.  Do not let the host
+        # local timezone shift the OAuth expiry when rebuilding Credentials.
+        if expiry_at and expiry_at.tzinfo is None:
+            expiry_at = expiry_at.replace(tzinfo=timezone.utc)
+        expiry = expiry_at.timestamp() if expiry_at else 0.0
         creds = build_credentials(access, refresh, expiry)
         try:
             if maybe_refresh(creds, timeout=self._timeout):
@@ -139,6 +146,7 @@ class RealGmailTransport(GmailTransport):
                 raise GmailTimeoutError(f"gmail_timeout: token_refresh {type(e).__name__}: {e}") from e
             raise
         self._creds = creds
+        self._persisted_access_token = creds.token
         # Explicit socket timeout on the underlying httplib2 transport. Every
         # Gmail API call AND the on-demand token refresh (AuthorizedHttp reuses
         # this same httplib2) inherit this timeout, so neither can block forever.
@@ -169,7 +177,15 @@ class RealGmailTransport(GmailTransport):
         for attempt in range(_MAX_RETRIES):
             try:
                 self._ensure_service()
-                return fn(self._service)
+                result = fn(self._service)
+                # AuthorizedHttp may still refresh after a server-side 401 (for
+                # example, after token revocation).  Persist that successful
+                # in-memory refresh so the next request does not repeat it.
+                if (hasattr(self, "_persisted_access_token") and self._creds
+                        and self._creds.token != self._persisted_access_token):
+                    self._persist_refreshed(self._creds)
+                    self._persisted_access_token = self._creds.token
+                return result
             except HttpError as e:
                 rate_limited = _is_rate_limit(e)
                 if rate_limited or e.status_code in (429, 500, 502, 503, 504):
@@ -302,10 +318,10 @@ class RealGmailTransport(GmailTransport):
     def update_draft(self, draft_id, to, subject, body_text, body_html, thread_id=None,
                      in_reply_to=None, references=None) -> dict:
         raw = build_mime(to, subject, body_text, body_html, thread_id, in_reply_to, references)
-        body = {"id": draft_id, "message": {"raw": raw}}
+        body = {"message": {"raw": raw}}
         if thread_id:
             body["message"]["threadId"] = thread_id
-        return self._call(lambda s: s.users().drafts().update(userId="me", body=body).execute())
+        return self._call(lambda s: s.users().drafts().update(userId="me", id=draft_id, body=body).execute())
 
     def send_draft(self, draft_id) -> dict:
         res = self._call(lambda s: s.users().drafts().send(userId="me", body={"id": draft_id}).execute())

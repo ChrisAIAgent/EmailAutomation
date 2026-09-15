@@ -132,6 +132,14 @@ def run() -> list[tuple[str, str, str]]:
                 "WHERE status IN ('queued', 'running', 'paused')"
             ))
         logger.info("Ensured index uq_gmail_sync_inflight (<=1 active sync per account).")
+    if inspect(engine).has_table("campaign_generation_runs"):
+        with engine.begin() as conn:
+            conn.execute(text("DROP INDEX IF EXISTS uq_campaign_generation_inflight"))
+            conn.execute(text(
+                "CREATE UNIQUE INDEX uq_campaign_generation_inflight "
+                "ON campaign_generation_runs(campaign_id) WHERE status = 'running'"
+            ))
+        logger.info("Ensured index uq_campaign_generation_inflight (<=1 active generation per campaign).")
     if inspect(engine).has_table("inbox_triage_runs"):
         with engine.begin() as conn:
             conn.execute(text("DROP INDEX IF EXISTS uq_inbox_initial_triage_inflight"))

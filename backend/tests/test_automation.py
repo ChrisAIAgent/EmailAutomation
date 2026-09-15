@@ -144,6 +144,7 @@ def test_web_due_scan_is_owner_scoped(client, monkeypatch):
 
 def test_run_now_creates_first_approval_draft_only(client, db):
     cid = _make_campaign(client)
+    assert client.post(f"/api/campaigns/{cid}/start").status_code == 200
     contact = models.Contact(owner_id=1, email="pyx1171898390@gmail.com", first_name="Chris", company="TAC")
     db.add(contact)
     db.flush()
@@ -400,6 +401,7 @@ def test_no_concurrent_duplicate_run(client, db):
     from app.db import SessionLocal
 
     cid = _make_campaign(client)
+    assert client.post(f"/api/campaigns/{cid}/start").status_code == 200
     contact = models.Contact(owner_id=1, email="pyx1171898390@gmail.com")
     db.add(contact)
     db.flush()

@@ -44,6 +44,30 @@ Approval `rejected` means no send and the unsent Draft is cancelled. `expired`
 means the operator invalidated it or sync reconciled it as already sent; its
 unsent Draft is also cancelled. Do not confuse either state with delivery.
 
+## Revising generated pending copy
+
+When an operator asks the embedded Agent to revise an already generated reply or
+Campaign first email, the Agent first lists pending Approvals and identifies one
+exact Approval ID. It then calls `ea_revise_approval` with the operator's explicit
+instruction and `user_authorized=true`. This is a no-send operation: it updates
+the existing pending Approval and its linked Gmail Draft in place, then reports
+the revised subject/body for human review. It must not create a replacement
+Approval, approve it, or send it. An Inbox reply or Campaign follow-up retains its
+original Gmail Thread headers and Subject; only first outreach may change Subject.
+If the target is ambiguous, the AI is unavailable, the safety checks fail, or the
+Draft update fails, leave the original content unchanged and report the exact
+blocker. The instruction is one-time editorial guidance, never stored as a
+Campaign/Profile/Knowledge Base setting.
+
+`outreach_generated` means a Campaign first-email Draft was already prepared; it
+is not a retry error and must not be reset by removing the member. A failed copy
+revision must never trigger Approval invalidation, Campaign-member removal, or a
+replacement Draft. Only a direct operator instruction that the item is obsolete
+or already sent may invalidate it; only a direct operator instruction may remove
+a Campaign member. After each successful revision, show the exact revised
+recipient, subject and body. The final approval or semi-auto confirmation is the
+only release point for sending.
+
 本项目已经交付客户，当前 Workspace 是正式运营环境。开发、维护、检查和业务操作均按正式环境标准执行；除非用户明确指定 `test` / `demo`，不得默认使用 Demo、测试或非正式运营框架描述任务。
 
 本手册用于运营 Agent 操作 Email Automation。前端用于人工操作与审计，API 是 Agent 的稳定执行入口。
@@ -124,6 +148,10 @@ contact_state_updated_from_conversation
 
 ## 3. Campaign 获客
 
+空 Campaign 列表表示当前尚未创建活动，是正常状态；它不是“Campaign 配置文件”缺失。用户给出完整名称、活动说明、目标客户、语言/语气等信息并明确授权后，直接按 typed MCP 顺序创建、加成员、核验成员、启动和生成，不要在源码或磁盘中查找配置文件。
+
+Campaign 生成调用如遇超时，结果必须视为未知。先读取 generation status、pending Approvals 和成员状态：`running` 时等待并对账；`failed`/`partial` 时停止并报告真实原因。不得自动重试或以旧状态代替新的工具调用结果。只有取得新的明确用户授权，并重新确认成员为 active + queued、没有对应 pending Approval 后，才可再调用一次生成工具；生成后立即重新读取结果。
+
 标准流程：
 
 1. `GET /api/contacts` 选择目标联系人。
@@ -134,6 +162,14 @@ contact_state_updated_from_conversation
 6. `GET /api/approvals?status=pending` 复核。
 7. 用户授权后调用 `POST /api/approvals/{id}/decision`。
 8. 查询 Approval 和 Gmail 结果，必要时由收件邮箱确认送达。
+
+嵌入式 TACWork Agent 执行上述日常链路时，必须依次使用已注册的 typed MCP 工具：
+`ea_list_contacts`、`ea_create_campaign`、`ea_add_campaign_contacts`、
+`ea_start_campaign`、`ea_generate_campaign_outreach`，以及需要时的
+`ea_generate_automation_plan`、`ea_create_automation`、`ea_enable_automation` 和
+`ea_schedule_automation`。加入成员前后用 `ea_list_campaign_members` 核验结果。
+不得为了查找普通业务接口而派生 Explore/源码检索任务；若工具缺失或服务拒绝，
+如实报告该操作不可用或失败，并停在现有安全边界。
 
 Approval 至少检查收件人、联系人身份、Campaign 匹配、主题、正文、重复发送、事实准确性、suppression、发送窗口和每日上限。
 
@@ -146,7 +182,7 @@ local calendar day. `max_follow_ups` is per Contact after the first email; `0`
 disables automated follow-up. Editing these values affects future unexecuted work
 only and must not rewrite a frozen Run or historical send.
 
-Use `DELETE /api/campaigns/{id}/contacts/{contact_id}` to remove a Contact from
+Use `ea_remove_campaign_contact` in the embedded Agent (or `DELETE /api/campaigns/{id}/contacts/{contact_id}` in the Web UI) to remove a Contact from
 future participation without deleting history. The operation expires unsent
 pending Campaign Approvals, cancels their Drafts and follow-up tasks, and retains
 the Contact, sent mail, Gmail thread, DeliveryAttempt and AuditLog. It is not an
@@ -464,7 +500,8 @@ and no longer in the Filtered customer list.
 ### Standalone Inbox replies
 
 An inbound business conversation does not need a Campaign. After the human and
-sales gates pass, call `POST /api/inbox/threads/{id}/generate-reply`. The result is
+sales gates pass, call `ea_generate_inbox_reply` in the embedded Agent (or
+`POST /api/inbox/threads/{id}/generate-reply` in the Web UI). The result is
 a pending Inbox Reply Approval whose `campaign_id` may be null. It must retain the
 Gmail `thread_id`, Contact, recipient, subject, and body. Review it in Approvals;
 in semi-auto mode, explicit user authorization permits the frozen send plan; in

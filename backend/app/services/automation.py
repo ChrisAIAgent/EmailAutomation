@@ -447,9 +447,13 @@ def _prepare_campaign(db, automation, run, plan):
             raise
         except Exception as exc:
             errors.append(str(exc)[:200])
-    for cc in db.query(models.CampaignContact).filter_by(
-        campaign_id=campaign.id, status="queued", membership_active=True
-    ).all():
+    queued_members = (
+        db.query(models.CampaignContact).filter_by(
+            campaign_id=campaign.id, status="queued", membership_active=True
+        ).all()
+        if campaign.status == "active" else []
+    )
+    for cc in queued_members:
         try:
             proposal = _primary(orch.generate_outreach(GenerateOutreachInput(
                 campaign_id=campaign.id, contact_id=cc.contact_id, mode=campaign.agent_mode

@@ -23,7 +23,7 @@ import pytest
 from app import diagnostics, redact
 from app.api import system as system_api
 from app.config import _DATA, get_settings
-from app.models import GmailAccount, OAuthCredential
+from app.models import Automation, GmailAccount, OAuthCredential
 import app.diagnostics_investigate as di
 
 
@@ -181,15 +181,79 @@ def test_system_target_unknown_when_overview_raises(db, monkeypatch, no_network)
     assert all(r["status"] != "healthy" for r in data["reports"])
 
 
-def test_overview_self_reports_unknown_when_it_fails(db, monkeypatch):
+def test_overview_failure_target_routes_to_system_investigation(db, monkeypatch, no_network):
+    monkeypatch.setattr(diagnostics, "run_diagnostics", lambda db_: {
+        "overall": "unknown", "error": "overview failed", "items": [],
+    })
+    monkeypatch.setattr(di, "run_diagnostics", diagnostics.run_diagnostics)
+
+    data = di.investigate(db, target="diagnostics.overview")
+
+    assert data["target"] == "system"
+    assert data["reports"][0]["target"] == "system"
+    assert data["reports"][0]["root_cause"] == "overview_failed"
+    assert "未知的诊断目标" not in data["reports"][0]["summary"]
+
+
+def test_overview_self_reports_unknown_when_initialization_fails(db, monkeypatch):
+    def broken_settings():
+        raise RuntimeError("settings failed")
+
+    monkeypatch.setattr(diagnostics, "get_diagnostic_settings", broken_settings)
+    overview = diagnostics.run_diagnostics(db)
+    assert overview["overall"] == "unknown"
+    assert overview.get("error")
+    assert overview["items"], "failure must be visible as an item"
+
+
+def test_overview_isolates_one_probe_failure(db, monkeypatch):
     def broken_lookup(db_):
         raise RuntimeError("peek failed")
 
     monkeypatch.setattr(diagnostics, "peek_email_config", broken_lookup)
     overview = diagnostics.run_diagnostics(db)
-    assert overview["overall"] == "unknown"
-    assert overview.get("error")
-    assert overview["items"], "failure must be visible as an item"
+
+    assert overview["overall"] != "unknown"
+    assert overview.get("error") is None
+    assert overview.get("trace_id")
+    ai_item = next(item for item in overview["items"] if item["id"] == "ai.config")
+    assert ai_item["status"] == "error"
+    assert "RuntimeError" in ai_item["detail"]
+    assert not any(item["id"] == "diagnostics.overview" for item in overview["items"])
+
+
+def test_overview_normalizes_sqlite_naive_diagnostic_timestamps(db, monkeypatch, tmp_path):
+    """A SQLite round-trip drops tzinfo but must not abort the whole overview."""
+    monkeypatch.setattr(diagnostics, "is_gmail_configured", lambda s: True)
+    now = datetime.now(timezone.utc)
+    make_connected_account(db, expiry=now - timedelta(minutes=10))
+    db.add(Automation(
+        owner_id=1,
+        name="diagnostic schedule",
+        prompt="diagnostic only",
+        plan_json="{}",
+        status="enabled",
+        next_run_at=now - timedelta(minutes=10),
+    ))
+    db.commit()
+
+    heartbeat = tmp_path / "scheduler-heartbeat.json"
+    heartbeat.write_text(
+        json.dumps({"tick_at": (now - timedelta(seconds=10)).replace(tzinfo=None).isoformat()}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(diagnostics._DATA, "queue", tmp_path)
+    db.expire_all()  # Reload DateTime values through SQLite, without tzinfo.
+
+    overview = diagnostics.run_diagnostics(db)
+
+    assert overview["overall"] != "unknown"
+    assert overview.get("error") is None
+    assert not any(item["id"] == "diagnostics.overview" for item in overview["items"])
+    gmail_items = [item for item in overview["items"] if item["id"] == "gmail.oauth"]
+    assert len(gmail_items) == 1
+    assert gmail_items[0]["status"] == "info"
+    assert any(item["id"] == "automations.stuck" and item["status"] == "warn" for item in overview["items"])
 
 
 # ---------------------------------------------------------------------------
@@ -273,11 +337,13 @@ def test_gmail_states(db, monkeypatch, no_network):
     monkeypatch.setattr(di, "is_gmail_configured", lambda s: True)
     now = datetime.now(timezone.utc)
 
-    # expired + refresh token present => suspected (refresh NOT attempted)
+    # An expired access token plus a refresh token is still an operational
+    # Gmail connection.  Diagnostics are read-only and must not falsely ask
+    # for reauthorization.
     make_connected_account(db, expiry=now - timedelta(seconds=120), refresh=True)
     rep = di.investigate(db, target="gmail.oauth")["reports"][0]
-    assert rep["status"] == "suspected"
-    assert rep["root_cause"] == "token_expired_no_refresh"
+    assert rep["status"] == "healthy"
+    assert rep["root_cause"] is None
 
     # expired + no refresh token => confirmed
     acc = db.query(GmailAccount).first()
@@ -308,7 +374,19 @@ def test_gmail_never_refreshes_or_calls_gmail(db, monkeypatch, no_network):
     monkeypatch.setattr(di, "is_gmail_configured", lambda s: True)
     make_connected_account(db, expiry=datetime.now(timezone.utc) - timedelta(seconds=60))
     rep = di.investigate(db, target="gmail.oauth")["reports"][0]
-    assert rep["status"] in {"confirmed", "suspected"}
+    assert rep["status"] == "healthy"
+
+
+def test_overview_reports_expired_refreshable_gmail_token_once(db, monkeypatch):
+    monkeypatch.setattr(diagnostics, "is_gmail_configured", lambda s: True)
+    make_connected_account(db, expiry=datetime.now(timezone.utc) - timedelta(seconds=60), refresh=True)
+
+    overview = diagnostics.run_diagnostics(db)
+    gmail_items = [item for item in overview["items"] if item["id"] == "gmail.oauth"]
+
+    assert len(gmail_items) == 1
+    assert gmail_items[0]["status"] == "info"
+    assert "automatically" in gmail_items[0]["detail"]
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +453,14 @@ def test_frontend_has_no_polling_or_automount_fetch():
     assert "DIAGNOSTICS_POLL" not in main
     assert "pollDiagnostics" not in main
     assert "setInterval" not in main
+
+
+def test_frontend_rechecks_synthetic_overview_failure_instead_of_investigating_it():
+    root = Path(__file__).resolve().parents[2]
+    tsx = (root / "frontend" / "components" / "Diagnostics.tsx").read_text(encoding="utf-8")
+    assert 'const OVERVIEW_FAILURE_ID = "diagnostics.overview"' in tsx
+    assert "target === OVERVIEW_FAILURE_ID" in tsx
+    assert "await runCheck()" in tsx
 
 
 # ---------------------------------------------------------------------------

@@ -120,6 +120,9 @@ New-Item -ItemType Directory -Force -Path $desktopAppTarget | Out-Null
 Copy-Item -LiteralPath (Join-Path $root "desktop\main.cjs") -Destination $desktopAppTarget -Force
 Copy-Item -LiteralPath (Join-Path $root "desktop\preload.cjs") -Destination $desktopAppTarget -Force
 Copy-Item -LiteralPath (Join-Path $root "desktop\package.json") -Destination $desktopAppTarget -Force
+# Brand window/taskbar icon. main.cjs resolves it relative to __dirname, so it must
+# sit beside the copied entrypoints as resources/app/brand/app-icon.ico.
+Copy-Item -LiteralPath (Join-Path $root "desktop\brand") -Destination (Join-Path $desktopAppTarget "brand") -Recurse -Force
 
 if (Test-Path (Join-Path $pythonTarget "fastapi")) {
     Write-Output "Reusing existing relocatable Python package runtime."

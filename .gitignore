@@ -51,6 +51,10 @@ backend/tacwork/run/
 # ---------------- Bundled runtimes / binaries (~1.9 GB, NOT source) -------
 offline-cache/
 tools/
+!backend/app/tools/
+backend/app/tools/*
+!backend/app/tools/__init__.py
+!backend/app/tools/email_tools.py
 tacwork-runtime/
 installer/payload/
 installer/output/

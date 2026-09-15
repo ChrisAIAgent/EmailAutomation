@@ -118,6 +118,8 @@ GET /api/approvals?status=pending   # 当前待审批项
 ```
 
 - 读状态类问题（如“现在有几个 Contact / 收件箱还有几个未分拣 / 有没有 Campaign”）**直接查工具后回答，不要反过来问用户去确认本该由你查询的事实**。
+- 空 Campaign 列表是正常业务状态，不是缺少“Campaign 配置文件”。在用户已提供完整活动信息并明确授权时，直接调用 `ea_create_campaign`，不得搜索或等待配置文件。
+- `ea_generate_campaign_outreach` 超时属于结果未知。必须先读取 generation status、pending Approvals 和成员状态；`running` 时只等待/对账，终态 `failed`/`partial` 时停止。不得自动重试或复用旧状态作为新的调用结果；只有新的明确授权且成员仍为 active + queued、无对应 pending Approval 时才可再次调用生成工具。
 - 收件箱已分拣过时，`unsorted` 计数为 0，必须如实报告“收件箱已分拣，无可分拣项”，而不是凭旧印象说“分拣 N 个 unsorted thread”。任何规划都必须基于这次重新读取到的分类计数。
 - 对 Inbox 运营动作，`/api/inbox/stats.unprocessed` 是唯一的真实“尚未经过 AI 分拣”计数。历史 `triage_review` 记录虽然兼容展示为 `unsorted`，但已完成分析；不得把它们称为新同步邮件、不得据此建议再次分拣。
 - Gmail History 同步如遇短暂 TLS 或本机代理连接中断，系统会有限重试；若仍失败，History 游标保持不变。报告“同步暂时失败、可稍后重试”，不得凭旧队列数字声称同步出了新邮件。
@@ -320,6 +322,24 @@ use the Gmail `threadId`, the parent RFC `Message-ID` as `In-Reply-To`, the accu
 block Draft creation instead of silently starting a new conversation. Only a first
 Campaign outreach message starts a new Gmail thread.
 
+嵌入式 Agent 生成符合条件的 Inbox 回复时必须调用 `ea_generate_inbox_reply`；该工具只会在
+原 Gmail thread 中创建 Draft 和 pending Approval，绝不确认或发送。Campaign 成员移除必须调用
+`ea_remove_campaign_contact`；它停止该 Campaign 的后续工作并保留历史，不得视作 Suppression。
+
+用户可在生成后向 Agent 下达自然语言修改指令。Agent 必须先通过 `ea_list_approvals` 定位唯一的
+`pending` Approval；若“刚才那封/这封邮件”不能唯一对应 Approval ID，必须询问，不得默认批量修改。
+随后仅调用 `ea_revise_approval`，携带明确的 `approval_id`、`instruction` 和
+`user_authorized=true`。该工具只能原地更新已有 Approval 和 Gmail Draft，状态保持 `pending`，绝不
+创建第二个 Approval、确认或发送。Inbox 回复及 Campaign follow-up 必须保持原 Gmail thread Subject、
+`In-Reply-To` 与 `References`；只有 Campaign 首封可修改 Subject。修改指令是编辑偏好，不能覆盖
+Profile、已发布知识、客户语言、事实边界、联系人准入、Approval、suppression、发送窗口或限额。模型、
+线程上下文、质量或 Draft 更新失败时，必须如实报告并保留原内容，不得静默回退为忽略指令的模板。
+不得因修改失败、Draft 更新失败、超时或 `outreach_generated` 而调用 Approval invalidate、移除/重新加入
+Campaign 成员、重置成员状态或重新生成邮件。`outreach_generated` 表示首封 Draft 已生成，属于正常待审核
+状态。只有用户明确说明该邮件已过时或已发送时才能 invalidate；只有用户明确要求移除该成员时才能移除。
+每次修改成功后必须展示准确的收件人、主题和完整正文；用户确认该最终版本后才可走 Approval 或 frozen Run
+的正常发送确认。
+
 Customer queue rules:
 
 - All Customers = Contacts with at least one Gmail thread.
@@ -421,6 +441,11 @@ and block numeric or placeholder identities such as `Best, 1`, `Your Name`,
 Approval. Invalidation cancels its Draft; identical content remains blocked by
 idempotency, while genuinely corrected subject/body content may be recreated.
 
+`ea_revise_approval` is the one-Approval no-send correction path: it creates a
+sanitized `approval_revised` AuditLog record with hashes only, updates the linked
+Gmail Draft in place, then keeps the Approval pending for normal Web review. It
+does not persist the instruction as Campaign, Profile, or Knowledge Base policy.
+
 When Gmail sync shows repeated 401 refresh failures or
 `Gmail API retry exhausted`, stop writes and use the dashboard header to
 disconnect and reconnect Gmail. OAuth renewal does not delete operational data.
@@ -436,9 +461,19 @@ The Web sidebar's **Agent Takeover** switch is the operator's standing,
 revocable authorization for routine Global Inbox operations. While enabled,
 the backend scheduler creates a fresh TACWork root session at each selected
 interval and never reuses a previous operating conversation. Each session gets
-a short-lived capability token bound to the active takeover grant. The MCP
-bridge revalidates it before Gmail sync, Inbox triage, Campaign configuration, or starting an owned enabled Run. Disabling takeover revokes
-the token immediately, including for a session already in progress.
+a short-lived capability token bound to the active takeover grant in private
+system context, never in the visible session prompt, transcript, report, or MCP
+log. The MCP bridge revalidates it before Gmail sync, Inbox triage, Campaign
+configuration, or starting an owned enabled Run. Disabling takeover revokes the
+token immediately, including for a session already in progress.
+
+Campaign 和 Automation 的日常操作必须调用已注册的 typed `ea_*` MCP 工具；不得为
+查询成员、Campaign 生命周期或 Automation 配置而启动源码/API Explore。若需要的
+typed 工具未注册，报告精确缺口并停止，不得猜测 REST 路径或通过源码发现来绕过能力边界。
+某个 typed 工具返回错误不等于工具不存在：不得改用 REST、Shell、源码探索或猜测路径；
+不得自动重试。记录工具名和结构化错误，跳过该阶段并如实汇报。计划接管使用的
+状态、Dashboard、Inbox 和 daily-triage 读取同样携带私有 capability；读取失败也必须
+记为本周期 MCP-stage error，不能被空闲 Session 伪装成正常完成。
 
 Enabling takeover sets the owner Approval mode to `agent_review` and Global
 Inbox execution to `full_auto`; disabling restores `human_review` and
@@ -466,11 +501,19 @@ until the stack is started again. It is not a cloud wake-on-device service.
 
 Scheduled-session monitoring must use `GET /api/agent-takeover`, current Agent
 Run state, and the TACWork session snapshot together. The minute scheduler checks
-an active Session for idle state before evaluating the next due time; it then marks
-the cycle `completed`, clears only `active_session_id`, and retains
-`last_session_id` for history. Treat `current_stage=poll_agent_run:success` plus
-the completed Agent Run/report as business completion; never re-run a task solely
-because a display state has not yet converged.
+an active Session for idle state before evaluating the next due time. It marks a
+cycle `completed` only when no authorized MCP stage failed; otherwise it records
+`completed_with_errors`, preserves `last_error`, clears only `active_session_id`,
+and retains `last_session_id` for history. Treat `current_stage=poll_agent_run:success`
+plus the completed Agent Run/report as business completion; never re-run a task
+solely because a display state has not yet converged.
+
+The scheduled prompt uses `ea_takeover_status` as the authority for takeover
+permission, health, Gmail, pause and approval mode; `ea_dashboard` supplies queue
+metrics. If they conflict after one fresh re-read, the cycle must report
+`state_conflict` and make no write. Before its final report it must re-read
+`ea_takeover_status`; a stale or past `next_run_at` is reported as scheduler
+reconciliation pending, never as a future wake-up.
 
 While Takeover is enabled, it is the sole Global Inbox cadence owner. Global
 Automation remains enabled as business configuration but reports

@@ -19,6 +19,7 @@ Design rules (consistent with project conventions):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import urllib.request
@@ -31,6 +32,7 @@ from sqlalchemy import inspect, text
 
 from .config import _DATA, get_diagnostic_settings, is_gmail_configured, is_llm_configured
 from .consumer_status import read_consumer_status
+from .logging_config import get_trace_id
 from .models import Automation, GmailAccount, OAuthCredential
 from .redact import mask_email
 from .services import flags as flag_svc
@@ -44,6 +46,7 @@ _AUTOMATION_STALE_SECONDS = 5 * 60            # next_run_at older than this => s
 _DISK_WARN_BYTES = 2 * 1024**3                # < 2 GiB free => warn
 _DISK_ERROR_BYTES = 500 * 1024**2             # < 500 MiB free => error
 _TACWORK_TIMEOUT_SECONDS = 8
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass
@@ -56,6 +59,47 @@ class DiagnosticResult:
     remedy: Optional[str] = None
     latency_ms: Optional[float] = None
     ts: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Normalize persisted and file-backed timestamps for read-only checks.
+
+    SQLite does not preserve timezone information for ``DateTime`` columns.
+    Email Automation writes its persisted diagnostic timestamps in UTC, so a
+    naive value read back from SQLite (or a legacy heartbeat file) is UTC too.
+    Keep the normalization local to diagnostics: no data migration or write is
+    needed merely to inspect these values.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _append_probe_failure(
+    items: list[DiagnosticResult],
+    *,
+    id: str,
+    category: str,
+    label: str,
+    exc: Exception,
+    remedy: str = "Retry the manual check; use the trace id to inspect backend logs.",
+) -> None:
+    """Record one failed probe without exposing exception text or aborting peers."""
+    trace_id = get_trace_id()
+    _LOG.warning(
+        "diagnostics probe failed probe=%s trace_id=%s exception=%s",
+        id,
+        trace_id,
+        type(exc).__name__,
+    )
+    items.append(DiagnosticResult(
+        id=id,
+        category=category,
+        label=label,
+        status="error",
+        detail=f"probe failed: {type(exc).__name__} (trace={trace_id})",
+        remedy=remedy,
+    ))
 
 
 def _dir_state(path: str) -> dict:
@@ -158,91 +202,121 @@ def _run_diagnostics_inner(db) -> dict:
         ))
 
     # ---- 3. Queue / Huey consumer --------------------------------------
-    cs = read_consumer_status()
-    if cs.get("healthy"):
-        age = cs.get("age_seconds") or 0
-        status = "ok" if age <= 60 else "warn"
-        items.append(DiagnosticResult(
-            id="queue.consumer", category="queue",
-            label="Huey consumer", status=status,
-            detail=f"state={cs.get('state')}; heartbeat age={age}s; pid={cs.get('pid')}",
-            remedy=None if status == "ok" else "Consumer heartbeat is stale; restart the unified stack.",
-        ))
-    else:
-        items.append(DiagnosticResult(
-            id="queue.consumer", category="queue",
-            label="Huey consumer", status="error",
-            detail=f"state={cs.get('state')}; healthy={cs.get('healthy')}",
-            remedy="Start the Huey consumer (start-stack.ps1 / Email Automation.exe). Background jobs will not run until it is up.",
-        ))
+    try:
+        cs = read_consumer_status()
+        if cs.get("healthy"):
+            age = cs.get("age_seconds") or 0
+            status = "ok" if age <= 60 else "warn"
+            items.append(DiagnosticResult(
+                id="queue.consumer", category="queue",
+                label="Huey consumer", status=status,
+                detail=f"state={cs.get('state')}; heartbeat age={age}s; pid={cs.get('pid')}",
+                remedy=None if status == "ok" else "Consumer heartbeat is stale; restart the unified stack.",
+            ))
+        else:
+            items.append(DiagnosticResult(
+                id="queue.consumer", category="queue",
+                label="Huey consumer", status="error",
+                detail=f"state={cs.get('state')}; healthy={cs.get('healthy')}",
+                remedy="Start the Huey consumer (start-stack.ps1 / Email Automation.exe). Background jobs will not run until it is up.",
+            ))
+    except Exception as exc:
+        _append_probe_failure(
+            items, id="queue.consumer", category="queue", label="Huey consumer", exc=exc,
+        )
 
     # ---- 4. Gmail OAuth -------------------------------------------------
-    gmail_cfg = is_gmail_configured(s)
     account = None
     oauth_expiry: Optional[datetime] = None
-    if db_ok:
-        account = (
-            db.query(GmailAccount)
-            .filter(GmailAccount.is_connected == True, GmailAccount.oauth != None)  # noqa: E711
-            .first()
-        )
-        if account and account.oauth and account.oauth.token_expiry:
-            oauth_expiry = account.oauth.token_expiry
-    if not gmail_cfg:
-        items.append(DiagnosticResult(
-            id="gmail.oauth", category="gmail",
-            label="Gmail OAuth", status="info",
-            detail="Google OAuth not configured (no client id/secret).",
-        ))
-    elif not account:
-        items.append(DiagnosticResult(
-            id="gmail.oauth", category="gmail",
-            label="Gmail OAuth", status="error",
-            detail="OAuth credentials are configured but no Gmail account is connected.",
-            remedy="Connect a Gmail account in Settings (authorize via Google).",
-        ))
-    else:
-        expiry_note = ""
-        if oauth_expiry:
-            secs = (oauth_expiry - now).total_seconds()
-            if secs <= 0:
-                items.append(DiagnosticResult(
-                    id="gmail.oauth", category="gmail",
-                    label="Gmail OAuth", status="warn",
-                    detail=f"token expired {abs(int(secs))}s ago; refresh will be attempted on next call",
-                    remedy="A fresh API call triggers token refresh; if it fails, re-authorize the account.",
-                ))
-                expiry_note = ""
-            elif secs <= _TOKEN_EXPIRY_WARN_SECONDS:
-                expiry_note = f"; token expires in {int(secs)}s (will auto-refresh)"
-                items.append(DiagnosticResult(
-                    id="gmail.oauth", category="gmail",
-                    label="Gmail OAuth", status="warn",
-                    detail=f"connected as {mask_email(account.email)}{expiry_note}",
-                    remedy="Token is near expiry; ensure the refresh token is valid or re-authorize soon.",
-                ))
-        if not expiry_note:
+    try:
+        gmail_cfg = is_gmail_configured(s)
+        if db_ok:
+            account = (
+                db.query(GmailAccount)
+                .filter(GmailAccount.is_connected == True, GmailAccount.oauth != None)  # noqa: E711
+                .first()
+            )
+            if account and account.oauth and account.oauth.token_expiry:
+                oauth_expiry = account.oauth.token_expiry
+        if not gmail_cfg:
             items.append(DiagnosticResult(
                 id="gmail.oauth", category="gmail",
-                label="Gmail OAuth", status="ok",
-                detail=f"connected as {mask_email(account.email)}",
+                label="Gmail OAuth", status="info",
+                detail="Google OAuth not configured (no client id/secret).",
             ))
+        elif not account:
+            items.append(DiagnosticResult(
+                id="gmail.oauth", category="gmail",
+                label="Gmail OAuth", status="error",
+                detail="OAuth credentials are configured but no Gmail account is connected.",
+                remedy="Connect a Gmail account in Settings (authorize via Google).",
+            ))
+        else:
+            has_refresh = bool(account.oauth and account.oauth.refresh_token_enc)
+            if oauth_expiry:
+                secs = (_as_utc(oauth_expiry) - now).total_seconds()
+                if secs <= 0 and has_refresh:
+                    # Access-token expiry is expected in a refresh-token OAuth
+                    # flow.  This read-only check must not misreport a connected
+                    # account as failed merely because it cannot refresh here.
+                    items.append(DiagnosticResult(
+                        id="gmail.oauth", category="gmail",
+                        label="Gmail OAuth", status="info",
+                        detail=(f"connected as {mask_email(account.email)}; cached access token is expired "
+                                "and will refresh automatically before the next Gmail call"),
+                    ))
+                elif secs <= 0:
+                    items.append(DiagnosticResult(
+                        id="gmail.oauth", category="gmail",
+                        label="Gmail OAuth", status="warn",
+                        detail=f"access token expired {abs(int(secs))}s ago and no refresh token is available",
+                        remedy="Re-authorize the Gmail account.",
+                    ))
+                elif secs <= _TOKEN_EXPIRY_WARN_SECONDS:
+                    items.append(DiagnosticResult(
+                        id="gmail.oauth", category="gmail",
+                        label="Gmail OAuth", status="info",
+                        detail=(f"connected as {mask_email(account.email)}; access token expires in "
+                                f"{int(secs)}s and will auto-refresh"),
+                    ))
+                else:
+                    items.append(DiagnosticResult(
+                        id="gmail.oauth", category="gmail",
+                        label="Gmail OAuth", status="ok",
+                        detail=f"connected as {mask_email(account.email)}",
+                    ))
+            else:
+                items.append(DiagnosticResult(
+                    id="gmail.oauth", category="gmail",
+                    label="Gmail OAuth", status="ok",
+                    detail=f"connected as {mask_email(account.email)}",
+                ))
+    except Exception as exc:
+        account = None
+        _append_probe_failure(
+            items, id="gmail.oauth", category="gmail", label="Gmail OAuth", exc=exc,
+        )
 
     # ---- 5. AI / LLM configuration -------------------------------------
-    ai_cfg = bool(peek_email_config(db)) or is_llm_configured(s)
-    if ai_cfg:
-        items.append(DiagnosticResult(
-            id="ai.config", category="ai",
-            label="AI / LLM", status="ok",
-            detail=f"provider configured (model={s.effective_llm_model or 'n/a'})",
-        ))
-    else:
-        items.append(DiagnosticResult(
-            id="ai.config", category="ai",
-            label="AI / LLM", status="error",
-            detail="No AI provider key/model configured.",
-            remedy="Set the Email Agent LLM Base URL, model and API key in Agent Settings.",
-        ))
+    try:
+        ai_cfg = bool(peek_email_config(db)) or is_llm_configured(s)
+        if ai_cfg:
+            items.append(DiagnosticResult(
+                id="ai.config", category="ai",
+                label="AI / LLM", status="ok",
+                detail=f"provider configured (model={s.effective_llm_model or 'n/a'})",
+            ))
+        else:
+            items.append(DiagnosticResult(
+                id="ai.config", category="ai",
+                label="AI / LLM", status="error",
+                detail="No AI provider key/model configured.",
+                remedy="Set the Email Agent LLM Base URL, model and API key in Agent Settings.",
+            ))
+    except Exception as exc:
+        _append_probe_failure(
+            items, id="ai.config", category="ai", label="AI / LLM", exc=exc,
+        )
 
     # ---- 6. Scheduler ---------------------------------------------------
     enabled = bool(s.ENABLE_SCHEDULER)
@@ -252,7 +326,8 @@ def _run_diagnostics_inner(db) -> dict:
     if hb_path.exists():
         try:
             hb = json.loads(hb_path.read_text(encoding="utf-8"))
-            hb_age = max(0.0, (now - datetime.fromisoformat(hb["tick_at"])).total_seconds())
+            heartbeat_at = _as_utc(datetime.fromisoformat(hb["tick_at"]))
+            hb_age = max(0.0, (now - heartbeat_at).total_seconds())
         except Exception:
             hb_age = None
     if not enabled:
@@ -284,42 +359,52 @@ def _run_diagnostics_inner(db) -> dict:
 
     # ---- 7. Automations (stuck detection) ------------------------------
     if db_ok:
-        autos = db.query(Automation).filter(Automation.status == "enabled").all()
-        enabled_count = len(autos)
-        stale = [
-            a.id for a in autos
-            if a.next_run_at and (a.next_run_at - now).total_seconds() < -_AUTOMATION_STALE_SECONDS
-        ]
-        if stale:
-            items.append(DiagnosticResult(
-                id="automations.stuck", category="automations",
-                label="Automations", status="warn",
-                detail=f"{enabled_count} enabled; {len(stale)} have a past-due schedule (ids: {stale[:5]}) — scheduler may be stuck",
-                remedy="Verify the scheduler heartbeat; a dead scheduler leaves enabled automations unscheduled.",
-            ))
-        else:
-            items.append(DiagnosticResult(
-                id="automations.stuck", category="automations",
-                label="Automations", status="ok",
-                detail=f"{enabled_count} enabled, none past-due",
-            ))
+        try:
+            autos = db.query(Automation).filter(Automation.status == "enabled").all()
+            enabled_count = len(autos)
+            stale = [
+                a.id for a in autos
+                if a.next_run_at and (_as_utc(a.next_run_at) - now).total_seconds() < -_AUTOMATION_STALE_SECONDS
+            ]
+            if stale:
+                items.append(DiagnosticResult(
+                    id="automations.stuck", category="automations",
+                    label="Automations", status="warn",
+                    detail=f"{enabled_count} enabled; {len(stale)} have a past-due schedule (ids: {stale[:5]}) — scheduler may be stuck",
+                    remedy="Verify the scheduler heartbeat; a dead scheduler leaves enabled automations unscheduled.",
+                ))
+            else:
+                items.append(DiagnosticResult(
+                    id="automations.stuck", category="automations",
+                    label="Automations", status="ok",
+                    detail=f"{enabled_count} enabled, none past-due",
+                ))
+        except Exception as exc:
+            _append_probe_failure(
+                items, id="automations.stuck", category="automations", label="Automations", exc=exc,
+            )
 
     # ---- 8. Agent Takeover / TACWork -----------------------------------
-    takeover_enabled = flag_svc.is_agent_takeover_enabled(db) if db_ok else False
-    if not takeover_enabled:
-        items.append(DiagnosticResult(
-            id="tacwork.connection", category="tacwork",
-            label="Agent Takeover / TACWork", status="info",
-            detail="Agent takeover is disabled.",
-        ))
-    else:
-        ok, detail = _tacwork_health(s)
-        items.append(DiagnosticResult(
-            id="tacwork.connection", category="tacwork",
-            label="Agent Takeover / TACWork", status="ok" if ok else "error",
-            detail=f"enabled; server {s.TACWORK_SERVER_URL} -> {detail}",
-            remedy=None if ok else "Start the embedded TACWork runtime (Email Automation.exe manages it).",
-        ))
+    try:
+        takeover_enabled = flag_svc.is_agent_takeover_enabled(db) if db_ok else False
+        if not takeover_enabled:
+            items.append(DiagnosticResult(
+                id="tacwork.connection", category="tacwork",
+                label="Agent Takeover / TACWork", status="info",
+                detail="Agent takeover is disabled.",
+            ))
+        else:
+            ok, detail = _tacwork_health(s)
+            items.append(DiagnosticResult(
+                id="tacwork.connection", category="tacwork",
+                label="Agent Takeover / TACWork", status="ok" if ok else "error",
+                detail=f"enabled; server {s.TACWORK_SERVER_URL} -> {detail}",
+                remedy=None if ok else "Start the embedded TACWork runtime (Email Automation.exe manages it).",
+            ))
+    except Exception as exc:
+        _append_probe_failure(
+            items, id="tacwork.connection", category="tacwork", label="Agent Takeover / TACWork", exc=exc,
+        )
 
     # ---- 9. Knowledge base ---------------------------------------------
     try:
@@ -342,26 +427,31 @@ def _run_diagnostics_inner(db) -> dict:
     # ---- 10. Sending safety --------------------------------------------
     # An empty RESTRICTED_RECIPIENT_ALLOWLIST is a *supported* configuration:
     # the policy engine only enforces the allowlist when it is configured.
-    real_send = is_real_send_enabled(s, account, account.oauth if account else None) if account else False
-    allowlist = s.recipient_allowlist
-    if not real_send:
-        items.append(DiagnosticResult(
-            id="sending.safety", category="sending",
-            label="Sending", status="info",
-            detail="real send disabled (safe default).",
-        ))
-    elif not allowlist:
-        items.append(DiagnosticResult(
-            id="sending.safety", category="sending",
-            label="Sending", status="info",
-            detail="real send enabled; RESTRICTED_RECIPIENT_ALLOWLIST is empty (no allowlist configured).",
-        ))
-    else:
-        items.append(DiagnosticResult(
-            id="sending.safety", category="sending",
-            label="Sending", status="ok",
-            detail=f"real send enabled; RESTRICTED_RECIPIENT_ALLOWLIST has {len(allowlist)} address(es).",
-        ))
+    try:
+        real_send = is_real_send_enabled(s, account, account.oauth if account else None) if account else False
+        allowlist = s.recipient_allowlist
+        if not real_send:
+            items.append(DiagnosticResult(
+                id="sending.safety", category="sending",
+                label="Sending", status="info",
+                detail="real send disabled (safe default).",
+            ))
+        elif not allowlist:
+            items.append(DiagnosticResult(
+                id="sending.safety", category="sending",
+                label="Sending", status="info",
+                detail="real send enabled; RESTRICTED_RECIPIENT_ALLOWLIST is empty (no allowlist configured).",
+            ))
+        else:
+            items.append(DiagnosticResult(
+                id="sending.safety", category="sending",
+                label="Sending", status="ok",
+                detail=f"real send enabled; RESTRICTED_RECIPIENT_ALLOWLIST has {len(allowlist)} address(es).",
+            ))
+    except Exception as exc:
+        _append_probe_failure(
+            items, id="sending.safety", category="sending", label="Sending", exc=exc,
+        )
 
     # ---- 11. Disk space ------------------------------------------------
     try:
@@ -407,6 +497,7 @@ def _run_diagnostics_inner(db) -> dict:
 
     return {
         "generated_at": now.isoformat(),
+        "trace_id": get_trace_id(),
         "overall": overall,
         "counts": counts,
         "items": [asdict(i) for i in items],
@@ -428,6 +519,7 @@ def run_diagnostics(db) -> dict:
         )
         return {
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "trace_id": get_trace_id(),
             "overall": "unknown",
             "counts": {"ok": 0, "warn": 0, "error": 1, "info": 0, "unknown": 0},
             "items": [asdict(failure)],

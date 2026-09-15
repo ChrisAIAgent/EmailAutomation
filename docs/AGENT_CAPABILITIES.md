@@ -27,9 +27,11 @@ Approve / Reject / Agent Decide.
 | Review Approval mode | `ea_get_profile` | `GET /api/agent-profile?create_if_missing=false` | Read `approval_mode` before any send-capable task |
 | Set Approval mode | `ea_set_approval_mode` | `PUT /api/agent-profile/approval-mode` | High-impact write; requires `user_authorized=true` |
 | Review Approvals | `ea_list_approvals` | `GET /api/approvals` | Read-only |
+| Revise one pending Approval | `ea_revise_approval` | `POST /api/approvals/{id}/revise` | Explicitly authorized, no-send edit of the existing Approval and Gmail Draft; never creates a second Approval |
 | Review Automations | `ea_list_automations` | `GET /api/automation` | Read-only |
 | Review operating state | `ea_dashboard` | readiness, metrics, Inbox stats, scheduler | Read-only |
 | Review Inbox queue | `ea_list_inbox` | `GET /api/inbox/threads` | `contact_admission_uncertain` is Contact admission; `content_uncertain` is no-action automatically for an existing Contact. Use Inbox `unprocessed` for actual untriaged work; legacy `triage_review` records are already analyzed even if their display category is `unsorted`. |
+| Generate eligible Inbox reply | `ea_generate_inbox_reply` | `POST /api/inbox/threads/{id}/generate-reply` | Creates a thread-bound Gmail Draft and pending Approval; never confirms or sends mail |
 | Review Agent Run | `ea_get_agent_run` | `GET /api/agent-runs/{id}` | Read-only |
 | Generate live report | `ea_agent_report` | current read endpoints | Read-only aggregation |
 | Check first import | `ea_gmail_import_status` | `GET /api/gmail/imports/current` | Read-only; reports required/running/completed and progress |
@@ -49,10 +51,17 @@ Approve / Reject / Agent Decide.
 | Create Contact from Inbox form | REST only | `POST /api/inbox/threads/{id}/contact` | Completes Approve; no reply/send side effect |
 | Review/revoke non-customer filter | REST only | `GET/DELETE /api/inbox/non-customer-filters[/{id}]` | Separate from outbound Suppression |
 | Preview/import Contacts | `ea_import_contacts` | `POST /api/contacts/import` | Workspace CSV/XLSX only |
-| Create Campaign | `ea_create_campaign` | `POST /api/campaigns` | Configuration write; no send |
-| Review Campaign members | REST only | `GET /api/campaigns/{id}/contacts?include_removed=true` | Read current and historical membership; no write |
-| Add/re-add Campaign members | REST only | `POST /api/campaigns/{id}/contacts` | Explicit configuration write; reuses historical membership |
-| Remove Campaign member | REST only | `DELETE /api/campaigns/{id}/contacts/{contact_id}` | Stops future Campaign work, preserves history, cancels unsent items; never creates Suppression |
+| Create Campaign | `ea_create_campaign` | `POST /api/campaigns` | Configuration write; an empty list is normal and never means a configuration file is missing |
+| Review one Campaign | `ea_get_campaign` | `GET /api/campaigns/{id}` | Read-only |
+| Review Campaign members | `ea_list_campaign_members` | `GET /api/campaigns/{id}/contacts?include_removed=true` | Read current and historical membership; no write |
+| Add/re-add Campaign members | `ea_add_campaign_contacts` | `POST /api/campaigns/{id}/contacts` | Explicit configuration write; reuses historical membership |
+| Remove Campaign member | `ea_remove_campaign_contact` | `DELETE /api/campaigns/{id}/contacts/{contact_id}` | Only after a direct operator removal request and an explicit destructive-action confirmation; stops future Campaign work and cancels unsent items |
+| Update / start / pause / stop Campaign | `ea_update_campaign`, `ea_start_campaign`, `ea_pause_campaign`, `ea_stop_campaign` | Campaign API | Configuration/lifecycle writes; no send by themselves |
+| Generate Campaign outreach | `ea_generate_campaign_outreach` | `POST /api/campaigns/{id}/generate` | Creates Drafts and pending Approvals; never report this as sent |
+| Review Campaign generation | `ea_get_campaign_generation` | `GET /api/campaigns/{id}/generation-status` | Read-only; reconcile after a timeout; never starts a second generation |
+| Review Automation | `ea_get_automation` | `GET /api/automation/{id}` | Read-only |
+| Generate / create Automation | `ea_generate_automation_plan`, `ea_create_automation` | `POST /api/automation/generate`, `POST /api/automation` | Plan generation and configuration only |
+| Enable / pause / schedule Automation | `ea_enable_automation`, `ea_pause_automation`, `ea_schedule_automation` | Automation API | Changes configuration; a later Run remains policy-gated |
 | Start Automation Run | `ea_start_agent_run` | `POST /api/agent-runs` | Read global `approval_mode` first; `human_review` forces `semi_auto` |
 | Confirm frozen Run | `ea_confirm_run` | `POST /api/agent-runs/{id}/confirm` | Send-capable; exact-plan confirmation |
 | Cancel frozen Run | `ea_cancel_run` | `POST /api/agent-runs/{id}/cancel` | No send |
@@ -64,13 +73,19 @@ Approve / Reject / Agent Decide.
 
 - Call the three health/status tools before a write action.
 - Direct TACWork write tools require `user_authorized=true` after explicit user authorization. A valid, active Agent Takeover capability is standing authorization for its allowed operating tools, except Contact admission which always remains human-only.
+- For routine Campaign and Automation work, use the typed `ea_*` tool listed above. Do not start source-code/API exploration to discover an ordinary member, Campaign, or Automation operation. If a required typed capability is unavailable, report the exact missing operation and stop before writing.
+- In a scheduled Agent Takeover session, a typed-tool error is not evidence that the tool is unavailable. Do not switch to REST, Shell, source exploration, or a guessed endpoint, and do not automatically retry. Report the tool name and structured error, skip that stage, and never claim it completed. Scheduled status, Dashboard, Inbox and daily-triage reads carry the private takeover context too, so their failure is recorded as an MCP-stage error rather than being hidden by a later idle Session.
+- An empty Campaign list is a normal create-ready state, not a missing Campaign configuration file. When the user has supplied complete Campaign information and explicit authorization, call `ea_create_campaign` directly.
+- A timeout from `ea_generate_campaign_outreach` is **result unknown**, not proof that no Draft exists. First read `ea_get_campaign_generation`, `ea_list_approvals`, and `ea_list_campaign_members`: for `running`, wait and reconcile; for terminal `failed` or `partial`, stop and report the real result. Never retry automatically or reuse an old generation-status as a new call result. A new generate call requires new explicit user authorization plus confirmation of active + queued members and no corresponding pending Approval.
+- Use `ea_generate_inbox_reply` only for a thread already admitted and eligible for reply. It creates a Draft and pending Approval in the original Gmail thread; show/review the result under the normal Approval contract before any send.
+- To revise generated copy from a user instruction, first use `ea_list_approvals` and identify exactly one `pending` Approval. If the target is ambiguous, ask which Approval to revise; never infer a Campaign-wide batch. Call `ea_revise_approval` with `user_authorized=true`. It updates the existing Draft and Approval only, leaves it `pending`, and never confirms or sends. Inbox replies retain their Gmail thread Subject, `In-Reply-To`, and `References`; only first Campaign outreach may revise its subject. If the revision cannot be applied, report the failure and leave the existing content unchanged. Do not invalidate the Approval, remove/re-add the Campaign member, reset `outreach_generated`, or regenerate to recover from a revision failure.
 - Before `ea_confirm_run`, show exact recipients, subject and full frozen body.
 - In `human_review`, do not represent a prepared Run as sent: wait for a person to confirm the exact frozen plan. In `agent_review`, `full_auto` may dispatch after server safeguards; never use it as a harmless test.
 - HTTP 200, queued/running, Draft or Approval creation is not proof of sending.
 - An unsubscribe creates Suppression only for an existing Contact, verified direct human, or Campaign recipient; footer text in unknown/filtered mail is not an opt-out event.
 - Contact admission always precedes sales reply and follow-up. `full_auto` does not bypass an unresolved admission decision.
 - Reject is a reversible CRM/Inbox exclusion by exact sender email. It is not unsubscribe, does not create Suppression, and does not authorize any send.
-- Approval Reject cancels its unsent Draft; Invalidate expires an obsolete or already-sent pending Approval and also cancels its unsent Draft. Neither action sends email.
+- Approval Reject cancels its unsent Draft; Invalidate expires an explicitly operator-identified obsolete or already-sent pending Approval and also cancels its unsent Draft. Neither action sends email. A revision, Draft-update, timeout, or generation failure is never an invalidation reason.
 - `contact_admission_uncertain` offers Approve / Reject / Agent Decide and is resolved at sender level. `content_uncertain` means special content (for example job, forwarded, or scripted content) cannot be safely classified; it creates no reply or send. For an existing Contact it is automatically recorded as no-action and never appears in the review queue. `opt_out_confirmation` remains a stop-contact decision. `stale_review` is cleared locally; none of these is an instruction for a human to reply.
 - The bridge never reads or returns `.env`, model keys, OAuth tokens or Gmail credentials.
 - The first mailbox import is a one-time, user-authorized local ingestion of all
@@ -92,11 +107,21 @@ OpenCode starts `scripts/mcp_server.py` with bundled Python. The transition defa
 API is `http://127.0.0.1:18000`; Electron/launchers always provide the selected
 loopback address through `EMAIL_AUTOMATION_API_URL`.
 For scheduled Agent Takeover, the bridge accepts the short-lived takeover grant
-for Gmail incremental sync, daily triage creation/control/monitoring and the
-owner's Global Inbox Run. Contact admission remains human-only; the grant never
-bypasses any server safety gate. `logs/mcp-server.log` is the
+for Gmail incremental sync, daily triage creation/control/monitoring, same-owner
+Campaign configuration, Automation configuration, and an owned enabled Run.
+Contact admission remains human-only; the grant never bypasses any server safety
+gate. `logs/mcp-server.log` is the
 minimal local diagnostic for bridge startup and tool/protocol errors. It must never
 contain a grant, API key, OAuth credential, recipient, or email content.
+
+The scheduled session's grant is injected through private TACWork system context,
+not its user-visible prompt or report. `ea_takeover_status` is authoritative for
+the current grant, health, Gmail, pause and approval mode; `ea_dashboard` is the
+queue-metrics source. On a persistent conflict, scheduled takeover reports
+`state_conflict` and performs no write. At the end of a cycle it refreshes
+`ea_takeover_status`; a missing or past next-run timestamp means scheduler
+reconciliation is pending. A finished TACWork session with an MCP-stage error is
+reported as `completed_with_errors`, not `completed`.
 
 ## Diagnostics: future Agent-Native interface (reserved, not implemented)
 

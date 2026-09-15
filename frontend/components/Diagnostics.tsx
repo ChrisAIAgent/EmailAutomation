@@ -22,6 +22,7 @@ const INVESTIGATE_STATUS: Record<string, string> = {
   healthy: "text-ok",
   unknown: "text-muted",
 };
+const OVERVIEW_FAILURE_ID = "diagnostics.overview";
 
 function overallLabel(overall: string | undefined, zh: boolean): { text: string; cls: string } {
   if (overall === "error") return { text: zh ? "存在异常" : "Issues found", cls: "border-danger text-danger" };
@@ -56,6 +57,12 @@ export default function Diagnostics() {
   };
 
   const runInvestigate = async (target: string) => {
+    // The overview failure item is synthetic, not an individual collector.
+    // Re-running the manual overview is the only meaningful action here.
+    if (target === OVERVIEW_FAILURE_ID) {
+      await runCheck();
+      return;
+    }
     setInvestigating(target);
     setInvestigateError(null);
     try {
@@ -125,6 +132,9 @@ export default function Diagnostics() {
               <span className="text-sm text-muted">
                 {zh ? "生成于" : "Generated"}: {overview.generated_at}
               </span>
+              {overview.overall === "unknown" && overview.trace_id && (
+                <span className="text-xs text-muted">Trace ID: {overview.trace_id}</span>
+              )}
               <span className="ml-auto flex gap-3 text-xs font-medium">
                 <span className="text-ok">OK {overview.counts.ok}</span>
                 <span className="text-warn">WARN {overview.counts.warn}</span>
@@ -146,11 +156,13 @@ export default function Diagnostics() {
                     key={item.id}
                     type="button"
                     className="btn text-xs"
-                    onClick={() => runInvestigate(item.id)}
-                    disabled={investigating === item.id}
+                    onClick={() => item.id === OVERVIEW_FAILURE_ID ? runCheck() : runInvestigate(item.id)}
+                    disabled={item.id === OVERVIEW_FAILURE_ID ? checking : investigating === item.id}
                   >
-                    <Search size={13} />
-                    {investigating === item.id ? (zh ? "诊断中…" : "Investigating…") : `${t("diag_this")}: ${item.label}`}
+                    {item.id === OVERVIEW_FAILURE_ID ? <Play size={13} /> : <Search size={13} />}
+                    {item.id === OVERVIEW_FAILURE_ID
+                      ? (checking ? (zh ? "体检中…" : "Checking…") : (zh ? "重新体检：总览诊断" : "Re-check: Diagnostics overview"))
+                      : (investigating === item.id ? (zh ? "诊断中…" : "Investigating…") : `${t("diag_this")}: ${item.label}`)}
                   </button>
                 ))}
               </div>
@@ -162,6 +174,7 @@ export default function Diagnostics() {
               const meta = STATUS_META[item.status] || STATUS_META.info;
               const Icon = meta.icon;
               const report = reports[item.id];
+              const isOverviewFailure = item.id === OVERVIEW_FAILURE_ID;
               return (
                 <div key={item.id} className="card flex flex-col gap-2">
                   <div className="flex items-center justify-between gap-2">
@@ -181,7 +194,7 @@ export default function Diagnostics() {
 
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-[11px] text-muted/70">{item.category}</span>
-                    {item.status !== "ok" && (
+                    {item.status !== "ok" && !isOverviewFailure && (
                       <button
                         type="button"
                         className="btn text-xs"
@@ -191,6 +204,11 @@ export default function Diagnostics() {
                         <Search size={13} />
                         {investigating === item.id ? (zh ? "诊断中…" : "Investigating…") : t("diag_this")}
                       </button>
+                    )}
+                    {isOverviewFailure && (
+                      <span className="text-xs text-muted">
+                        {zh ? "请重新体检；若持续失败，请使用上方 Trace ID 查看日志。" : "Re-check the overview; if it persists, inspect logs with the Trace ID above."}
+                      </span>
                     )}
                   </div>
 

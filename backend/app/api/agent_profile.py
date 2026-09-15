@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..services.agent_profile import get_or_create_profile
+from ..services.agent_profile import get_or_create_profile, validate_profile_signature
 from ..services import ai_config as ai_config_svc
 from .deps import ensure_owner, get_db
 
@@ -74,6 +74,10 @@ def get_profile(
 
 @router.put("")
 def update_profile(payload: AgentProfileUpdate, actor: str = "user", db: Session = Depends(get_db)):
+    try:
+        validate_profile_signature(payload.agent_name, payload.company_name, payload.signature_text)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     owner_id = ensure_owner(db)
     row = get_or_create_profile(db, owner_id)
     for key, value in payload.model_dump().items():
@@ -126,7 +130,9 @@ def _safe_provider_url(value: str) -> str:
 
 
 def _build_email_config(payload: EmailAIConfigUpdate, db: Session) -> "ai_config_svc.EmailAIConfig":
-    current = ai_config_svc.load_email(db)
+    current, state = ai_config_svc.email_config_state(db, migrate_legacy=True)
+    if state.get("source") != "db" and not (payload.api_key or "").strip():
+        raise HTTPException(status_code=422, detail="api_key_required_for_new_or_unreadable_credential")
     key = (payload.api_key or "").strip() or current.api_key
     if not key:
         raise HTTPException(status_code=422, detail="api_key_required")
@@ -141,7 +147,8 @@ def _build_email_config(payload: EmailAIConfigUpdate, db: Session) -> "ai_config
 
 @router.get("/email-ai-config")
 def get_email_ai_config(db: Session = Depends(get_db)):
-    return ai_config_svc.public_email(ai_config_svc.load_email(db))
+    config, state = ai_config_svc.email_config_state(db, migrate_legacy=True)
+    return ai_config_svc.public_email(config, state)
 
 
 @router.post("/email-ai-config/test")
@@ -170,4 +177,7 @@ def update_email_ai_config(payload: EmailAIConfigUpdate, db: Session = Depends(g
     ai_config_svc.save_email(db, cfg)
     db.add(models.AuditLog(actor="user", action="email_ai_config_updated", entity="system_config", detail=f"provider={cfg.provider_name}; model={cfg.model}"))
     db.commit()
-    return ai_config_svc.public_email(cfg)
+    return ai_config_svc.public_email(cfg, {
+        "source": "db", "db_config_present": True, "db_config_readable": True,
+        "usable": True, "error_code": None,
+    })

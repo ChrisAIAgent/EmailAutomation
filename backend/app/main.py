@@ -16,7 +16,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .config import get_settings, is_gmail_configured, is_llm_configured, _DATA
-from .services.ai_config import peek_email_config
+from .services.ai_config import email_config_state
 from .consumer_status import read_consumer_status
 from .db import init_db, SessionLocal
 from .events import queue as event_queue
@@ -199,6 +199,7 @@ def health(db: Session = Depends(get_db)):
     gmail_connected = bool(
         gmail_account and gmail_account.is_connected and gmail_account.oauth
     )
+    _llm_config, llm_state = email_config_state(db)
     return {
         "status": "ok" if db_ok else "error",
         "db_ok": db_ok,
@@ -211,7 +212,8 @@ def health(db: Session = Depends(get_db)):
         "gmail_connected": gmail_connected,
         "gmail_account": gmail_account.email if gmail_account else None,
         "global_pause": flag_svc.is_globally_paused(db),
-        "llm_configured": bool(peek_email_config(db)) or is_llm_configured(settings),
+        "llm_configured": bool(llm_state["usable"]),
+        "llm_config": llm_state,
         "consumer": read_consumer_status(),
     }
 

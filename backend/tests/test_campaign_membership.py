@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from app import models
+from app.services import approvals as approval_svc
 from app.services import followup as followup_svc
 
 
@@ -153,3 +154,88 @@ def test_campaign_limits_reject_invalid_values(client):
     assert bad_daily.status_code == 422
     bad_followups = client.post("/api/campaigns", json={"name": "Bad", "max_follow_ups": -1})
     assert bad_followups.status_code == 422
+
+
+def test_archiving_campaign_closes_pending_work_and_cannot_restart(client, db):
+    campaign, contact, member = _campaign_member(db, status="outreach_generated")
+    removed_contact = models.Contact(
+        owner_id=1, email="removed@example.com", first_name="Removed",
+        category="qualified", status="new",
+    )
+    db.add(removed_contact); db.flush()
+    removed_member = models.CampaignContact(
+        campaign_id=campaign.id, contact_id=removed_contact.id, status="queued",
+        membership_active=False, removed_at=datetime.now(timezone.utc),
+        removed_reason="operator_removed_from_campaign",
+    )
+    account = models.GmailAccount(user_id=1, email="sender@example.com", is_connected=True)
+    db.add_all([removed_member, account]); db.flush()
+    draft = models.EmailDraft(
+        gmail_account_id=account.id, campaign_contact_id=member.id,
+        to_email=contact.email, subject="Hello", body_text="Body", status="draft",
+    )
+    db.add(draft); db.flush()
+    approval = models.Approval(
+        kind="first_send", campaign_id=campaign.id, campaign_contact_id=member.id,
+        draft_id=draft.id, to_email=contact.email, subject="Hello", body_text="Body",
+        status="pending",
+    )
+    historical_reply = models.Approval(
+        kind="reply", campaign_id=campaign.id, campaign_contact_id=None,
+        to_email="customer@example.com", subject="Re: Existing thread",
+        body_text="Reply", status="pending",
+    )
+    task = models.FollowUpTask(
+        campaign_contact_id=member.id, contact_id=contact.id, campaign_id=campaign.id,
+        sequence=1, scheduled_at=datetime.now(timezone.utc), status="ready",
+    )
+    db.add_all([approval, historical_reply, task]); db.commit()
+
+    campaign.status = "paused"
+    db.commit()
+    paused_decision = approval_svc.decide_approval(db, approval.id, "approve")
+    assert paused_decision == {
+        "ok": False, "blocked": "campaign_paused", "status": "pending",
+    }
+    db.refresh(draft); db.refresh(approval)
+    assert draft.status == "draft"
+    assert approval.status == "pending"
+    campaign.status = "active"
+    db.commit()
+
+    archived = client.delete(f"/api/campaigns/{campaign.id}")
+    assert archived.status_code == 200, archived.text
+    db.refresh(campaign); db.refresh(member); db.refresh(removed_member)
+    db.refresh(draft); db.refresh(approval); db.refresh(historical_reply); db.refresh(task)
+    assert campaign.status == "archived"
+    assert member.membership_active is False
+    assert member.removed_reason == "campaign_archived"
+    assert removed_member.removed_reason == "operator_removed_from_campaign"
+    assert draft.status == "cancelled"
+    assert approval.status == "expired"
+    assert approval.rejection_reason == "campaign_archived"
+    assert historical_reply.status == "pending"
+    assert task.status == "cancelled"
+    assert task.last_error == "campaign_archived"
+
+    restart = client.post(f"/api/campaigns/{campaign.id}/start")
+    assert restart.status_code == 409
+    assert restart.json()["detail"] == "campaign_archived"
+    generate = client.post(f"/api/campaigns/{campaign.id}/generate")
+    assert generate.status_code == 409
+    assert generate.json()["detail"] == "campaign_archived"
+    imported = client.post(
+        f"/api/campaigns/{campaign.id}/import-csv",
+        json={
+            "campaign_id": campaign.id,
+            "csv_text": "email,first_name\\nnew@example.com,New",
+            "field_map": {"email": "email", "first_name": "first_name"},
+            "has_header": True,
+        },
+    )
+    assert imported.status_code == 409
+    uploaded = client.post(
+        f"/api/campaigns/{campaign.id}/upload-contacts",
+        files={"file": ("contacts.csv", b"email,first_name\\nnew@example.com,New", "text/csv")},
+    )
+    assert uploaded.status_code == 409

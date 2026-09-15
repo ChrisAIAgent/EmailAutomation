@@ -102,3 +102,21 @@ def test_agent_profile_update_accepts_actor_param(client, db):
     log = db.query(models.AuditLog).filter_by(action="agent_profile_updated").order_by(models.AuditLog.id.desc()).first()
     assert log is not None
     assert log.actor == "agent"
+
+
+def test_profile_update_rejects_signature_that_does_not_match_identity(client):
+    response = client.put("/api/agent-profile", json={
+        "agent_name": "Chris",
+        "company_name": "TAC AISolution",
+        "role": "Sales consultant",
+        "tone": "professional",
+        "language_policy": "match_customer",
+        "signature_text": "Best regards,\nSendy\nOther Company",
+        "forbidden_claims": "pricing",
+        "unknown_answer_policy": "Ask for confirmation.",
+        "allow_campaign_override": False,
+        "is_active": True,
+    })
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "agent_profile_signature_validation_failed"

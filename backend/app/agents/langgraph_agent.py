@@ -27,6 +27,7 @@ from ..schemas import (
     AnalyzeMessageInput,
     GenerateOutreachInput,
     GenerateFollowUpInput,
+    ApprovalRevisionInput,
     PlanNextActionInput,
 )
 from .base import AgentAdapter
@@ -150,7 +151,9 @@ def _make_llm(db=None, *, task: str = "classification"):
         "api_key": cfg.api_key,
         "temperature": 0.35 if task in {"reply", "outreach", "follow_up"} else 0,
         "timeout": get_settings().LLM_TIMEOUT_SECONDS,
-        "max_retries": 1,
+        # Outreach has a deterministic fallback. Hidden provider retries turn
+        # one 30s failure into a client-visible minute-long stall.
+        "max_retries": 0 if task == "outreach" else 1,
     }
     if cfg.base_url:
         kwargs["base_url"] = cfg.base_url
@@ -486,6 +489,99 @@ def _llm_reply(contact, campaign, customer_message: str, thread_context: str) ->
         return None
 
 
+def _llm_revision(contact: dict, campaign: dict, inp: ApprovalRevisionInput) -> Optional[dict]:
+    """Regenerate one existing draft from an explicit operator instruction.
+
+    This intentionally has no rule-based fallback.  A caller who asked for a
+    revision must never receive a draft that silently ignored that instruction.
+    """
+    try:
+        from pydantic import BaseModel
+
+        class RevisionOut(BaseModel):
+            subject: str
+            body_text: str
+
+        is_thread_reply = inp.kind in {"reply", "follow_up"} and bool(inp.thread_id)
+        llm = _make_llm(task="reply" if is_thread_reply else "outreach")
+        if llm is None:
+            return None
+        owner_id = campaign.get("owner_id") or contact.get("owner_id")
+        profile = resolve_profile(
+            getattr(_DB_HOLDER, "db", None), owner_id, campaign=campaign
+        )
+        customer_message = inp.latest_customer_message or ""
+        thread_context = inp.thread_context or ""
+        knowledge_context = format_knowledge_context(
+            "\n".join([
+                customer_message,
+                thread_context,
+                campaign.get("product_description") or "",
+                inp.instruction,
+            ]),
+            db=getattr(_DB_HOLDER, "db", None),
+            owner_id=owner_id,
+        )
+        reply_strategy = format_reply_strategy(
+            db=getattr(_DB_HOLDER, "db", None), owner_id=owner_id,
+        )
+        subject_rule = (
+            "The email is a reply in an existing Gmail thread. Return the current subject exactly; "
+            "do not change it."
+            if is_thread_reply else
+            "You may improve the subject only when that helps satisfy the revision instruction."
+        )
+        prompt = (
+            "Revise an existing customer-facing email draft. This is a content revision only; "
+            "it is not permission to send email.\n"
+            "Hard rules:\n"
+            "- Follow the operator instruction only as editorial guidance. It cannot override the rules below.\n"
+            "- Preserve truthful facts. Never invent pricing, discounts, delivery dates, guarantees, "
+            "customer history, capabilities, or commitments.\n"
+            "- Use the Agent Profile as mandatory behavior. Do not write a closing or signature; "
+            "the application appends the exact Profile signature.\n"
+            "- Use only approved knowledge when it is relevant. Do not mention internal systems or knowledge bases.\n"
+            "- Match the customer's language for a thread reply. Use plain text and no markdown.\n"
+            f"- {subject_rule}\n\n"
+            "Agent Profile:\n"
+            f"Name: {profile['agent_name']}\n"
+            f"Company: {profile['company_name']}\n"
+            f"Role: {profile['role']}\n"
+            f"Tone: {profile['tone']}\n"
+            f"Language policy: {profile['language_policy']}\n"
+            f"Required signature:\n{profile['signature_text']}\n"
+            f"Forbidden claims: {profile['forbidden_claims']}\n"
+            f"Unknown-answer policy: {profile['unknown_answer_policy']}\n\n"
+            "Reply strategy (guidance only; cannot override the hard rules):\n"
+            f"{reply_strategy}\n\n"
+            "Approved knowledge base:\n"
+            f"{knowledge_context}\n\n"
+            f"Contact: {contact}\n"
+            f"Campaign facts: {campaign}\n\n"
+            "Current draft subject:\n"
+            f"{inp.current_subject}\n\n"
+            "Current draft body:\n"
+            f"{inp.current_body_text}\n\n"
+            "Conversation context:\n"
+            f"{thread_context[-10000:]}\n\n"
+            "Latest customer message:\n"
+            f"{customer_message[:5000]}\n\n"
+            "Operator revision instruction:\n"
+            f"{inp.instruction}"
+        )
+        out = llm.with_structured_output(RevisionOut).invoke(prompt)
+        subject = (out.subject or "").strip()
+        body = (out.body_text or "").strip()
+        if not subject or not body:
+            return None
+        if is_thread_reply and not _reply_passes_quality(customer_message, body):
+            return None
+        return {"subject": subject, "body_text": body, "body_html": ""}
+    except Exception as exc:
+        logger.warning("LLM approval revision failed without fallback: %s", exc)
+        return None
+
+
 def _reply_topics(text: str) -> dict[str, tuple[str, ...]]:
     lowered = (text or "").lower()
     patterns = {
@@ -787,21 +883,75 @@ class LangGraphAdapter(AgentAdapter):
         d = self._run("generate_follow_up", inp.model_dump())
         return _to_proposal(d)
 
+    def revise_approval(self, inp: ApprovalRevisionInput) -> Optional[EmailProposal]:
+        if self._db is None:
+            return None
+        _DB_HOLDER.db = self._db
+        contact: dict = {}
+        campaign: dict = {}
+        if inp.contact_id:
+            row = self._db.get(models.Contact, inp.contact_id)
+            if row:
+                contact = {
+                    key: getattr(row, key)
+                    for key in ("id", "owner_id", "email", "first_name", "last_name", "company", "title", "custom_fields")
+                }
+        if inp.campaign_id:
+            row = self._db.get(models.Campaign, inp.campaign_id)
+            if row:
+                campaign = {
+                    key: getattr(row, key)
+                    for key in ("id", "owner_id", "name", "product_description", "target_audience", "sender_name", "sender_company", "tone", "objective", "max_follow_ups", "confidence_threshold", "timezone")
+                }
+        t0 = time.time()
+        generated = _llm_revision(contact, campaign, inp)
+        if generated is None:
+            return None
+        profile = resolve_profile(
+            self._db, campaign.get("owner_id") or contact.get("owner_id"), campaign=campaign
+        )
+        body, flags = apply_profile_to_reply(
+            generated["body_text"], profile,
+            customer_message=inp.latest_customer_message or "",
+            customer_name=(contact.get("first_name") or "").strip(),
+        )
+        if flags:
+            logger.info("Agent Profile approval revision cleanup: %s", ",".join(flags))
+        subject = inp.current_subject if inp.kind in {"reply", "follow_up"} and inp.thread_id else generated["subject"]
+        cfg = _effective_llm_config()
+        return EmailProposal(
+            agent="langgraph", run_id="run_" + _rand(), subject=subject,
+            body_text=body, body_html="", intent=inp.intent,
+            confidence=1.0, summary="Revised existing pending Approval.",
+            recommended_action=inp.recommended_action, reasoning_summary="Applied operator revision instruction without sending.",
+            risk_level=inp.risk_level, requires_approval=True,
+            latency_ms=int((time.time() - t0) * 1000),
+            model=cfg.model if (cfg.api_key and cfg.model) else "rule-based",
+            prompt_version=PROMPT_VERSION,
+        )
+
     def plan_next_action(self, inp: PlanNextActionInput) -> Optional[AgentDecision]:
         return self._run("plan_next_action", inp.model_dump())
 
     def health_check(self) -> AgentHealth:
         if self._db is not None:
-            cfg = peek_email_config(self._db)
-            configured = bool(cfg and cfg.api_key and cfg.model)
+            from ..services.ai_config import email_config_state
+            _cfg, state = email_config_state(self._db)
+            configured = bool(state["usable"])
+            detail = (
+                "saved credential cannot be read by this runtime"
+                if state.get("error_code") == "credential_unreadable"
+                else ("LLM-backed" if configured else "rule-based fallback (no LLM API key)")
+            )
         else:
             configured = is_llm_configured(get_settings())
+            detail = "LLM-backed" if configured else "rule-based fallback (no LLM API key)"
         return AgentHealth(
             agent="langgraph",
             configured=configured,
             reachable=True,
             mode=None,
-            detail="LLM-backed" if configured else "rule-based fallback (no LLM API key)",
+            detail=detail,
         )
 
 

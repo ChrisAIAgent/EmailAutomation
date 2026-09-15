@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Activity, BarChart3, Beaker, BookOpen, Bot, CalendarClock, ChevronLeft, ChevronRight, Inbox as InboxIcon, Moon, Pause, Play, Send, Stethoscope, Sun, Type, Users } from "lucide-react";
+import { Activity, BarChart3, Beaker, BookOpen, Bot, CalendarClock, ChevronLeft, ChevronRight, Inbox as InboxIcon, Megaphone, Moon, Pause, Play, Send, Stethoscope, Sun, Type, Users } from "lucide-react";
 import { api, API_BASE, Metrics } from "@/lib/api";
 import { useLang } from "@/lib/i18n";
 import ConfigBar from "./ConfigBar";
@@ -26,7 +26,7 @@ const TAB_KEYS: Record<Tab, { labelKey: string; icon: any }> = {
   overview:  { labelKey: "nav_dashboard",   icon: BarChart3 },
   inbox:     { labelKey: "nav_inbox",       icon: InboxIcon },
   contacts:  { labelKey: "nav_contacts",    icon: Users },
-  campaigns: { labelKey: "nav_campaigns",   icon: Users },
+  campaigns: { labelKey: "nav_campaigns",   icon: Megaphone },
   approvals: { labelKey: "nav_approvals",   icon: Send },
   agent_profile:{ labelKey: "nav_agent_profile", icon: Bot },
   knowledge: { labelKey: "nav_knowledge",   icon: BookOpen },
@@ -148,7 +148,7 @@ export default function Dashboard() {
         <div className="absolute -top-12 -right-12 h-28 w-28 rounded-full bg-accent/10 blur-2xl" />
         <div className={`flex items-center ${sidebarCollapsed ? "justify-center" : "justify-between"} mb-5 ${sidebarCollapsed ? "" : "px-2"} relative`}>
           <div className={`min-w-0 ${sidebarCollapsed ? "text-center" : "text-left"}`}>
-            <div className="font-black tracking-[0.24em] text-brand text-lg leading-none">TAC</div>
+            <img src="/brand/tac-wordmark.png" alt="TAC" className="h-[18px] w-auto" />
             {!sidebarCollapsed && <div className="text-[10px] uppercase tracking-[0.16em] text-muted mt-1 truncate">{t('dash_email_automation')}</div>}
           </div>
           {!sidebarCollapsed && <button type="button" className="btn !px-1.5 !py-1" onClick={() => setSidebarCollapsed(true)} title={lang === "zh" ? "收缩功能栏" : "Collapse navigation"}><ChevronLeft size={16} /></button>}

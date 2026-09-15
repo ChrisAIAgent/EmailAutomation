@@ -109,6 +109,8 @@ def test_generate_without_gmail_creates_demo_drafts(client, db):
         "campaign_id": camp_id, "csv_text": "email,first_name\nlead@example.com,Lead",
         "field_map": {}, "has_header": True})
     assert r.status_code == 200 and r.json()["imported"] == 1
+    started = client.post(f"/api/campaigns/{camp_id}/start")
+    assert started.status_code == 200, started.text
     r = client.post(f"/api/campaigns/{camp_id}/generate")
     assert r.status_code == 200, r.text
     assert r.json()["generated"] == 1

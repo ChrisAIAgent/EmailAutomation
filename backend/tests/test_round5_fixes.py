@@ -32,7 +32,8 @@ def test_contact_partial_update_preserves_omitted_fields(client):
     assert updated["company"] == "Acme"
     assert updated["category"] == "qualified"
     assert updated["intent_level"] == "high"
-    assert updated["tags"] == ["crm", "priority"]
+    # Tags are user-managed and retain the submitted display order.
+    assert updated["tags"] == ["priority", "crm"]
     assert updated["next_action"] == "reply"
 
 

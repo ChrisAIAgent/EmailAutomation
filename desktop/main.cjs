@@ -414,7 +414,12 @@ async function stopServices() {
   } catch {}
 }
 function createWindow() {
-  mainWindow = new BrowserWindow({ width: 1500, height: 920, minWidth: 980, minHeight: 680, show: false, backgroundColor: "#080d16", webPreferences: { preload: path.join(__dirname, "preload.cjs"), contextIsolation: true, nodeIntegration: false, sandbox: true } });
+  // Brand window/taskbar icon. `__dirname` is desktop/ in development and
+  // runtime/electron/resources/app/ once packaged, so one relative path covers
+  // both layouts. Guarded: a missing file degrades to the default icon instead
+  // of failing window creation.
+  const windowIcon = path.join(__dirname, "brand", "app-icon.ico");
+  mainWindow = new BrowserWindow({ width: 1500, height: 920, minWidth: 980, minHeight: 680, show: false, backgroundColor: "#080d16", icon: fs.existsSync(windowIcon) ? windowIcon : undefined, webPreferences: { preload: path.join(__dirname, "preload.cjs"), contextIsolation: true, nodeIntegration: false, sandbox: true } });
   mainWindow.webContents.setWindowOpenHandler(({ url }) => { if (/^https?:\/\//i.test(url)) void shell.openExternal(url); return { action: "deny" }; });
   mainWindow.webContents.on("did-fail-load", (_event, code, description, url) => writeDiagnostic("did_fail_load", { code, description, url }));
   mainWindow.webContents.on("did-finish-load", () => writeDiagnostic("did_finish_load", { url: mainWindow.webContents.getURL() }));

@@ -217,11 +217,17 @@ export default function ApprovalsView({ onChanged }: { onChanged: () => void }) 
                     {t('appr_confirm_send_desc')}
                   </div>
                 )}
-                <div className="text-sm space-y-1">
-                  <div><span className="text-muted">{t('appr_recipient')}:</span> {[confirmTarget.contact_name, confirmTarget.contact_company].filter(Boolean).join(" · ") || confirmTarget.to_email}</div>
-                  {(confirmTarget.contact_name || confirmTarget.contact_company) && <div className="text-xs text-muted">{confirmTarget.to_email}</div>}
-                  <div><span className="text-muted">{t('appr_subject')}:</span> {confirmTarget.subject}</div>
-                </div>
+                  <div className="text-sm space-y-1">
+                    <div><span className="text-muted">{t('appr_recipient')}:</span> {[confirmTarget.contact_name, confirmTarget.contact_company].filter(Boolean).join(" · ") || confirmTarget.to_email}</div>
+                    {(confirmTarget.contact_name || confirmTarget.contact_company) && <div className="text-xs text-muted">{confirmTarget.to_email}</div>}
+                    <div><span className="text-muted">{t('appr_subject')}:</span> {editedSubject}</div>
+                    <div className="pt-2">
+                      <div className="text-xs text-muted mb-1">{t('appr_body')}</div>
+                      <div className="max-h-52 overflow-y-auto whitespace-pre-wrap rounded border border-border bg-surface-muted p-2 text-xs">
+                        {editedBody}
+                      </div>
+                    </div>
+                  </div>
                 <div className="flex gap-2">
                   <button className="btn" disabled={busy} onClick={() => setConfirmId(null)}>{t('common_cancel')}</button>
                   <button

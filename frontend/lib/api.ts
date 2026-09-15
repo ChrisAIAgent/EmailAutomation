@@ -104,6 +104,11 @@ export const api = {
   createContact: (body: any) => req<any>("/api/contacts", { method: "POST", body: JSON.stringify(body) }),
   updateContact: (id: number, body: any) => req<any>(`/api/contacts/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteContact: (id: number) => req<any>(`/api/contacts/${id}`, { method: "DELETE" }),
+  downloadContactsTemplate: async () => {
+    const res = await fetch(`${API_BASE}/api/contacts/template.xlsx`);
+    if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+    return res.blob();
+  },
   importContacts: (file: File, confirm: boolean) =>
     uploadReq<any>(`/api/contacts/import?confirm=${confirm}`, (() => { const fd = new FormData(); fd.append("file", file); return fd; })()),
 
@@ -124,6 +129,7 @@ export const api = {
   uploadContacts: (id: number, file: File, confirm: boolean) =>
     uploadReq<any>(`/api/campaigns/${id}/upload-contacts?confirm=${confirm}`, (() => { const fd = new FormData(); fd.append("file", file); return fd; })()),
   generate: (id: number) => req<any>(`/api/campaigns/${id}/generate`, { method: "POST" }, LONG_ACTION_TIMEOUT_MS),
+  campaignGenerationStatus: (id: number) => req<any>(`/api/campaigns/${id}/generation-status`),
   startCampaign: (id: number) => req<any>(`/api/campaigns/${id}/start`, { method: "POST" }),
   pauseCampaign: (id: number) => req<any>(`/api/campaigns/${id}/pause`, { method: "POST" }),
   stopCampaign: (id: number) => req<any>(`/api/campaigns/${id}/stop`, { method: "POST" }),
@@ -289,6 +295,8 @@ export type DiagnosticItem = {
 
 export type DiagnosticReport = {
   generated_at: string;
+  trace_id?: string;
+  error?: string;
   overall: "ok" | "degraded" | "error" | "unknown";
   counts: { ok: number; warn: number; error: number; info: number; unknown?: number };
   items: DiagnosticItem[];
