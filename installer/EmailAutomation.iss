@@ -81,6 +81,9 @@ Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\runtime\electron\Email Au
 Filename: "{app}\runtime\electron\Email Automation.exe"; Description: "Launch {#MyAppName}"; Flags: postinstall nowait skipifsilent
 
 [Code]
+procedure RemoveObsoleteFiles(); forward;
+procedure InstallVcRedist(); forward;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   UninstallKey, UninstallString: string;
@@ -188,3 +191,4 @@ begin
     end;
   end;
 end;
+
