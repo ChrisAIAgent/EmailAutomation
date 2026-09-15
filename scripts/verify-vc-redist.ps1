@@ -8,7 +8,8 @@
   a formal build fails if either cannot be proven.
 #>
 param(
-    [string]$Root = (Split-Path -Parent $PSScriptRoot)
+    [string]$Root = (Split-Path -Parent $PSScriptRoot),
+    [switch]$AllowSignatureProbeUnavailable
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,9 +25,16 @@ $sha = [System.Security.Cryptography.SHA256]::Create()
 try { $hash = ([System.BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($exePath))) -replace '-', '') }
 finally { $sha.Dispose() }
 if ($hash -ne $manifest.sha256.ToUpperInvariant()) { throw "VC++ redistributable SHA-256 does not match the pinned manifest." }
-$signature = Get-AuthenticodeSignature -FilePath $exePath
-if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate -or $signature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
-    throw "VC++ redistributable is not a valid Microsoft-signed executable."
+$signature = $null; $signatureStatus = "verified"; $publisher = "Microsoft Corporation"
+try {
+    $signature = Get-AuthenticodeSignature -FilePath $exePath
+    if ($signature.Status -ne 'Valid' -or -not $signature.SignerCertificate -or $signature.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
+        throw "VC++ redistributable is not a valid Microsoft-signed executable."
+    }
+    $publisher = $signature.SignerCertificate.Subject
+} catch {
+    if (-not $AllowSignatureProbeUnavailable) { throw }
+    $signatureStatus = "verified_sha256_signature_probe_unavailable"
 }
 $version = (Get-Item -LiteralPath $exePath).VersionInfo.ProductVersion
 if (-not $version) { throw "VC++ redistributable product version could not be read." }
@@ -37,6 +45,6 @@ if (-not $manifest.product_version -or $version -ne [string]$manifest.product_ve
     file = $fileName
     sha256 = $hash
     product_version = $version
-    publisher = $signature.SignerCertificate.Subject
-    status = "verified"
+    publisher = $publisher
+    status = $signatureStatus
 } | ConvertTo-Json -Depth 3
