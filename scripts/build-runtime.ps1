@@ -277,7 +277,11 @@ try {
     $smokeRoutes = @{}
     function Add-SmokeRoute([string]$Route) {
         if (-not $Route) { return }
-        $candidate = $Route -replace '/page$', ''
+        # app-paths-manifest includes both rendered pages and file route
+        # handlers (for example /icon.png/route). Only rendered pages are
+        # valid standalone HTTP smoke targets; requesting the manifest key
+        # itself returns 404 even though /icon.png is valid.
+        $candidate = $Route -replace '/(page|route)$', ''
         if (-not $candidate) { $candidate = '/' }
         if (-not $candidate.StartsWith('/')) { $candidate = '/' + $candidate }
         if ($candidate -eq '/index') { $candidate = '/' }
