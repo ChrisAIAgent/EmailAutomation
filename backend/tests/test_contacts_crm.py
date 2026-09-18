@@ -97,10 +97,11 @@ def test_contact_excel_template_matches_import_contract(client):
     rows = read_xlsx_rows(response.content)
     headers = rows[0]
     assert headers == [
-        "email", "first_name", "last_name", "company", "title", "phone", "website",
-        "segments", "tags", "timezone", "notes", "custom_fields", "source",
+        "email", "first_name", "last_name", "system_category", "segments", "tags",
+        "company", "title", "phone", "website", "timezone", "notes", "custom_fields", "source",
     ]
-    assert rows[1][7] == "Finance; IT"
+    assert rows[1][3] == "prospect"
+    assert rows[1][4] == "Finance; IT"
     imported = client.post("/api/contacts/import?confirm=true", files={
         "file": ("contacts-import-template.xlsx", BytesIO(response.content), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     })

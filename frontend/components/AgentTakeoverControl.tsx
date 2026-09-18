@@ -27,6 +27,7 @@ export default function AgentTakeoverControl({ paused, onChanged }: { paused: bo
   const zh = lang === "zh";
   const [state, setState] = useState<any>(null);
   const [intervalInput, setIntervalInput] = useState("60");
+  const [scope, setScope] = useState<"inbox" | "campaign" | "all">("inbox");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [, setClockTick] = useState(0);
@@ -41,6 +42,7 @@ export default function AgentTakeoverControl({ paused, onChanged }: { paused: bo
       syncedTimezone.current = timezone;
       setState(value);
       setIntervalInput(String(value.interval_minutes || 60));
+      setScope(value.scope || "inbox");
       setError("");
     } catch (e: any) {
       setError(e?.message || (zh ? "无法读取接管状态" : "Unable to load takeover status"));
@@ -63,9 +65,10 @@ export default function AgentTakeoverControl({ paused, onChanged }: { paused: bo
     if (minutes === null) return;
     setBusy(true); setError("");
     try {
-      const value = await api.updateAgentTakeover(enabled, minutes, computerTimezone());
+      const value = await api.updateAgentTakeover(enabled, minutes, computerTimezone(), scope);
       setState(value);
       setIntervalInput(String(value.interval_minutes));
+      setScope(value.scope || scope);
       syncedTimezone.current = computerTimezone();
       onChanged();
     } catch (e: any) {
@@ -91,9 +94,10 @@ export default function AgentTakeoverControl({ paused, onChanged }: { paused: bo
     if (minutes === null || busy || !state) return;
     setBusy(true); setError("");
     try {
-      const updated = await api.updateAgentTakeover(Boolean(state.enabled), minutes, computerTimezone());
+      const updated = await api.updateAgentTakeover(Boolean(state.enabled), minutes, computerTimezone(), scope);
       setState(updated);
       setIntervalInput(String(updated.interval_minutes));
+      setScope(updated.scope || scope);
       syncedTimezone.current = computerTimezone();
       onChanged();
     } catch (e: any) {
@@ -103,8 +107,10 @@ export default function AgentTakeoverControl({ paused, onChanged }: { paused: bo
   };
 
   const permissions = useMemo(() => state?.enabled
-    ? (zh ? "Agent Review · 自动发送 · 定时唤醒 · Inbox 运营" : "Agent Review · Auto-send · Scheduled wake-up · Inbox operations")
-    : (zh ? "常规写操作需要人工授权" : "Routine writes require user authorization"), [state?.enabled, zh]);
+    ? (scope === "inbox"
+      ? (zh ? "Agent Review · 自动发送 · 定时唤醒 · Inbox 运营" : "Agent Review · Auto-send · Scheduled wake-up · Inbox operations")
+      : (zh ? `Agent Review · ${scope === "all" ? "Inbox + Campaign" : "Campaign"} · 定时唤醒` : `Agent Review · ${scope === "all" ? "Inbox + Campaign" : "Campaign"} · Scheduled wake-up`))
+    : (zh ? "常规写操作需要人工授权" : "Routine writes require user authorization"), [state?.enabled, scope, zh]);
   const running = state?.last_status === "running" || String(state?.current_stage || "").includes("started") || state?.current_stage === "agent_running";
 
   return (
@@ -127,6 +133,18 @@ export default function AgentTakeoverControl({ paused, onChanged }: { paused: bo
         <div className="flex flex-wrap gap-1" aria-label={zh ? "常用分钟数" : "Quick intervals"}>
           {QUICK_INTERVALS.map((minutes) => <button type="button" key={minutes} disabled={busy} className="rounded border border-border px-1.5 py-0.5 text-[9px] text-muted hover:text-fg" onClick={() => { setIntervalInput(String(minutes)); void saveInterval(String(minutes)); }}>{minutes}</button>)}
         </div>
+        <label className="block text-[10px] text-muted" htmlFor="agent-takeover-scope">{zh ? "接管作用域" : "Takeover scope"}</label>
+        <select id="agent-takeover-scope" className="input w-full text-xs py-1" value={scope} disabled={busy} onChange={async (event) => {
+          const next = event.target.value as "inbox" | "campaign" | "all";
+          setScope(next); setBusy(true); setError("");
+          try { const updated = await api.updateAgentTakeover(Boolean(state?.enabled), Number(intervalInput), computerTimezone(), next); setState(updated); setScope(updated.scope || next); onChanged(); }
+          catch (e: any) { setError(e?.message || (zh ? "更新作用域失败" : "Failed to update takeover scope")); }
+          finally { setBusy(false); }
+        }}>
+          <option value="inbox">{zh ? "Inbox（默认）" : "Inbox (default)"}</option>
+          <option value="campaign">{zh ? "Campaign" : "Campaign"}</option>
+          <option value="all">{zh ? "全部：Inbox + Campaign" : "All: Inbox + Campaign"}</option>
+        </select>
         <div className="text-[10px] text-muted space-y-1">
           <div className="flex items-center gap-1"><Clock size={10} /><span>{zh ? "下次" : "Next"}: {state?.display_time?.next_run_at?.local || localDateTime(state?.next_run_at)}</span></div>
           <div>{zh ? "状态" : "Status"}: {paused ? (zh ? "已全局暂停" : "Globally paused") : running ? (zh ? "运行中" : "Running") : (state?.last_status || (zh ? "空闲" : "Idle"))}</div>

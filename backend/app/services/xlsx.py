@@ -126,14 +126,14 @@ def _worksheet_xml(rows: list[list[str]], widths: list[int], *, freeze: bool = F
 def contacts_template_xlsx() -> bytes:
     """Create the English-first Contact import workbook returned by the API."""
     headers = [
-        "email", "first_name", "last_name", "company", "title", "phone", "website",
-        "segments", "tags", "timezone", "notes", "custom_fields", "source",
+        "email", "first_name", "last_name", "system_category", "segments", "tags",
+        "company", "title", "phone", "website", "timezone", "notes", "custom_fields", "source",
     ]
     contact_rows = [
         headers,
         [
-            "alex@example.com", "Alex", "Chen", "Example Company", "Founder", "+1 555 0100",
-            "https://example.com", "Finance; IT", "priority; conference", "Asia/Shanghai",
+            "alex@example.com", "Alex", "Chen", "prospect", "Finance; IT", "priority; conference",
+            "Example Company", "Founder", "+1 555 0100", "https://example.com", "Asia/Shanghai",
             "Met at the 2026 summit", '{"account_tier":"enterprise"}', "event_import",
         ],
     ]
@@ -142,12 +142,13 @@ def contacts_template_xlsx() -> bytes:
         ["email", "Yes", "A valid email address.", "alex@example.com"],
         ["first_name", "Name required", "Given name. Fill first_name or last_name at minimum.", "Alex"],
         ["last_name", "Name required", "Family name. Fill first_name or last_name at minimum.", "Chen"],
+        ["system_category", "Yes", "Operational Contact classification for a new lead. New imports must be prospect.", "prospect"],
+        ["segments", "No", "User-managed customer groups or industries. Separate multiple values with commas or semicolons.", "Finance; IT"],
+        ["tags", "No", "Free-form user tags. Separate multiple values with commas or semicolons; tags are independent from Segments.", "priority; conference"],
         ["company", "No", "Company or organization name.", "Example Company"],
         ["title", "No", "Job title.", "Founder"],
         ["phone", "No", "Phone number.", "+1 555 0100"],
         ["website", "No", "Company or contact website.", "https://example.com"],
-        ["segments", "No", "Industry/customer groups. Separate multiple values with commas or semicolons.", "Finance; IT"],
-        ["tags", "No", "Additional user tags. Separate multiple values with commas or semicolons.", "priority; conference"],
         ["timezone", "No", "IANA timezone name.", "Asia/Shanghai"],
         ["notes", "No", "Free-text CRM notes.", "Met at the 2026 summit"],
         ["custom_fields", "No", "A JSON object for extra attributes.", '{"account_tier":"enterprise"}'],
@@ -170,6 +171,6 @@ def contacts_template_xlsx() -> bytes:
         archive.writestr("xl/workbook.xml", workbook)
         archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
         archive.writestr("xl/styles.xml", styles)
-        archive.writestr("xl/worksheets/sheet1.xml", _worksheet_xml(contact_rows, [28, 18, 18, 24, 20, 18, 30, 24, 24, 18, 32, 34, 20], freeze=True, filter_ref="A1:M2"))
+        archive.writestr("xl/worksheets/sheet1.xml", _worksheet_xml(contact_rows, [28, 18, 18, 18, 24, 24, 24, 20, 18, 30, 18, 32, 34, 20], freeze=True, filter_ref="A1:N2"))
         archive.writestr("xl/worksheets/sheet2.xml", _worksheet_xml(guide_rows, [20, 18, 72, 36], freeze=True))
     return output.getvalue()

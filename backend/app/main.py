@@ -97,20 +97,10 @@ async def lifespan(app: FastAPI):
                     }),
                 ))
 
-        profile = db.query(models.AgentProfile).filter_by(owner_id=owner_id).first()
-        if profile:
-            desired_approval = "agent_review" if takeover_enabled else "human_review"
-            if profile.approval_mode != desired_approval:
-                profile.approval_mode = desired_approval
-                profile.version = (profile.version or 0) + 1
-                db.add(models.AuditLog(
-                    actor="system", action="agent_takeover_startup_reconciled",
-                    entity="agent_profile", entity_id=str(profile.id),
-                    detail=json.dumps({
-                        "enabled": takeover_enabled,
-                        "approval_mode": desired_approval,
-                    }),
-                ))
+        # The owner-level Approval Mode is independent from TACWork Takeover.
+        # Takeover enable/disable may change it through its explicit API, but a
+        # service restart must preserve a deliberate Agent Review selection so
+        # Campaign first-email generation does not silently revert to pending.
         if not takeover_enabled:
             # A service restart must not leave an inactive switch pointing to
             # a deleted TACWork session from a previous process lifetime.

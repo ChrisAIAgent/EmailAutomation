@@ -313,7 +313,7 @@ class CampaignContact(TimestampMixin, Base):
         Integer, ForeignKey("contacts.id"), nullable=False, index=True
     )
     status = Column(String(30), default="queued", nullable=False, index=True)
-    # queued | outreach_generated | approved | sent | replied | following_up | done | stopped
+    # queued | outreach_generated | approved | sent | replied | following_up | done | stopped | converted
     assigned_follow_ups = Column(Integer, default=0, nullable=False)
     last_message_id = Column(String(100), nullable=True)
     thread_id = Column(String(100), nullable=True)
@@ -345,6 +345,14 @@ class CampaignGenerationRun(TimestampMixin, Base):
     approvals_json = Column(Text, nullable=True)
     failures_json = Column(Text, nullable=True)
     error = Column(Text, nullable=True)
+    # First-send dispatch is requested only when the workspace is in
+    # agent_review.  Generation and dispatch are tracked separately so a
+    # blocked/unknown send never gets reported as a successful generation.
+    send_status = Column(String(20), default="not_requested", nullable=False)
+    # not_requested | running | completed | partial | blocked | stopped
+    sent = Column(Integer, default=0, nullable=False)
+    send_failed = Column(Integer, default=0, nullable=False)
+    send_failures_json = Column(Text, nullable=True)
 
     __table_args__ = (
         Index(

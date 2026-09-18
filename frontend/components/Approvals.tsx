@@ -103,7 +103,7 @@ export default function ApprovalsView({ onChanged }: { onChanged: () => void }) 
           <p className="text-xs text-muted mt-1">
             {approvalMode === "human_review"
               ? (lang === "zh" ? "人工审核：Agent 只能准备邮件；后续发送必须由人工确认。" : "Human review: Agent may prepare email only; a person must confirm any later send.")
-              : (lang === "zh" ? "Agent 审核：仅在全部既有安全规则通过时，Agent 可按自动化设置直接发送。" : "Agent review: the Agent may send only when every existing safety rule passes.")}
+              : (lang === "zh" ? "Agent 审核：新生成的 Campaign 首封邮件会先经过全部安全规则检查，检查通过后由 Agent 自动发送；已有待审批邮件保持不变。" : "Agent review: newly generated Campaign first emails are checked by the Agent and sent automatically only when every existing safety rule passes; existing pending approvals are unchanged.")}
           </p>
         </div>
         <div className="flex flex-wrap gap-2">

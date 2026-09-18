@@ -109,8 +109,10 @@ export const api = {
     if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
     return res.blob();
   },
-  importContacts: (file: File, confirm: boolean) =>
-    uploadReq<any>(`/api/contacts/import?confirm=${confirm}`, (() => { const fd = new FormData(); fd.append("file", file); return fd; })()),
+  importContacts: (file: File, confirm: boolean, mode: "lead" | "legacy" = "lead") =>
+    uploadReq<any>(`/api/contacts/import?confirm=${confirm}&mode=${mode}`, (() => { const fd = new FormData(); fd.append("file", file); return fd; })()),
+  transitionContact: (id: number, body: any) =>
+    req<any>(`/api/contacts/${id}/transition`, { method: "POST", body: JSON.stringify(body) }),
 
   campaigns: () => req<any[]>("/api/campaigns"),
   createCampaign: (body: any) =>
@@ -230,8 +232,8 @@ export const api = {
     }, 60_000),
 
   agentTakeover: () => req<any>("/api/agent-takeover"),
-  updateAgentTakeover: (enabled: boolean, intervalMinutes: number, displayTimezone?: string) =>
-    req<any>("/api/agent-takeover", { method: "POST", body: JSON.stringify({ enabled, interval_minutes: intervalMinutes, display_timezone: displayTimezone }) }),
+  updateAgentTakeover: (enabled: boolean, intervalMinutes: number, displayTimezone?: string, scope?: "inbox" | "campaign" | "all") =>
+    req<any>("/api/agent-takeover", { method: "POST", body: JSON.stringify({ enabled, interval_minutes: intervalMinutes, display_timezone: displayTimezone, ...(scope ? { scope } : {}) }) }),
   updateWorkspaceDisplayTimezone: (displayTimezone: string) =>
     req<any>("/api/agent-takeover/display-timezone", { method: "POST", body: JSON.stringify({ display_timezone: displayTimezone }) }),
   runAgentTakeoverNow: () =>

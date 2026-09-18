@@ -98,6 +98,14 @@ def test_capability_can_start_owned_enabled_full_auto_runs(client, db):
     campaign_allowed = client.post("/api/agent-takeover/authorize", json={
         "token": token, "operation": "start_agent_run", "automation_id": campaign_automation.id,
     })
+    assert campaign_allowed.status_code == 403
+    enabled_campaign_scope = client.post("/api/agent-takeover", json={
+        "enabled": True, "interval_minutes": 60, "scope": "campaign",
+    })
+    assert enabled_campaign_scope.status_code == 200
+    campaign_allowed = client.post("/api/agent-takeover/authorize", json={
+        "token": token, "operation": "start_agent_run", "automation_id": campaign_automation.id,
+    })
     assert campaign_allowed.status_code == 200
     campaign_automation.execution_mode = "semi_auto"; db.commit()
     denied = client.post("/api/agent-takeover/authorize", json={
@@ -107,7 +115,7 @@ def test_capability_can_start_owned_enabled_full_auto_runs(client, db):
 
 
 def test_capability_checks_campaign_and_automation_ownership(client, db):
-    client.post("/api/agent-takeover", json={"enabled": True, "interval_minutes": 60})
+    client.post("/api/agent-takeover", json={"enabled": True, "interval_minutes": 60, "scope": "campaign"})
     token = "ownership-secret"
     flags.set_flag(db, takeover_svc.FLAG_TOKEN_HASH, hashlib.sha256(token.encode()).hexdigest())
     flags.set_flag(db, takeover_svc.FLAG_TOKEN_EXPIRES, (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())

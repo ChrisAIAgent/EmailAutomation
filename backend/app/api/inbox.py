@@ -209,6 +209,7 @@ def _update_contact_from_human(
     }:
         return
     before = {
+        "category": contact.category,
         "tags": _tags_json(contact.tags),
         "intent_level": contact.intent_level,
         "status": contact.status,
@@ -300,23 +301,40 @@ def _update_contact_from_human(
         contact.status = "replied"
         contact.lifecycle_stage = "new_customer"
         contact.next_action = "human_review"
-    elif sales_reply_required(intent, content_tags):
-        contact.category = "qualified"
-        contact.intent_level = "high" if intent == "interested" else "medium"
-        contact.status = "replied"
-        contact.lifecycle_stage = "needs_reply"
-        contact.next_action = "reply"
-    elif intent == "interested":
-        contact.category = "qualified"
-        contact.intent_level = "high"
-        contact.status = "replied"
-        contact.lifecycle_stage = "needs_reply"
-        contact.next_action = "reply"
-    elif intent in ("asking_question", "objection"):
-        contact.intent_level = "medium"
-        contact.status = "replied"
-        contact.lifecycle_stage = "needs_reply"
-        contact.next_action = "reply"
+    elif sales_reply_required(intent, content_tags) or intent in {"interested", "asking_question", "objection"}:
+        # Qualified conversion is shared with the CRM and Agent APIs.  Pass the
+        # current Campaign explicitly so a reply in one Campaign cannot close a
+        # different active Campaign owned by the same Contact.
+        from ..services.contact_lifecycle import ContactTransitionError, transition_contact
+        source_campaign_id = None
+        thread_for_transition = db.get(models.EmailThread, thread_id) if thread_id else None
+        if thread_for_transition is not None:
+            source_campaign_id = thread_for_transition.campaign_id
+        if source_campaign_id is None:
+            # A sales-related Inbox reply can make the Contact actionable, but
+            # it is not a Campaign qualification event.  Qualification is
+            # reserved for a reply in the current Campaign Gmail Thread.
+            contact.intent_level = "high" if intent == "interested" else "medium"
+            contact.status = "replied"
+            contact.lifecycle_stage = "needs_reply"
+            contact.next_action = "reply"
+        else:
+            try:
+                transition_contact(
+                    db, contact, owner_id=contact.owner_id, action="qualify",
+                    campaign_id=source_campaign_id, intent=intent,
+                    reason="sales_related_reply", actor="langgraph",
+                )
+            except ContactTransitionError as exc:
+                # A stale already-converted Campaign row should not turn Inbox
+                # analysis into a second conversion.  Other safety errors remain
+                # visible to the caller.
+                if exc.code not in {"source_campaign_membership_not_found"}:
+                    raise
+                contact.intent_level = "high" if intent == "interested" else "medium"
+                contact.status = "replied"
+                contact.lifecycle_stage = "needs_reply"
+                contact.next_action = "reply"
     elif we_awaiting_customer and not requires_reply:
         # We already replied (latest message is outbound). The new inbound is a
         # follow-up, not a fresh request needing a reply. Keep the contact in the
@@ -340,6 +358,7 @@ def _update_contact_from_human(
     recompute_contact_reply_state(db, contact)
 
     after = {
+        "category": contact.category,
         "tags": _tags_json(contact.tags),
         "intent_level": contact.intent_level,
         "status": contact.status,
@@ -841,7 +860,7 @@ def resolve_human_review(thread_id: int, payload: HumanReviewDecisionBody, db: S
         contact = db.query(models.Contact).filter_by(owner_id=owner_id, email=email).first()
         if payload.decision == "approve":
             cc = db.query(models.CampaignContact).filter_by(contact_id=contact.id).first() if contact else None
-            approvals_svc.apply_intent_actions(db, cc, t.intent, email, owner_id)
+            approvals_svc.apply_intent_actions(db, cc, t.intent, email, owner_id, actor="user")
             t.pending_action = "no_action"
             t.last_agent_summary = "退订已人工批准，联系人已 opt-out。"
             db.add(models.AuditLog(

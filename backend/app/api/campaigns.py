@@ -262,8 +262,8 @@ def import_csv(campaign_id: int, req: CsvImportRequest, db: Session = Depends(ge
 # --------------- file upload (XLSX + CSV) ---------------
 
 EXPECTED_COLUMNS = [
-    "email", "first_name", "last_name", "company", "title", "phone", "website",
-    "segments", "tags", "timezone", "notes", "custom_fields", "source",
+    "email", "first_name", "last_name", "category", "segments", "tags", "company",
+    "title", "phone", "website", "timezone", "notes", "custom_fields", "source",
 ]
 _EMAIL_RE = __import__("re").compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -306,7 +306,9 @@ def _parse_upload(file_bytes: bytes, filename: str) -> tuple[list[str], list[dic
         "姓": "last_name", "姓氏": "last_name", "公司": "company", "邮箱": "email",
         "职位": "title", "电话": "phone", "网站": "website", "网址": "website",
         "标签": "tags", "备注": "notes", "时区": "timezone", "来源": "source",
-        "客户分类": "segments", "行业分类": "segments", "行业": "segments",
+        "category": "category", "system_category": "category", "系统分类": "category", "分类": "category",
+        "segment": "segments", "客户分群": "segments", "客户分类": "segments",
+        "行业分类": "segments", "行业": "segments",
         "自定义字段": "custom_fields",
     }
     header = [aliases.get(c.strip().lower().replace(" ", "_"), c.strip().lower().replace(" ", "_")) for c in rows[0]]
@@ -340,6 +342,10 @@ async def upload_contacts(
         raise HTTPException(status_code=409, detail="campaign_archived")
     by = await file.read()
     header, rows = _parse_upload(by, file.filename or "")
+    strict_lead = "category" in header
+    compatibility_warnings = [] if strict_lead else [
+        "legacy_import_missing_system_category_defaulted_to_prospect"
+    ]
 
     # validation
     valid_rows: list[dict] = []
@@ -356,6 +362,16 @@ async def upload_contacts(
             errors.append("invalid email format")
         if not (r.get("first_name") or "").strip() and not (r.get("last_name") or "").strip():
             errors.append("name required")
+        category = (r.get("category") or "").strip().lower()
+        if strict_lead:
+            if not category:
+                errors.append("system_category_required")
+            elif category not in {"prospect", "qualified", "customer", "partner", "won", "invalid"}:
+                errors.append("invalid_system_category")
+            elif category != "prospect":
+                errors.append("new_lead_category_must_be_prospect")
+        elif category and category not in {"prospect", "qualified", "customer", "partner", "won", "invalid"}:
+            errors.append("invalid_system_category")
         try:
             r["_custom_fields"] = _custom_fields(r.get("custom_fields"))
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -388,6 +404,8 @@ async def upload_contacts(
         "valid": len(valid_rows),
         "invalid": len(invalid_rows),
         "duplicates": dup_count,
+        "mode": "lead" if strict_lead else "legacy",
+        "compatibility_warnings": compatibility_warnings,
         "valid_rows": valid_rows,
         "invalid_rows": invalid_rows,
     }
@@ -406,12 +424,14 @@ async def upload_contacts(
                 first_name=r.get("first_name") or "", last_name=r.get("last_name") or "",
                 company=r.get("company") or "", title=r.get("title") or "",
                 phone=r.get("phone") or None, website=r.get("website") or None,
+                category=(r.get("category") or "prospect").strip().lower() or "prospect",
                 tags=json.dumps(_split_list(r.get("tags")), ensure_ascii=False),
                 segments=json.dumps(_split_list(r.get("segments")), ensure_ascii=False),
                 timezone=r.get("timezone") or None, notes=r.get("notes") or None,
                 custom_fields=(json.dumps(r.get("_custom_fields"), ensure_ascii=False)
                                if r.get("_custom_fields") else None),
-                source=r.get("source") or "file_import",
+                source=r.get("source") or "file_import", status="new",
+                lifecycle_stage="new_customer", next_action="review",
             )
             db.add(contact)
             db.flush()
@@ -456,8 +476,19 @@ def _json_list(value: str | None) -> list:
         return []
 
 
+def _agent_review_enabled(db: Session, owner_id: int) -> bool:
+    """Return the current workspace send authority without creating profile data."""
+    profile = (
+        db.query(models.AgentProfile)
+        .filter_by(owner_id=owner_id)
+        .first()
+    )
+    return bool(profile and profile.approval_mode == "agent_review")
+
+
 def _generation_run_out(run: models.CampaignGenerationRun, *, reused: bool = False) -> dict:
     failures = _json_list(run.failures_json)
+    send_failures = _json_list(run.send_failures_json)
     return {
         "run_id": run.id,
         "status": run.status,
@@ -469,6 +500,10 @@ def _generation_run_out(run: models.CampaignGenerationRun, *, reused: bool = Fal
         "started_at": run.started_at,
         "finished_at": run.finished_at,
         "error": run.error,
+        "send_status": run.send_status or "not_requested",
+        "sent": run.sent or 0,
+        "send_failed": run.send_failed or 0,
+        "send_failures": send_failures,
         "reused": reused,
     }
 
@@ -487,6 +522,20 @@ def _record_generation_failure(
     failures.append({"contact_id": contact_id, "email": email, "code": code[:160]})
     run.failures_json = json.dumps(failures, ensure_ascii=False)
     run.failed = len(failures)
+    db.commit()
+
+
+def _record_generation_send_failure(
+    db: Session, run_id: int, contact_id: int, email: str, code: str,
+) -> None:
+    """Persist an Agent-review dispatch result without touching generation results."""
+    run = db.get(models.CampaignGenerationRun, run_id)
+    if run is None:
+        return
+    failures = _json_list(run.send_failures_json)
+    failures.append({"contact_id": contact_id, "email": email, "code": code[:160]})
+    run.send_failures_json = json.dumps(failures, ensure_ascii=False)
+    run.send_failed = len(failures)
     db.commit()
 
 
@@ -548,8 +597,17 @@ def generate_outreach(campaign_id: int, db: Session = Depends(get_db)):
         campaign_id=campaign_id, status="queued", membership_active=True
     ).all()
     if not queued:
-        return {"status": "completed", "generated": 0, "failed": 0, "approvals": [], "failures": []}
-    run = models.CampaignGenerationRun(campaign_id=campaign_id, total_contacts=len(queued))
+        return {
+            "status": "completed", "generated": 0, "failed": 0,
+            "approvals": [], "failures": [], "send_status": "not_requested",
+            "sent": 0, "send_failed": 0, "send_failures": [],
+        }
+    auto_send_requested = _agent_review_enabled(db, c.owner_id)
+    run = models.CampaignGenerationRun(
+        campaign_id=campaign_id,
+        total_contacts=len(queued),
+        send_status="running" if auto_send_requested else "not_requested",
+    )
     db.add(run)
     try:
         # Commit before the slow LLM call. A client timeout can now be safely
@@ -623,6 +681,51 @@ def generate_outreach(campaign_id: int, db: Session = Depends(get_db)):
             # One recipient is one transaction: a later failure cannot erase
             # this Draft/Approval pair.
             db.commit()
+            if auto_send_requested:
+                # Re-read the global switch before each send. Turning Agent
+                # Review off while a batch is running stops the remaining
+                # dispatches but keeps their generated Drafts pending.
+                if not _agent_review_enabled(db, c.owner_id):
+                    current = db.get(models.CampaignGenerationRun, run_id)
+                    if current is not None:
+                        current.send_status = "stopped"
+                        db.commit()
+                    auto_send_requested = False
+                else:
+                    try:
+                        send_result = approval_svc.decide_approval(
+                            db,
+                            ap.id,
+                            "approve",
+                            editor_email="agent:agent_review",
+                            mode=c.agent_mode,
+                            agent=c.primary_agent,
+                            is_primary=True,
+                        )
+                        if send_result.get("ok"):
+                            current = db.get(models.CampaignGenerationRun, run_id)
+                            if current is not None:
+                                current.sent = (current.sent or 0) + 1
+                        else:
+                            _record_generation_send_failure(
+                                db, run_id, cc.contact_id, email,
+                                f"send_blocked:{send_result.get('blocked') or send_result.get('error') or 'unknown'}",
+                            )
+                        db.commit()
+                    except Exception as exc:
+                        # The Draft/Approval was already committed. Preserve it
+                        # as pending and record the outcome as unknown; never
+                        # retry automatically after a transport or post-send
+                        # exception.
+                        db.rollback()
+                        logger.exception(
+                            "Campaign Agent-review send failed campaign=%s contact=%s",
+                            campaign_id, cc.contact_id,
+                        )
+                        _record_generation_send_failure(
+                            db, run_id, cc.contact_id, email,
+                            f"send_unknown:{type(exc).__name__}",
+                        )
         except approval_svc.DraftCreationError as exc:
             db.rollback()
             _record_generation_failure(db, run_id, cc.contact_id, email, exc.reason)
@@ -637,6 +740,11 @@ def generate_outreach(campaign_id: int, db: Session = Depends(get_db)):
     run.finished_at = datetime.now(timezone.utc)
     if degraded:
         run.error = f"rule_based_fallback:{degraded}"
+    if auto_send_requested:
+        if run.send_failed:
+            run.send_status = "partial" if run.sent else "blocked"
+        else:
+            run.send_status = "completed"
     db.commit()
     return {**_generation_run_out(run), "degraded": degraded}
 

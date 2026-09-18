@@ -14,7 +14,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..schemas import ContactCreate, ContactUpdate
+from ..schemas import ContactCreate, ContactTransition, ContactUpdate
+from ..services.contact_lifecycle import ContactTransitionError, transition_contact
 from ..services.xlsx import contacts_template_xlsx, read_xlsx_rows
 from .deps import ensure_owner, get_db
 
@@ -77,6 +78,9 @@ def _serialize(contact: models.Contact, db: Session) -> dict:
         "first_name": contact.first_name, "last_name": contact.last_name,
         "company": contact.company, "title": contact.title, "phone": contact.phone,
         "website": contact.website, "category": contact.category or "prospect",
+        # Keep the legacy ``category`` API field while exposing the English
+        # business name used by the import template and UI.
+        "system_category": contact.category or "prospect",
         "tags": _string_list(contact.tags), "segments": _string_list(contact.segments),
         "intent_level": contact.intent_level or "unknown",
         "notes": contact.notes, "source": contact.source, "status": contact.status,
@@ -110,6 +114,8 @@ def _validate(payload, require_identity: bool = True) -> tuple[str, list[str], l
 def list_contacts(
     q: str | None = None, category: str | None = None,
     tag: str | None = None, intent_level: str | None = None,
+    segments_any: list[str] | None = Query(None),
+    tags_any: list[str] | None = Query(None),
     db: Session = Depends(get_db),
 ):
     owner_id = ensure_owner(db)
@@ -124,8 +130,26 @@ def list_contacts(
         query = query.filter(models.Contact.intent_level == intent_level)
     contacts = query.order_by(models.Contact.updated_at.desc()).all()
     rows = [_serialize(c, db) for c in contacts]
-    if tag:
-        rows = [row for row in rows if tag in row["tags"]]
+    wanted_segments = {
+        value.strip().casefold()
+        for raw in (segments_any or [])
+        for value in re.split(r"[,，;；]", raw)
+        if value.strip()
+    }
+    wanted_tags = {
+        value.strip().casefold()
+        for raw in ([tag] if tag else []) + (tags_any or [])
+        for value in re.split(r"[,，;；]", raw)
+        if value.strip()
+    }
+    if wanted_segments:
+        rows = [row for row in rows if wanted_segments.intersection(
+            {str(value).casefold() for value in row["segments"]}
+        )]
+    if wanted_tags:
+        rows = [row for row in rows if wanted_tags.intersection(
+            {str(value).casefold() for value in row["tags"]}
+        )]
     return rows
 
 
@@ -141,20 +165,42 @@ def create_contact(payload: ContactCreate, db: Session = Depends(get_db)):
                 custom_fields=json.dumps(payload.custom_fields, ensure_ascii=False) if payload.custom_fields else None)
     contact = models.Contact(owner_id=owner_id, status="new", **data)
     db.add(contact)
+    db.flush()
+    db.add(models.AuditLog(
+        actor="user", action="contact_created", entity="contact", entity_id=str(contact.id),
+        detail=json.dumps({"category": contact.category, "intent_level": contact.intent_level}, ensure_ascii=False),
+        success=True,
+    ))
     db.commit()
     db.refresh(contact)
     return _serialize(contact, db)
 
 
 @router.put("/{contact_id}")
-def update_contact(contact_id: int, payload: ContactUpdate, db: Session = Depends(get_db)):
+def update_contact(
+    contact_id: int, payload: ContactUpdate, actor: str = Query("user"),
+    db: Session = Depends(get_db),
+):
     owner_id = ensure_owner(db)
     contact = db.query(models.Contact).filter_by(id=contact_id, owner_id=owner_id).first()
     if not contact:
         raise HTTPException(status_code=404, detail="contact_not_found")
-    changes = payload.model_dump(exclude_unset=True)
+    before = {
+        "category": contact.category,
+        "intent_level": contact.intent_level,
+        "tags": _string_list(contact.tags),
+        "segments": _string_list(contact.segments),
+        "notes": contact.notes,
+        "lifecycle_stage": contact.lifecycle_stage,
+        "next_action": contact.next_action,
+        "manual_lock": bool(contact.manual_lock),
+    }
+    changes = payload.model_dump(exclude_unset=True, exclude={"reason", "override_manual_lock"})
     if not changes:
         return _serialize(contact, db)
+
+    if contact.manual_lock and actor != "user" and not payload.override_manual_lock:
+        raise HTTPException(status_code=409, detail="contact_manual_lock")
 
     if "email" in changes:
         if changes["email"] is None:
@@ -172,9 +218,32 @@ def update_contact(contact_id: int, payload: ContactUpdate, db: Session = Depend
         raise HTTPException(status_code=422, detail="invalid_contact_category")
     if "intent_level" in changes and changes["intent_level"] not in ALLOWED_INTENT:
         raise HTTPException(status_code=422, detail="invalid_intent_level")
+    resulting_first_name = (changes.get("first_name", contact.first_name) or "").strip()
+    resulting_last_name = (changes.get("last_name", contact.last_name) or "").strip()
+    if not resulting_first_name and not resulting_last_name:
+        raise HTTPException(status_code=422, detail="name_required")
+
+    transitioned = False
+    if "category" in changes and changes["category"] in {"qualified", "customer", "invalid"} \
+            and changes["category"] != contact.category:
+        try:
+            transition_contact(
+                db, contact, owner_id=owner_id, action={
+                    "qualified": "qualify", "customer": "customer", "invalid": "invalid",
+                }[changes["category"]], reason=payload.reason, actor=actor,
+                override_manual_lock=payload.override_manual_lock,
+            )
+        except ContactTransitionError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+        transitioned = True
 
     for key, value in changes.items():
-        if key in {"email", "tags", "segments", "custom_fields"}:
+        if key in {"email", "tags", "segments", "custom_fields", "category"}:
+            continue
+        # A lifecycle transition owns its terminal/reply operational state.
+        # Do not let the full-form UI accidentally overwrite it with stale
+        # values while still allowing independent Intent/Tags/Notes edits.
+        if transitioned and key in {"lifecycle_stage", "next_action"}:
             continue
         setattr(contact, key, value)
     if "tags" in changes:
@@ -196,9 +265,49 @@ def update_contact(contact_id: int, payload: ContactUpdate, db: Session = Depend
     if changes.get("manual_lock") is True:
         from datetime import datetime, timezone
         contact.manual_updated_at = datetime.now(timezone.utc)
+    after = {
+        "category": contact.category,
+        "intent_level": contact.intent_level,
+        "tags": _string_list(contact.tags),
+        "segments": _string_list(contact.segments),
+        "notes": contact.notes,
+        "lifecycle_stage": contact.lifecycle_stage,
+        "next_action": contact.next_action,
+        "manual_lock": bool(contact.manual_lock),
+    }
+    db.add(models.AuditLog(
+        actor=actor if actor in {"user", "agent", "tacwork", "langgraph", "system"} else "user",
+        action="contact_updated", entity="contact", entity_id=str(contact.id),
+        detail=json.dumps({"before": before, "after": after, "reason": payload.reason or "",
+                           "manual_lock_override": bool(payload.override_manual_lock)}, ensure_ascii=False),
+        success=True,
+    ))
     db.commit()
     db.refresh(contact)
     return _serialize(contact, db)
+
+
+@router.post("/{contact_id}/transition")
+def transition_contact_endpoint(
+    contact_id: int, payload: ContactTransition, actor: str = Query("user"),
+    db: Session = Depends(get_db),
+):
+    owner_id = ensure_owner(db)
+    contact = db.query(models.Contact).filter_by(id=contact_id, owner_id=owner_id).first()
+    if not contact:
+        raise HTTPException(status_code=404, detail="contact_not_found")
+    try:
+        result = transition_contact(
+            db, contact, owner_id=owner_id, action=payload.action,
+            campaign_id=payload.campaign_id, intent=payload.intent,
+            reason=payload.reason, actor=actor,
+            override_manual_lock=payload.override_manual_lock,
+        )
+    except ContactTransitionError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+    db.commit()
+    db.refresh(contact)
+    return {**result, "contact": _serialize(contact, db)}
 
 
 @router.delete("/{contact_id}")
@@ -231,8 +340,10 @@ def _parse_file(content: bytes, filename: str) -> list[dict]:
         "last_name": "last_name", "姓": "last_name", "姓氏": "last_name",
         "公司": "company", "邮箱": "email", "职位": "title", "电话": "phone",
         "网站": "website", "网址": "website", "分类": "category", "标签": "tags",
+        "category": "category", "system_category": "category", "系统分类": "category",
         "备注": "notes", "时区": "timezone", "来源": "source",
-        "客户分类": "segments", "行业分类": "segments", "行业": "segments",
+        "segment": "segments", "客户分群": "segments", "客户分类": "segments",
+        "行业分类": "segments", "行业": "segments",
         "自定义字段": "custom_fields",
     }
     header = []
@@ -260,9 +371,21 @@ def download_contacts_template():
 
 
 @router.post("/import")
-async def import_contacts(file: UploadFile = File(...), confirm: bool = Query(False), db: Session = Depends(get_db)):
+async def import_contacts(
+    file: UploadFile = File(...), confirm: bool = Query(False),
+    mode: str | None = Query(None, pattern="^(lead|legacy)$"),
+    db: Session = Depends(get_db),
+):
     owner_id = ensure_owner(db)
     rows = _parse_file(await file.read(), file.filename or "")
+    has_category_column = bool(rows and "category" in rows[0])
+    # New templates carry an explicit category column and are strict.  Files
+    # from older releases without that column stay importable in compatibility
+    # mode and default to Prospect with a visible warning.
+    strict_lead = mode == "lead" or (mode is None and has_category_column)
+    compatibility_warnings = [] if strict_lead else [
+        "legacy_import_missing_system_category_defaulted_to_prospect"
+    ]
     existing = {c.email.lower() for c in db.query(models.Contact).filter_by(owner_id=owner_id).all()}
     seen: set[str] = set()
     valid, invalid, duplicates = [], [], 0
@@ -273,6 +396,16 @@ async def import_contacts(file: UploadFile = File(...), confirm: bool = Query(Fa
         errors = []
         if not EMAIL_RE.match(email): errors.append("invalid_email")
         if not first_name and not last_name: errors.append("name_required")
+        category = (row.get("category") or "").strip().lower()
+        if strict_lead:
+            if not category:
+                errors.append("system_category_required")
+            elif category not in ALLOWED_CATEGORIES:
+                errors.append("invalid_system_category")
+            elif category != "prospect":
+                errors.append("new_lead_category_must_be_prospect")
+        elif category and category not in ALLOWED_CATEGORIES:
+            errors.append("invalid_system_category")
         try:
             custom_fields = _custom_fields(row.get("custom_fields"))
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -285,7 +418,9 @@ async def import_contacts(file: UploadFile = File(...), confirm: bool = Query(Fa
             continue
         seen.add(email); valid.append(row | {"email": email, "_custom_fields": custom_fields})
     preview = {"filename": file.filename, "total": len(rows), "valid": len(valid),
-               "invalid": len(invalid), "duplicates": duplicates, "errors": invalid}
+               "invalid": len(invalid), "duplicates": duplicates, "errors": invalid,
+               "mode": "lead" if strict_lead else "legacy",
+               "compatibility_warnings": compatibility_warnings}
     if not confirm:
         return {"imported": 0, "preview": preview}
     imported = 0
@@ -300,6 +435,7 @@ async def import_contacts(file: UploadFile = File(...), confirm: bool = Query(Fa
             website=row.get("website") or None, category=category,
             tags=json.dumps(tags, ensure_ascii=False), segments=json.dumps(segments, ensure_ascii=False),
             intent_level="unknown", notes=row.get("notes") or None,
+            lifecycle_stage="new_customer", next_action="review",
             custom_fields=json.dumps(row.get("_custom_fields"), ensure_ascii=False) if row.get("_custom_fields") else None,
             timezone=row.get("timezone") or None, source=row.get("source") or "file_import", status="new",
         )

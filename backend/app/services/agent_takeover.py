@@ -42,6 +42,8 @@ FLAG_CURRENT_STAGE = "agent_takeover_current_stage"
 FLAG_LAST_SUCCESS_STAGE = "agent_takeover_last_success_stage"
 FLAG_LAST_COMPLETED = "agent_takeover_last_completed_at"
 FLAG_CYCLE_HAS_ERRORS = "agent_takeover_cycle_has_errors"
+FLAG_SCOPE = "agent_takeover_scope"
+TAKEOVER_SCOPES = {"inbox", "campaign", "all"}
 
 
 def _parse_time(value: str | None) -> datetime | None:
@@ -76,6 +78,12 @@ def _operating_prompt(cycle_id: str, db) -> str:
         datetime.now(timezone.utc) + timedelta(minutes=int(flags.get_flag(db, FLAG_INTERVAL, "60") or 60)),
         timezone_name,
     )["local"]
+    scope = scope_value(db)
+    campaign_guidance = (
+        "8. This takeover explicitly includes Campaign scope. Read current Campaigns and Contacts before writing. You may use ea_find_contacts, ea_update_contact, ea_transition_contact and the Campaign tools for owned records only. Do not import a file, create a Campaign, or change a manually locked Contact unless the user explicitly authorized that action in this cycle. A sales-related reply may qualify a Prospect only when its source Campaign is unambiguous."
+        if scope in {"campaign", "all"} else
+        "8. This takeover is Inbox-only. Do not create or modify Campaigns, Campaign members, or Contact lifecycle classifications; leave Campaign work for an explicitly enabled campaign/all takeover or a direct user operation."
+    )
     return f"""You are the scheduled production Email Automation operating Agent. This is a fresh, isolated run authorized by the Workspace's active Agent Takeover switch.
 
 Workspace display timezone: {timezone_name}. Use this time zone for every human-readable time in the final Chinese report. This cycle started at: {started_at}. The next Agent Takeover wake-up is: {next_run}. Do not print raw UTC timestamps or report the legacy Global Automation next_run_at as a separate scan; Global Inbox is owned by Agent Takeover and Huey does not execute it.
@@ -89,8 +97,9 @@ Cycle ID: {cycle_id}
 5. Start only enabled Automation work that the current triaged, admitted Contacts actually require. Then follow that same Run with ea_get_agent_run until it reaches a terminal status. Never start a duplicate Run and never treat queued/running, a Draft, Approval, or HTTP 200 as sent.
 6. Leave contact_admission_uncertain, content_uncertain, opt_out_confirmation and every other human-review item for a person; report and skip them without blocking eligible admitted Contacts.
 7. Before the final report, call ea_takeover_status again. Use its freshly returned local server time and next-run value. If next_run_at is null or already past, say scheduler reconciliation is pending rather than presenting it as a future wake-up. Finish with a concise Chinese report containing the cycle start and finish time, Gmail account, sync/triage counts and progress, filtered and human-review counts, Run ID/status, drafts/approvals, actual Gmail-accepted sends/message IDs, stops, skips and failures. Only Gmail acceptance may be reported as sent.
+{campaign_guidance}
 
-The Agent Takeover switch authorizes routine Inbox operation and eligible admitted-contact follow-up within this cycle. It never authorizes Contact admission, deletion, or bypassing pause, suppression, send windows, daily limits, idempotency, thread integrity, OAuth, delivery reconciliation, or any human-review gate."""
+The Agent Takeover switch authorizes only the configured {scope} scope within this cycle. It never authorizes Contact admission, deletion, or bypassing pause, suppression, send windows, daily limits, idempotency, thread integrity, OAuth, delivery reconciliation, or any human-review gate."""
 
 
 def _operating_system_context(token: str) -> str:
@@ -140,10 +149,17 @@ def status(db) -> dict:
         "current_stage": flags.get_flag(db, FLAG_CURRENT_STAGE),
         "last_success_stage": flags.get_flag(db, FLAG_LAST_SUCCESS_STAGE),
         "cycle_has_errors": (flags.get_flag(db, FLAG_CYCLE_HAS_ERRORS, "false") or "false").lower() == "true",
+        "scope": scope_value(db),
     }
 
 
-def configure(db, *, enabled: bool, interval_minutes: int, display_timezone: str | None = None) -> dict:
+def scope_value(db) -> str:
+    value = (flags.get_flag(db, FLAG_SCOPE, "inbox") or "inbox").strip().lower()
+    return value if value in TAKEOVER_SCOPES else "inbox"
+
+
+def configure(db, *, enabled: bool, interval_minutes: int, display_timezone: str | None = None,
+              scope: str | None = None) -> dict:
     if not isinstance(interval_minutes, int) or isinstance(interval_minutes, bool) or not (
         MIN_INTERVAL_MINUTES <= interval_minutes <= MAX_INTERVAL_MINUTES
     ):
@@ -152,6 +168,13 @@ def configure(db, *, enabled: bool, interval_minutes: int, display_timezone: str
     previously_enabled = flags.is_agent_takeover_enabled(db)
     if display_timezone:
         workspace_time.set_timezone(db, display_timezone)
+    if scope is not None:
+        normalized_scope = scope.strip().lower()
+        if normalized_scope not in TAKEOVER_SCOPES:
+            raise ValueError("unsupported_agent_takeover_scope")
+        flags.set_flag(db, FLAG_SCOPE, normalized_scope)
+    elif not flags.get_flag(db, FLAG_SCOPE):
+        flags.set_flag(db, FLAG_SCOPE, "inbox")
     flags.set_flag(db, FLAG_ENABLED, "true" if enabled else "false")
     flags.set_flag(db, FLAG_INTERVAL, str(interval_minutes))
     flags.set_flag(
