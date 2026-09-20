@@ -6,20 +6,18 @@ TACWork then uses the existing MCP tools and the normal backend policy engine.
 """
 from __future__ import annotations
 
-import json
 import hashlib
 import hmac
+import json
 import logging
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 from .. import models
-from ..config import get_settings
 from . import flags
 from . import workspace_time
+from . import agent_providers
 
 logger = logging.getLogger("agent.takeover")
 
@@ -43,32 +41,12 @@ FLAG_LAST_SUCCESS_STAGE = "agent_takeover_last_success_stage"
 FLAG_LAST_COMPLETED = "agent_takeover_last_completed_at"
 FLAG_CYCLE_HAS_ERRORS = "agent_takeover_cycle_has_errors"
 FLAG_SCOPE = "agent_takeover_scope"
+FLAG_SESSION_PROVIDER = agent_providers.SESSION_PROVIDER_FLAG
 TAKEOVER_SCOPES = {"inbox", "campaign", "all"}
 
 
 def _parse_time(value: str | None) -> datetime | None:
     return workspace_time.as_utc(value)
-
-
-def _request(method: str, path: str, payload: dict | None = None) -> dict:
-    settings = get_settings()
-    base = settings.TACWORK_SERVER_URL.rstrip("/")
-    body = json.dumps(payload).encode("utf-8") if payload is not None else None
-    req = Request(
-        f"{base}{path}", data=body, method=method,
-        headers={
-            "Authorization": f"Bearer {settings.TACWORK_CLIENT_TOKEN}",
-            **({"Content-Type": "application/json"} if body is not None else {}),
-        },
-    )
-    try:
-        with urlopen(req, timeout=settings.TACWORK_HTTP_TIMEOUT_SECONDS) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:500]
-        raise RuntimeError(f"tacwork_http_{exc.code}: {detail}") from exc
-    except (URLError, TimeoutError) as exc:
-        raise RuntimeError(f"tacwork_unreachable: {exc}") from exc
 
 
 def _operating_prompt(cycle_id: str, db) -> str:
@@ -150,6 +128,8 @@ def status(db) -> dict:
         "last_success_stage": flags.get_flag(db, FLAG_LAST_SUCCESS_STAGE),
         "cycle_has_errors": (flags.get_flag(db, FLAG_CYCLE_HAS_ERRORS, "false") or "false").lower() == "true",
         "scope": scope_value(db),
+        "selected_provider": agent_providers.selected_provider_id(db),
+        "session_provider": flags.get_flag(db, FLAG_SESSION_PROVIDER, "") or "",
     }
 
 
@@ -164,6 +144,9 @@ def configure(db, *, enabled: bool, interval_minutes: int, display_timezone: str
         MIN_INTERVAL_MINUTES <= interval_minutes <= MAX_INTERVAL_MINUTES
     ):
         raise ValueError("unsupported_agent_takeover_interval")
+    if enabled:
+        provider = agent_providers.get_selected_provider(db)
+        agent_providers.require_capability(provider, agent_providers.CAP_SCHEDULED_TAKEOVER)
     now = datetime.now(timezone.utc)
     previously_enabled = flags.is_agent_takeover_enabled(db)
     if display_timezone:
@@ -194,15 +177,13 @@ def configure(db, *, enabled: bool, interval_minutes: int, display_timezone: str
         flags.set_flag(db, FLAG_TOKEN_EXPIRES, "")
         flags.set_flag(db, FLAG_CURRENT_STAGE, "disabled")
         flags.set_flag(db, FLAG_CYCLE_HAS_ERRORS, "false")
+        flags.set_flag(db, FLAG_SESSION_PROVIDER, "")
     return status(db)
 
 
-def _session_is_busy(workspace_id: str, session_id: str) -> bool:
-    snapshot = _request(
-        "GET",
-        f"/workspace/{workspace_id}/sessions/{session_id}/snapshot?limit=20",
-    )
-    return (snapshot.get("status") or {}).get("type") not in {None, "idle"}
+def _session_provider(db, current: dict):
+    provider_id = current.get("session_provider") or current.get("selected_provider")
+    return agent_providers.get_provider(provider_id)
 
 
 def trigger_due(db, *, force: bool = False) -> dict:
@@ -216,45 +197,52 @@ def trigger_due(db, *, force: bool = False) -> dict:
     workspace_id = current["workspace_id"]
     if active_session and workspace_id:
         try:
-            if _session_is_busy(workspace_id, active_session):
+            provider = _session_provider(db, current)
+            session = provider.get_session(workspace_id=workspace_id, session_id=active_session)
+            session_status = session.get("status", "unknown")
+            if session_status in {"created", "running", "unknown"}:
                 if not force and current["next_run_at"] and current["next_run_at"] > now:
-                    return {"status": "running", "session_id": active_session}
+                    return {"status": "running", "session_id": active_session, "provider_id": provider.id}
                 flags.set_flag(db, FLAG_LAST_STATUS, "previous_run_still_running")
                 flags.set_flag(db, FLAG_NEXT_RUN, (now + timedelta(minutes=interval)).isoformat())
                 db.commit()
-                return {"status": "previous_run_still_running", "session_id": active_session}
+                return {"status": "previous_run_still_running", "session_id": active_session, "provider_id": provider.id}
             flags.set_flag(db, FLAG_ACTIVE_SESSION, "")
             cycle_has_errors = (flags.get_flag(db, FLAG_CYCLE_HAS_ERRORS, "false") or "false").lower() == "true"
-            final_status = "completed_with_errors" if cycle_has_errors else "completed"
+            final_status = "completed_with_errors" if cycle_has_errors else session_status
+            if final_status not in {"completed", "completed_with_errors", "failed", "stopped"}:
+                final_status = "completed_with_errors" if cycle_has_errors else "completed"
             flags.set_flag(db, FLAG_LAST_STATUS, final_status)
             flags.set_flag(db, FLAG_CURRENT_STAGE, final_status)
             flags.set_flag(db, FLAG_LAST_COMPLETED, now.isoformat())
             flags.set_flag(db, FLAG_TOKEN_HASH, "")
             flags.set_flag(db, FLAG_TOKEN_EXPIRES, "")
+            flags.set_flag(db, FLAG_SESSION_PROVIDER, "")
             db.add(models.AuditLog(
                 actor="scheduler", action="agent_takeover_session_completed",
-                entity="tacwork_session", entity_id=active_session,
+                entity="agent_session", entity_id=active_session,
                 detail=json.dumps({"cycle_id": current["cycle_id"], "completed_at_utc": now.isoformat(),
                                    "display_timezone": current["display_timezone"],
                                    "completed_at_display": workspace_time.display(now, current["display_timezone"])["local"],
-                                   "outcome": final_status}),
-                success=not cycle_has_errors,
+                                   "outcome": final_status, "provider_id": provider.id}),
+                success=final_status in {"completed", "stopped"} and not cycle_has_errors,
             ))
             db.commit()
         except Exception as exc:
-            logger.warning("could not read prior TACWork session %s: %s", active_session, exc)
-            # A deleted TACWork session is a stale local reference, not an
+            logger.warning("could not read prior Agent session %s: %s", active_session, exc)
+            # A deleted Agent session is a stale local reference, not an
             # unknown email-delivery state. Clear it and continue this cycle.
-            if "tacwork_http_404" in str(exc) and "session_not_found" in str(exc):
+            if "session_not_found" in str(exc) or "http_404" in str(exc):
                 flags.set_flag(db, FLAG_ACTIVE_SESSION, "")
                 flags.set_flag(db, FLAG_WORKSPACE, "")
+                flags.set_flag(db, FLAG_SESSION_PROVIDER, "")
                 flags.set_flag(db, FLAG_LAST_STATUS, "stale_session_recovered")
                 flags.set_flag(db, FLAG_LAST_ERROR, "")
                 flags.set_flag(db, FLAG_CURRENT_STAGE, "stale_session_recovered")
                 db.add(models.AuditLog(
                     actor="scheduler", action="agent_takeover_stale_session_recovered",
-                    entity="tacwork_session", entity_id=active_session,
-                    detail=json.dumps({"reason": "session_not_found"}),
+                    entity="agent_session", entity_id=active_session,
+                    detail=json.dumps({"reason": "session_not_found", "provider_id": current.get("session_provider")}),
                 ))
                 db.commit()
             else:
@@ -276,13 +264,11 @@ def trigger_due(db, *, force: bool = False) -> dict:
 
     try:
         cycle_id = uuid.uuid4().hex
+        provider = agent_providers.get_selected_provider(db)
+        agent_providers.require_capability(provider, agent_providers.CAP_SCHEDULED_TAKEOVER)
         flags.set_flag(db, FLAG_CYCLE_ID, cycle_id)
-        flags.set_flag(db, FLAG_CURRENT_STAGE, "tacwork_status")
+        flags.set_flag(db, FLAG_CURRENT_STAGE, "provider_status")
         db.commit()
-        server_status = _request("GET", "/status")
-        workspace_id = str(server_status.get("activeWorkspaceId") or "").strip()
-        if not workspace_id:
-            raise RuntimeError("tacwork_has_no_active_workspace")
         display_timezone = workspace_time.get_timezone(db)
         title = f"Inbox Operation · {workspace_time.display(now, display_timezone)['local']}"
         takeover_token = secrets.token_urlsafe(32)
@@ -292,21 +278,20 @@ def trigger_due(db, *, force: bool = False) -> dict:
         flags.set_flag(db, FLAG_TOKEN_EXPIRES, (now + timedelta(minutes=max(interval, 120))).isoformat())
         flags.set_flag(db, FLAG_CYCLE_HAS_ERRORS, "false")
         flags.set_flag(db, FLAG_LAST_ERROR, "")
-        flags.set_flag(db, FLAG_LAST_SUCCESS_STAGE, "tacwork_status")
+        flags.set_flag(db, FLAG_LAST_SUCCESS_STAGE, "provider_status")
         flags.set_flag(db, FLAG_CURRENT_STAGE, "session_create")
         db.commit()
-        created = _request(
-            "POST", f"/workspace/{workspace_id}/sessions",
-            {
-                "title": title,
-                "prompt": _operating_prompt(cycle_id, db),
-                "system": _operating_system_context(takeover_token),
-            },
+        created = provider.create_session(
+            title=title,
+            prompt=_operating_prompt(cycle_id, db),
+            system=_operating_system_context(takeover_token),
         )
-        session_id = str((created.get("item") or {}).get("id") or "").strip()
+        session_id = str(created.get("id") or "").strip()
+        workspace_id = str(created.get("workspace_id") or "").strip()
         if not session_id:
-            raise RuntimeError("tacwork_session_id_missing")
+            raise agent_providers.AgentProviderError("agent_provider_protocol_error", "session_id_missing")
         flags.set_flag(db, FLAG_WORKSPACE, workspace_id)
+        flags.set_flag(db, FLAG_SESSION_PROVIDER, provider.id)
         flags.set_flag(db, FLAG_ACTIVE_SESSION, session_id)
         flags.set_flag(db, FLAG_LAST_SESSION, session_id)
         flags.set_flag(db, FLAG_LAST_RUN, now.isoformat())
@@ -317,13 +302,14 @@ def trigger_due(db, *, force: bool = False) -> dict:
         flags.set_flag(db, FLAG_NEXT_RUN, (now + timedelta(minutes=interval)).isoformat())
         db.add(models.AuditLog(
             actor="scheduler", action="agent_takeover_session_started",
-            entity="tacwork_session", entity_id=session_id,
+            entity="agent_session", entity_id=session_id,
             detail=json.dumps({"cycle_id": cycle_id, "workspace_id": workspace_id, "interval_minutes": interval,
                                "started_at_utc": now.isoformat(), "display_timezone": display_timezone,
-                               "started_at_display": workspace_time.display(now, display_timezone)["local"]}),
+                               "started_at_display": workspace_time.display(now, display_timezone)["local"],
+                               "provider_id": provider.id}),
         ))
         db.commit()
-        return {"status": "running", "session_id": session_id, "workspace_id": workspace_id}
+        return {"status": "running", "session_id": session_id, "workspace_id": workspace_id, "provider_id": provider.id}
     except Exception as exc:
         failed_stage = flags.get_flag(db, FLAG_CURRENT_STAGE)
         flags.set_flag(db, FLAG_LAST_STATUS, "failed")

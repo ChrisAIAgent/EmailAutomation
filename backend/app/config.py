@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 from functools import lru_cache
 from pathlib import Path
@@ -42,13 +43,16 @@ def resolve_data_dir():
     if env:
         root = Path(env)
         mode = "app"
-    elif _is_protected_install():
-        local = (
-            os.environ.get("LOCALAPPDATA")
-            or os.environ.get("APPDATA")
-            or tempfile.gettempdir()
-        )
-        root = Path(local) / "TAC AISolution" / "Email Automation"
+    elif _is_protected_install() or sys.platform == "darwin":
+        if sys.platform == "darwin":
+            root = Path.home() / "Library" / "Application Support" / "TAC AISolution" / "Email Automation"
+        else:
+            local = (
+                os.environ.get("LOCALAPPDATA")
+                or os.environ.get("APPDATA")
+                or tempfile.gettempdir()
+            )
+            root = Path(local) / "TAC AISolution" / "Email Automation"
         mode = "app"
     else:
         root = Path(_BACKEND_DIR)
@@ -170,8 +174,21 @@ class Settings(BaseSettings):
     # fixed client token is the same local collaboration token passed by
     # scripts/tacwork-runtime.ps1; deployments may override both values.
     TACWORK_SERVER_URL: str = "http://127.0.0.1:18002"
+    TACWORK_WEB_URL: str = "http://127.0.0.1:18003"
     TACWORK_CLIENT_TOKEN: str = "email-automation-local-v1"
     TACWORK_HTTP_TIMEOUT_SECONDS: int = 15
+
+    # --- Optional DeepSeek Agent Harness provider ---
+    # A model endpoint alone is intentionally insufficient.  The Harness is
+    # considered configured only when it exposes the session protocol below
+    # and is explicitly wired to the typed Email Automation MCP server.
+    DEEPSEEK_HARNESS_URL: Optional[str] = None
+    DEEPSEEK_HARNESS_API_KEY: Optional[str] = None
+    DEEPSEEK_HARNESS_TIMEOUT_SECONDS: int = 30
+    DEEPSEEK_HARNESS_MCP_ENABLED: bool = False
+    DEEPSEEK_HARNESS_SCHEDULED_TAKEOVER: bool = False
+    DEEPSEEK_HARNESS_SURFACE_TYPE: str = "unavailable"
+    DEEPSEEK_HARNESS_SURFACE_URL: Optional[str] = None
 
     # --- App ---
     SECRET_KEY: str = "dev-insecure-secret-change-me"

@@ -1,14 +1,18 @@
-"""Per-user encrypted credential storage for installed Windows runtimes."""
+"""Per-user credential storage for Windows DPAPI and macOS Keychain."""
 from __future__ import annotations
 
 import base64
 import ctypes
+import hashlib
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 
 _UI_FORBIDDEN = 0x1
+_MAC_KEYCHAIN_SERVICE = "com.tacaisolution.email-automation.credentials"
 
 
 def _credential_path(config_dir: Path) -> Path:
@@ -44,8 +48,60 @@ def _dpapi(raw: bytes, *, protect: bool) -> bytes:
         ctypes.windll.kernel32.LocalFree(target_blob.pbData)
 
 
+def _mac_account(config_dir: Path) -> str:
+    digest = hashlib.sha256(str(Path(config_dir).expanduser().resolve()).encode("utf-8")).hexdigest()[:20]
+    return f"email-automation-{digest}"
+
+
+def _mac_read(config_dir: Path) -> dict:
+    result = subprocess.run(
+        [
+            "/usr/bin/security", "find-generic-password",
+            "-a", _mac_account(config_dir),
+            "-s", _MAC_KEYCHAIN_SERVICE,
+            "-w",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        # `security` uses a non-zero result when the item does not exist. Do
+        # not include stderr in an exception because it can expose Keychain
+        # metadata from the current user profile.
+        return {}
+    try:
+        decoded = base64.b64decode(result.stdout.strip().encode("ascii"), validate=True)
+        value = json.loads(decoded.decode("utf-8"))
+        return value if isinstance(value, dict) else {}
+    except Exception as exc:
+        raise RuntimeError("credential_key_unavailable") from exc
+
+
+def _mac_write(config_dir: Path, values: dict) -> None:
+    encoded = base64.b64encode(
+        json.dumps(values, ensure_ascii=False).encode("utf-8")
+    ).decode("ascii")
+    result = subprocess.run(
+        [
+            "/usr/bin/security", "add-generic-password",
+            "-a", _mac_account(config_dir),
+            "-s", _MAC_KEYCHAIN_SERVICE,
+            "-w", encoded,
+            "-U",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("credential_key_unavailable")
+
+
 def load(config_dir: Path) -> dict:
     """Load credentials without logging or exposing their contents."""
+    if sys.platform == "darwin":
+        return _mac_read(config_dir)
     path = _credential_path(config_dir)
     if not path.exists():
         return {}
@@ -59,6 +115,11 @@ def load(config_dir: Path) -> dict:
 
 def save(config_dir: Path, values: dict) -> None:
     """Atomically persist a DPAPI-protected JSON object."""
+    if sys.platform == "darwin":
+        _mac_write(config_dir, values)
+        return
+    if os.name != "nt":
+        raise RuntimeError("credential_key_unavailable")
     path = _credential_path(config_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     protected = _dpapi(json.dumps(values, ensure_ascii=False).encode("utf-8"), protect=True)
@@ -75,4 +136,6 @@ def update(config_dir: Path, values: dict) -> dict:
 
 
 def exists(config_dir: Path) -> bool:
+    if sys.platform == "darwin":
+        return bool(_mac_read(config_dir))
     return _credential_path(config_dir).exists()

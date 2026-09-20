@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from app import models
 from app.services import agent_takeover as takeover_svc
+from app.services import agent_providers as provider_svc
 from app.services import flags
 from app.tasks import scan_due_automations
 
@@ -201,22 +203,24 @@ def test_due_tick_creates_fresh_tacwork_session_and_records_stage(client, db, mo
     })
     calls = []
 
-    def fake_request(method, path, payload=None):
-        calls.append((method, path, payload))
-        if path == "/status":
-            return {"activeWorkspaceId": "ws_email"}
-        if path == "/workspace/ws_email/sessions":
-            return {"item": {"id": "ses_scheduled"}, "started": True}
-        raise AssertionError(path)
+    def create_session(**payload):
+        calls.append(payload)
+        return {"id": "ses_scheduled", "workspace_id": "ws_email", "status": "running"}
 
-    monkeypatch.setattr(takeover_svc, "_request", fake_request)
+    provider = SimpleNamespace(
+        id="tacwork",
+        configured=True,
+        capabilities=(provider_svc.CAP_SCHEDULED_TAKEOVER,),
+        create_session=create_session,
+    )
+    monkeypatch.setattr(takeover_svc.agent_providers, "get_selected_provider", lambda db: provider)
     result = takeover_svc.trigger_due(db, force=True)
-    assert result == {"status": "running", "session_id": "ses_scheduled", "workspace_id": "ws_email"}
+    assert result == {"status": "running", "session_id": "ses_scheduled", "workspace_id": "ws_email", "provider_id": "tacwork"}
     state = takeover_svc.status(db)
     assert state["cycle_id"]
     assert state["current_stage"] == "agent_running"
     assert state["last_success_stage"] == "session_create"
-    create_payload = calls[-1][2]
+    create_payload = calls[-1]
     assert "Cycle ID:" in create_payload["prompt"]
     assert "takeover_token=" not in create_payload["prompt"]
     assert "takeover_token=" in create_payload["system"]
@@ -231,16 +235,17 @@ def test_stale_tacwork_session_is_cleared_and_replaced_in_same_cycle(client, db,
     flags.set_flag(db, takeover_svc.FLAG_WORKSPACE, "ws_email")
     db.commit()
 
-    def fake_request(method, path, payload=None):
-        if path.endswith("/snapshot?limit=20"):
-            raise RuntimeError("tacwork_http_404: session_not_found")
-        if path == "/status":
-            return {"activeWorkspaceId": "ws_email"}
-        if path == "/workspace/ws_email/sessions":
-            return {"item": {"id": "ses_fresh"}}
-        raise AssertionError(path)
-
-    monkeypatch.setattr(takeover_svc, "_request", fake_request)
+    provider = SimpleNamespace(
+        id="tacwork",
+        configured=True,
+        capabilities=(provider_svc.CAP_SCHEDULED_TAKEOVER,),
+        get_session=lambda **_kwargs: (_ for _ in ()).throw(
+            provider_svc.AgentProviderError("agent_provider_protocol_error", "http_404:session_not_found")
+        ),
+        create_session=lambda **_kwargs: {"id": "ses_fresh", "workspace_id": "ws_email", "status": "running"},
+    )
+    monkeypatch.setattr(takeover_svc.agent_providers, "get_provider", lambda provider_id: provider)
+    monkeypatch.setattr(takeover_svc.agent_providers, "get_selected_provider", lambda db: provider)
     result = takeover_svc.trigger_due(db, force=True)
     assert result["session_id"] == "ses_fresh"
     assert takeover_svc.status(db)["active_session_id"] == "ses_fresh"
@@ -257,7 +262,11 @@ def test_idle_session_is_completed_before_the_next_due_cycle(client, db, monkeyp
     flags.set_flag(db, takeover_svc.FLAG_LAST_STATUS, "running")
     db.commit()
 
-    monkeypatch.setattr(takeover_svc, "_request", lambda method, path, payload=None: {"status": {"type": "idle"}})
+    provider = SimpleNamespace(
+        id="tacwork",
+        get_session=lambda **_kwargs: {"status": "completed"},
+    )
+    monkeypatch.setattr(takeover_svc.agent_providers, "get_provider", lambda provider_id: provider)
     result = takeover_svc.trigger_due(db)
     assert result["status"] == "not_due"
     state = takeover_svc.status(db)
@@ -265,6 +274,7 @@ def test_idle_session_is_completed_before_the_next_due_cycle(client, db, monkeyp
     assert state["last_status"] == "completed"
     assert state["current_stage"] == "completed"
     assert state["last_completed_at"] is not None
+    assert state["session_provider"] == ""
     assert db.query(models.AuditLog).filter_by(action="agent_takeover_session_completed").count() == 1
 
 
@@ -278,7 +288,11 @@ def test_idle_session_with_mcp_error_preserves_completed_with_errors(client, db,
     flags.set_flag(db, takeover_svc.FLAG_CYCLE_HAS_ERRORS, "true")
     db.commit()
 
-    monkeypatch.setattr(takeover_svc, "_request", lambda method, path, payload=None: {"status": {"type": "idle"}})
+    provider = SimpleNamespace(
+        id="tacwork",
+        get_session=lambda **_kwargs: {"status": "completed"},
+    )
+    monkeypatch.setattr(takeover_svc.agent_providers, "get_provider", lambda provider_id: provider)
     result = takeover_svc.trigger_due(db)
     assert result["status"] == "not_due"
     state = takeover_svc.status(db)

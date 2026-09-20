@@ -622,22 +622,24 @@ If sync repeatedly returns 401 or `Gmail API retry exhausted`, use the header
 **断开连接 / 连接 Gmail** flow, then re-check status and complete a successful
 incremental sync before resuming preparation or sending.
 
-## Embedded TACWork Web Panel
+## Embedded Agent Provider Panel
 
-Email Automation now treats TACWork as the resident right-side Agent console. The
-operator should not have to switch between two separate products for normal
-takeover, monitoring, and development assistance.
+Email Automation uses a provider-neutral right-side Agent console. TACWork is the
+default. A DeepSeek Harness appears as selectable only after its session protocol,
+typed MCP connection and health check are configured. Switching changes future
+Agent Sessions only; it does not alter Campaigns, Drafts, Approvals or mail.
 
 Operational rules:
 
-- Start and stop the whole stack with `start-stack.bat` / `stop-stack.bat` only.
+- On Windows, start and stop the whole stack with `start-stack.bat` / `stop-stack.bat` only.
   The startup script owns Backend, Consumer, Frontend, TACWork Server, TACWork Web,
   and the OpenCode Engine.
-- TACWork is locked to the Email Automation Workspace. When it is asked to inspect
+- Every Provider is locked to the Email Automation Workspace. When it is asked to inspect
   operations, prefer read-only API checks and existing scripts. Source/config/DB
   changes still require explicit user authorization.
-- The Web panel should restore the latest non-archived root session for this
-  Workspace after refresh. It must not create a new session on every page load.
+- The TACWork Surface restores the latest non-archived root session after refresh.
+  An event-stream Harness is rendered by Email Automation. An external-only
+  Surface opens separately; an unavailable Surface must show its real reason.
 - The plus/New control starts a new session intentionally. Opening the session
   drawer and choosing an older session is the manual recovery path.
 - If the panel shows connection retry/loading, verify direct service health before
@@ -653,6 +655,31 @@ GET http://127.0.0.1:18003/
 For browser origin issues, both `127.0.0.1` and `localhost` origins are expected
 to be allowed by the TACWork runtime. A CORS or iframe connection issue is a Web
 integration issue, not evidence that Email Automation business services failed.
+
+### macOS source validation
+
+The first macOS phase is source execution, not a distributable package. Use native
+Python/Node/pnpm and native TACWork/OpenCode binaries. Create the local ignored
+`opencode.jsonc` from `opencode.jsonc.example`, keep the `email_automation` MCP
+command pointed at `python scripts/mcp_server.py`, then run:
+
+```text
+node scripts/mac-stack.mjs start --root "/path/to/Email Automation" --development
+node scripts/mac-stack.mjs stop  --root "/path/to/Email Automation" --development
+```
+
+Set `TACWORK_ROOT`, or explicit `TACWORK_SERVER_BIN` and `TACWORK_ENGINE_BIN`,
+to native macOS artifacts. ARM64 uses `opencode-aarch64-apple-darwin`; Intel uses
+`opencode-x86_64-apple-darwin`. The launcher never reuses `.exe` files. It stores
+development state under `~/Library/Application Support/TAC AISolution/Email Automation Dev`.
+Production app-mode data uses the same path without `Dev`. Key material is stored
+in macOS Keychain; do not copy Windows `credentials.dat`.
+
+DeepSeek Harness configuration is backend-only: `DEEPSEEK_HARNESS_URL`, optional
+`DEEPSEEK_HARNESS_API_KEY`, `DEEPSEEK_HARNESS_MCP_ENABLED=true`, optional
+`DEEPSEEK_HARNESS_SCHEDULED_TAKEOVER=true`, and a Surface type/URL. A plain model
+API without MCP, session lifecycle and status/event output is an LLM Provider, not
+an Agent Provider, and must remain unavailable in this selector.
 
 ## Stale Frozen Run Cleanup
 

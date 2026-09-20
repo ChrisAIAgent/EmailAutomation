@@ -62,8 +62,8 @@ function Test-BackendIdentity {
 # Unified TACWork config: the Email frontend must reach the SAME ports the
 # TACWork server/web were started on. Derive the URLs from the resolved port
 # variables above (which honor TACWORK_SERVER_PORT / TACWORK_WEB_PORT). The
-# client token is a fixed local loopback identifier and is intentionally NOT
-# passed to the browser; a backend proxy is planned to remove it from the UI.
+# The browser now reads a sanitized Provider Surface from the backend and never
+# receives the local collaboration token.
 [Environment]::SetEnvironmentVariable("NEXT_PUBLIC_TACWORK_URL", "http://127.0.0.1:$script:TacWorkWebPort", "Process")
 [Environment]::SetEnvironmentVariable("NEXT_PUBLIC_TACWORK_SERVER_URL", "http://127.0.0.1:$script:TacWorkServerPort", "Process")
 $env:NEXT_PUBLIC_TACWORK_URL = "http://127.0.0.1:$script:TacWorkWebPort"
@@ -96,6 +96,7 @@ $env:NEXT_PUBLIC_API_URL = $env:API_URL
 $env:APP_URL = "http://127.0.0.1:$script:FrontendPort"
 $env:EMAIL_AUTOMATION_API_URL = $env:API_URL
 $env:TACWORK_SERVER_URL = "http://127.0.0.1:$script:TacWorkServerPort"
+$env:TACWORK_WEB_URL = "http://127.0.0.1:$script:TacWorkWebPort"
 $env:GOOGLE_REDIRECT_URI = "$($env:API_URL)/api/gmail/oauth/callback"
 $env:CORS_ORIGINS = "http://127.0.0.1:$script:FrontendPort,http://localhost:$script:FrontendPort,http://127.0.0.1:$script:TacWorkWebPort,http://localhost:$script:TacWorkWebPort,app://email-automation"
 $env:PORT = [string]$script:FrontendPort

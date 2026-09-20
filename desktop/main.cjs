@@ -14,10 +14,14 @@ const developmentMode = process.env.EMAIL_AUTOMATION_DESKTOP_DEV === "1";
 // Raw stderr from the most recent PowerShell launcher call. Retained purely so a
 // startup failure can be investigated after the fact.
 let lastLauncherStderr = "";
+function platformDataRoot(productName) {
+  if (process.platform === "darwin") {
+    return path.join(app.getPath("appData"), "TAC AISolution", productName);
+  }
+  return path.join(process.env.LOCALAPPDATA || app.getPath("userData"), "TAC AISolution", productName);
+}
 const developmentDataRoot = process.env.EMAIL_AUTOMATION_DATA_DIR || path.join(
-  process.env.LOCALAPPDATA || app.getPath("userData"),
-  "TAC AISolution",
-  "Email Automation Dev",
+  platformDataRoot("Email Automation Dev"),
 );
 
 // Electron's single-instance lock is scoped to userData.  Give the developer
@@ -37,7 +41,8 @@ function rootPath() {
     path.resolve(process.resourcesPath, "..", "..", ".."),
   ].filter(Boolean);
   for (const candidate of candidates) {
-    if (fs.existsSync(path.join(candidate, "VERSION")) && fs.existsSync(path.join(candidate, "scripts", "start-stack.ps1"))) return candidate;
+    const launcher = process.platform === "darwin" ? "mac-stack.mjs" : "start-stack.ps1";
+    if (fs.existsSync(path.join(candidate, "VERSION")) && fs.existsSync(path.join(candidate, "scripts", launcher))) return candidate;
   }
   throw new Error("runtime_integrity_failed:application_root_not_found");
 }
@@ -367,6 +372,32 @@ function runPowerShell(script, args = []) {
     });
   });
 }
+function runMacStack(action) {
+  return new Promise((resolve, reject) => {
+    const script = path.join(appRoot, "scripts", "mac-stack.mjs");
+    const args = [script, action, "--root", appRoot, ...(developmentMode ? ["--development"] : [])];
+    writeDiagnostic("mac_stack_start", { action });
+    const child = spawn(process.env.EMAIL_AUTOMATION_NODE_BIN || "node", args, {
+      cwd: appRoot,
+      env: {
+        ...process.env,
+        EMAIL_AUTOMATION_DATA_DIR: dataRoot,
+        EMAIL_AUTOMATION_BACKEND_PORT: String(selectedPorts.backend),
+        EMAIL_AUTOMATION_FRONTEND_PORT: String(selectedPorts.frontend),
+        TACWORK_SERVER_PORT: String(selectedPorts.tacworkServer),
+        TACWORK_WEB_PORT: String(selectedPorts.tacworkWeb),
+      },
+    });
+    let stderr = "";
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      lastLauncherStderr = stderr.trim();
+      writeDiagnostic("mac_stack_exit", { action, code });
+      code === 0 ? resolve() : reject(new Error(stderr.trim() || `service_start_failed:exit_${code}`));
+    });
+  });
+}
 async function waitForReady() {
   const deadline = Date.now() + 90000;
   while (Date.now() < deadline) {
@@ -397,9 +428,13 @@ async function startServices() {
   selectedPorts = await choosePorts();
   writeDiagnostic("ports_selected", { ports: selectedPorts });
   runtimeStatus = { stage: "services_starting", ports: selectedPorts, error: null };
-  const script = developmentMode ? "dev-stack.ps1" : "start-stack.ps1";
-  const args = developmentMode ? ["-Root", appRoot] : ["-Root", appRoot, "-SkipFrontend"];
-  await runPowerShell(path.join(appRoot, "scripts", script), args);
+  if (process.platform === "darwin") {
+    await runMacStack("start");
+  } else {
+    const script = developmentMode ? "dev-stack.ps1" : "start-stack.ps1";
+    const args = developmentMode ? ["-Root", appRoot] : ["-Root", appRoot, "-SkipFrontend"];
+    await runPowerShell(path.join(appRoot, "scripts", script), args);
+  }
   writeDiagnostic("launcher_complete", { ports: selectedPorts });
   await waitForReady();
   runtimeStatus = { stage: "ready", ports: selectedPorts, error: null };
@@ -407,10 +442,14 @@ async function startServices() {
 async function stopServices() {
   if (!selectedPorts) return;
   try {
-    await runPowerShell(
-      path.join(appRoot, "scripts", developmentMode ? "dev-stop.ps1" : "stop-stack.ps1"),
-      ["-Root", appRoot],
-    );
+    if (process.platform === "darwin") {
+      await runMacStack("stop");
+    } else {
+      await runPowerShell(
+        path.join(appRoot, "scripts", developmentMode ? "dev-stop.ps1" : "stop-stack.ps1"),
+        ["-Root", appRoot],
+      );
+    }
   } catch {}
 }
 function createWindow() {
@@ -537,7 +576,7 @@ if (!app.requestSingleInstanceLock()) app.quit();
 app.on("second-instance", () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } });
 app.whenReady().then(async () => {
   appRoot = rootPath();
-  dataRoot = process.env.EMAIL_AUTOMATION_DATA_DIR || path.join(process.env.LOCALAPPDATA || app.getPath("userData"), "TAC AISolution", "Email Automation");
+  dataRoot = process.env.EMAIL_AUTOMATION_DATA_DIR || platformDataRoot("Email Automation");
   fs.mkdirSync(dataRoot, { recursive: true });
   writeDiagnostic("app_ready", { appRoot, dataRoot });
   registerAppProtocol(); createWindow();

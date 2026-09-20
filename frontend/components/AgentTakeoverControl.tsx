@@ -59,8 +59,8 @@ export default function AgentTakeoverControl({ paused, onChanged }: { paused: bo
   const toggle = async () => {
     const enabled = !state?.enabled;
     if (enabled && !window.confirm(zh
-      ? "开启 Agent 接管后，TACWork 将按计划自动处理并真实发送符合安全规则的客户回复；需要人工审核的项目仍会跳过。确认开启？"
-      : "Agent Takeover will let TACWork process and really send eligible customer replies on schedule. Human-review items remain blocked. Enable it?")) return;
+      ? `开启 Agent 接管后，${state?.selected_provider || "当前 Agent"} 将按计划自动处理并真实发送符合安全规则的客户回复；需要人工审核的项目仍会跳过。确认开启？`
+      : `Agent Takeover will let ${state?.selected_provider || "the selected Agent"} process and really send eligible customer replies on schedule. Human-review items remain blocked. Enable it?`)) return;
     const minutes = parseInterval(intervalInput);
     if (minutes === null) return;
     setBusy(true); setError("");
@@ -146,6 +146,7 @@ export default function AgentTakeoverControl({ paused, onChanged }: { paused: bo
           <option value="all">{zh ? "全部：Inbox + Campaign" : "All: Inbox + Campaign"}</option>
         </select>
         <div className="text-[10px] text-muted space-y-1">
+          <div>{zh ? "Provider" : "Provider"}: {state?.selected_provider || "tacwork"}</div>
           <div className="flex items-center gap-1"><Clock size={10} /><span>{zh ? "下次" : "Next"}: {state?.display_time?.next_run_at?.local || localDateTime(state?.next_run_at)}</span></div>
           <div>{zh ? "状态" : "Status"}: {paused ? (zh ? "已全局暂停" : "Globally paused") : running ? (zh ? "运行中" : "Running") : (state?.last_status || (zh ? "空闲" : "Idle"))}</div>
           {state?.current_stage && <div className="truncate" title={state.current_stage}>{zh ? "阶段" : "Stage"}: {state.current_stage}</div>}

@@ -1,6 +1,6 @@
 # Email Automation Workspace: Agent Quick Start
 
-> After this file, read `docs/AGENT_CAPABILITIES.md` for the embedded TACWork
+> After this file, read `docs/AGENT_CAPABILITIES.md` for the embedded Agent
 > intent-to-tool map. This file remains the single authoritative contract.
 
 ## Execution modes: full-auto first
@@ -20,9 +20,9 @@ according to its execution contract, but it must not bypass an unresolved Contac
 admission `human_review`. Only admitted Contacts proceed to reply/follow-up policy.
 In semi-auto, the single frozen-batch confirmation is the user approval point.
 
-## Embedded TACWork: first-message guidance
+## Embedded Agent Provider: first-message guidance
 
-For the first natural-language message in a new embedded TACWork session, and whenever
+For the first natural-language message in a new embedded Agent session, and whenever
 the user says “start”, “take over”, or “help me review”, call the read-only MCP tool
 `ea_takeover_status` before proposing work. It reads the real operational state only:
 it must not sync Gmail, write local data, create Contacts, Drafts or Approvals, or send
@@ -465,17 +465,30 @@ When Gmail sync shows repeated 401 refresh failures or
 `Gmail API retry exhausted`, stop writes and use the dashboard header to
 disconnect and reconnect Gmail. OAuth renewal does not delete operational data.
 
-## Embedded TACWork Agent contract
+## Embedded Agent Provider contract
 
-The Email Automation web UI embeds TACWork as the right-side resident Agent panel.
-It is an operator console for this Workspace, not a separate business system.
+The Email Automation web UI hosts a provider-neutral right-side Agent panel. TACWork
+is the default Provider; a configured DeepSeek Harness may be selected without
+changing Email Automation's business or send rules. Both Providers must use the
+same typed `ea_*` MCP boundary. They are operator consoles for this Workspace, not
+separate business systems.
+
+`GET /api/agent-providers` reports the selected Provider, configuration state,
+capabilities and a sanitized UI Surface. `PUT /api/agent-provider` changes only
+future Agent Sessions. A switch is rejected while a Session is running, when the
+requested Provider is not configured or healthy, or when its protocol is invalid.
+Provider failure must return an explicit `agent_provider_*` error; never silently
+fall back from DeepSeek Harness to TACWork or from TACWork to DeepSeek Harness.
+Provider selection is stored in SystemFlag and audited as `agent_provider_changed`;
+API keys, capability tokens, prompts, message bodies and credentials are never
+included in the response or AuditLog.
 
 ### Scheduled Agent Takeover
 
 The Web sidebar's **Agent Takeover** switch is the operator's standing,
 revocable authorization for routine operations within its configured scope:
 `inbox` (default), `campaign`, or `all`. While enabled,
-the backend scheduler creates a fresh TACWork root session at each selected
+the backend scheduler creates a fresh Session through the selected Provider at each selected
 interval and never reuses a previous operating conversation. Each session gets
 a short-lived capability token bound to the active takeover grant in private
 system context, never in the visible session prompt, transcript, report, or MCP
@@ -501,24 +514,26 @@ decisions remain subject to the configured scope and server policy gates. Contac
 admission, ambiguous opt-out and content review stay human-only. The grant
 never bypasses pause, suppression, send windows, daily limits, idempotency,
 Gmail thread integrity, OAuth, or delivery reconciliation. Global pause always wins. The
-legacy Huey Automation scanner never executes Global scope; TACWork is the sole
-scheduler for that scope. Every scheduled cycle has a
+legacy Huey Automation scanner never executes Global scope; Agent Takeover is the sole
+scheduler for that scope. The selected Provider must advertise
+`scheduled_takeover`; otherwise enabling the switch is rejected with
+`agent_provider_capability_missing`. Every scheduled cycle has a
 correlation ID; session creation and authorized MCP stages write sanitized
 structured AuditLog entries without tokens, credentials, recipients or bodies.
 
 The Agent Takeover cadence accepts any whole-minute value from 1 through 1440.
 Recommended values are 1, 15, 30, 60, 120, 240 and 1440 minutes; use 1 minute
-only for short diagnostics because it can create frequent TACWork sessions. UTC is the sole stored and
+only for short diagnostics because it can create frequent Agent sessions. UTC is the sole stored and
 comparison time; the Workspace persists the most recently connected operator
 computer's IANA time zone for all user-visible dates. The Web UI, Automation
-status, TACWork session title, and scheduled report must use the returned local
+status, Agent session title, and scheduled report must use the returned local
 display time including its zone label, never a raw UTC timestamp. This is a
 local-runtime schedule: the computer and the unified stack must remain running;
-shutdown, sleep, or a stopped Backend/Consumer/TACWork runtime prevents a wake-up
+shutdown, sleep, or a stopped Backend/Consumer/selected Provider runtime prevents a wake-up
 until the stack is started again. It is not a cloud wake-on-device service.
 
 Scheduled-session monitoring must use `GET /api/agent-takeover`, current Agent
-Run state, and the TACWork session snapshot together. The minute scheduler checks
+Run state, and the selected Provider session snapshot together. The minute scheduler checks
 an active Session for idle state before evaluating the next due time. It marks a
 cycle `completed` only when no authorized MCP stage failed; otherwise it records
 `completed_with_errors`, preserves `last_error`, clears only `active_session_id`,
@@ -545,12 +560,21 @@ credential configuration only through an approved secure migration channel; neve
 put `.env`, encryption keys, OAuth credentials, databases, or logs into a normal
 portable customer package. Start the new machine with `start-stack.bat`, then
 verify `/api/health`, `/api/gmail/status`, `/api/system/pause`,
-`/api/agent-takeover`, Consumer health, and the embedded TACWork MCP connection
+`/api/agent-takeover`, Consumer health, and the selected Provider MCP connection
 before enabling or relying on scheduled takeover. If the database and its matching
 encryption key are not migrated together, reconnect Gmail and configure the new
-environment instead of attempting to reuse unreadable credentials. Old TACWork
+environment instead of attempting to reuse unreadable credentials. Old Agent
 sessions are not portable operating context; the next scheduled cycle must create
 a new root session.
+
+For the macOS source-validation phase, mutable data lives under
+`~/Library/Application Support/TAC AISolution/Email Automation` (or the explicit
+development directory), credentials use the current user's macOS Keychain, and
+Windows `credentials.dat` is never read or migrated. Start/stop through
+`scripts/mac-stack.mjs`; it requires native `aarch64-apple-darwin` or
+`x86_64-apple-darwin` TACWork/OpenCode artifacts and an operator-created
+`opencode.jsonc` wired to `scripts/mcp_server.py`. This is source validation only;
+Mac installer, signing, notarization and auto-update remain a later packaging phase.
 
 For diagnostics, inspect `logs/backend.log`, `logs/backend-error.log`,
 `logs/consumer-error.log`, and `logs/mcp-server.log`. The MCP log records only

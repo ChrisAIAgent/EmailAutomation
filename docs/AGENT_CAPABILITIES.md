@@ -2,13 +2,13 @@
 
 本项目已交付客户；当前 Workspace 是正式运营环境。以下能力说明用于正式运营和受授权维护，不应默认包装为 Demo 或测试任务。
 
-This is the action map for the embedded TACWork Agent. `AGENTS.md` remains the
+This is the action map for every embedded Agent Provider. `AGENTS.md` remains the
 authoritative safety and operating contract. The local MCP tools only call the
 existing loopback API; they do not implement or bypass business logic.
 
 ## Embedded panel conversation start
 
-On the first user message in a TACWork session, call `ea_takeover_status` before
+On the first user message in a TACWork or DeepSeek Harness session, call `ea_takeover_status` before
 asking the user to choose a task. Give a short, plain-language production status:
 service/Gmail/AI/pause/send state, real queues, and up to three next actions. This
 is read-only. Do not run sync, triage, CRM changes, Campaign/Automation changes,
@@ -75,7 +75,9 @@ Approve / Reject / Agent Decide.
 ## Mandatory rules
 
 - Call the three health/status tools before a write action.
-- Direct TACWork write tools require `user_authorized=true` after explicit user authorization. A valid, active Agent Takeover capability is standing authorization for its allowed operating tools, except Contact admission which always remains human-only.
+- Direct Agent write tools require `user_authorized=true` after explicit user authorization. A valid, active Agent Takeover capability is standing authorization for its allowed operating tools, except Contact admission which always remains human-only.
+- TACWork and DeepSeek Harness share this exact `ea_*` inventory. A Provider may orchestrate sessions, surfaces and events, but it must not call Email Automation business REST directly, read SQLite, or access Gmail/OAuth/model credentials. Provider selection uses `GET /api/agent-providers` and `PUT /api/agent-provider`; these are host configuration APIs, not alternate business-action paths.
+- Provider errors are explicit: `agent_provider_not_configured`, `agent_provider_unreachable`, `agent_provider_capability_missing`, `agent_provider_session_active`, `agent_provider_protocol_error`, or `agent_provider_timeout`. Never silently retry through the other Provider.
 - Contacts use one shared record: imported leads start as `category=prospect`, `intent_level=unknown`, `lifecycle_stage=new_customer`, `next_action=review`, and `status=new`. `category` (System Category), `intent_level` (Intent), `segments`, and `tags` are independent fields; changing one must not overwrite the others.
 - Use `ea_find_contacts` for deterministic server-side selection such as `category=prospect` plus `segments_any=IT`; do not infer Contact IDs from prose. Use `ea_update_contact` for an ordinary authorized field edit and `ea_transition_contact` for `qualify`, `customer`, or `invalid` so Campaign membership, Draft/Approval and follow-up cleanup stay atomic and audited.
 - A `qualify` transition requires a current source Campaign: an explicit `campaign_id` is required when there are multiple active memberships, and one active membership may be inferred. A Contact with no active Campaign cannot be qualified by an Inbox-only reply. The transition changes only the source membership to `converted`, cancels that Campaign's unexecuted work, and preserves the Contact, Gmail thread, sent mail and audit history. `invalid` stops all future Campaign work; `customer` is an explicit authorized business transition.

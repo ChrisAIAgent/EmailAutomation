@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..consumer_status import read_consumer_status
 from ..services import agent_takeover as takeover_svc
+from ..services import agent_providers as provider_svc
 from ..services import workspace_time
 from ..services.agent_profile import get_or_create_profile
 from ..services.automation import create_automation, parse_plan
@@ -92,6 +93,14 @@ def get_agent_takeover(db: Session = Depends(get_db)):
 def update_agent_takeover(body: AgentTakeoverUpdate, db: Session = Depends(get_db)):
     owner_id = ensure_owner(db)
     effective_scope = body.scope or takeover_svc.scope_value(db)
+    if body.enabled:
+        try:
+            provider_svc.require_capability(
+                provider_svc.get_selected_provider(db),
+                provider_svc.CAP_SCHEDULED_TAKEOVER,
+            )
+        except provider_svc.AgentProviderError as exc:
+            raise HTTPException(status_code=409, detail=exc.code) from exc
     profile = get_or_create_profile(db, owner_id)
     automation = _global_automation(db, owner_id)
     if automation is None:
@@ -261,7 +270,8 @@ def record_agent_takeover_telemetry(body: AgentTakeoverTelemetry, db: Session = 
         flags.set_flag(db, takeover_svc.FLAG_CYCLE_HAS_ERRORS, "true")
     cycle_id = flags.get_flag(db, takeover_svc.FLAG_CYCLE_ID)
     db.add(models.AuditLog(
-        actor="tacwork", action=f"agent_takeover_{body.stage}_{body.status}",
+        actor=takeover_svc.status(db).get("session_provider") or provider_svc.selected_provider_id(db),
+        action=f"agent_takeover_{body.stage}_{body.status}",
         entity="agent_takeover", entity_id=cycle_id,
         detail=json.dumps(body.detail or {}), success=body.status != "failed",
     ))

@@ -10,7 +10,11 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const root = path.resolve(__dirname, "..");
-const electron = path.join(__dirname, "node_modules", "electron", "dist", "electron.exe");
+const electron = process.platform === "darwin"
+  ? path.join(__dirname, "node_modules", "electron", "dist", "Electron.app", "Contents", "MacOS", "Electron")
+  : process.platform === "win32"
+    ? path.join(__dirname, "node_modules", "electron", "dist", "electron.exe")
+    : path.join(__dirname, "node_modules", "electron", "dist", "electron");
 if (!fs.existsSync(electron)) {
   console.error("dev_dependency_missing: run npm ci in the desktop directory on the development machine.");
   process.exit(1);

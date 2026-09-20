@@ -22,7 +22,7 @@ from .db import init_db, SessionLocal
 from .events import queue as event_queue
 from . import models  # noqa: F401  (register models)
 from .logging_config import configure_logging, trace_id_var
-from .api import gmail, campaigns, contacts, inbox, approvals, comparisons, dashboard, system, automation, agent_runs, knowledge, agent_profile, agent_takeover
+from .api import gmail, campaigns, contacts, inbox, approvals, comparisons, dashboard, system, automation, agent_runs, knowledge, agent_profile, agent_takeover, agent_providers
 from .api.deps import ensure_owner, get_db
 from .errors import register_error_handlers
 from .scheduler import start as start_scheduler
@@ -139,6 +139,7 @@ app.include_router(agent_runs.router)
 app.include_router(knowledge.router)
 app.include_router(agent_profile.router)
 app.include_router(agent_takeover.router)
+app.include_router(agent_providers.router)
 
 
 @app.middleware("http")

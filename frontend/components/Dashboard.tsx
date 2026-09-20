@@ -14,7 +14,7 @@ import ActivityView from "./Activity";
 import ComparisonView from "./Comparison";
 import KnowledgeBaseView from "./KnowledgeBase";
 import AgentProfileView from "./AgentProfile";
-import TacWorkPanel from "./TacWorkPanel";
+import AgentPanel from "./AgentPanel";
 import AgentTakeoverControl from "./AgentTakeoverControl";
 import AutomationView from "./Automation";
 import DiagnosticsView from "./Diagnostics";
@@ -213,7 +213,7 @@ export default function Dashboard() {
           {tab === "diagnostics" && <DiagnosticsView />}
         </div>
       </main>
-      <TacWorkPanel />
+      <AgentPanel />
     </div>
   );
 }

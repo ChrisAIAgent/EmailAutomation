@@ -80,6 +80,15 @@ export function friendlyError(e: any, zh: boolean): string {
   if (key === "gmail_sync_failed") {
     return zh ? "Gmail 同步暂时遇到网络连接中断，请稍后重试；已同步的邮件不会丢失。" : "Gmail sync was interrupted by a network connection issue. Retry shortly; already-synced mail is preserved.";
   }
+  const providerErrors: Record<string, [string, string]> = {
+    agent_provider_not_configured: ["所选 Agent Provider 尚未完成配置。", "The selected Agent Provider is not configured."],
+    agent_provider_unreachable: ["所选 Agent Provider 当前无法连接。", "The selected Agent Provider is unreachable."],
+    agent_provider_capability_missing: ["所选 Agent Provider 不支持该能力。", "The selected Agent Provider does not support this capability."],
+    agent_provider_session_active: ["仍有 Agent Session 在运行，停止后才能切换 Provider。", "An Agent session is still running. Stop it before switching Provider."],
+    agent_provider_protocol_error: ["Agent Provider 返回了不兼容的协议结果。", "The Agent Provider returned an incompatible protocol response."],
+    agent_provider_timeout: ["Agent Provider 请求超时，未自动切换到其他 Provider。", "The Agent Provider timed out; no automatic fallback was performed."],
+  };
+  if (providerErrors[key]) return zh ? providerErrors[key][0] : providerErrors[key][1];
   if (status && code) return `${status}: ${code}`;
   return raw;
 }
@@ -238,6 +247,9 @@ export const api = {
     req<any>("/api/agent-takeover/display-timezone", { method: "POST", body: JSON.stringify({ display_timezone: displayTimezone }) }),
   runAgentTakeoverNow: () =>
     req<any>("/api/agent-takeover/run-now", { method: "POST" }, LONG_ACTION_TIMEOUT_MS),
+  agentProviders: () => req<any>("/api/agent-providers"),
+  selectAgentProvider: (providerId: string) =>
+    req<any>("/api/agent-provider", { method: "PUT", body: JSON.stringify({ provider_id: providerId }) }, 30_000),
 
   // Automation
   automations: () => req<any>("/api/automation"),
