@@ -33,6 +33,8 @@ coverage/
 opencode.jsonc
 opencode.jsonc.*
 !opencode.jsonc.example
+.mac.env
+mac.env
 config/secrets/
 
 # ---------------- Database & runtime data (REAL PII + customer email) -----

@@ -661,7 +661,25 @@ integration issue, not evidence that Email Automation business services failed.
 The first macOS phase is source execution, not a distributable package. Use native
 Python/Node/pnpm and native TACWork/OpenCode binaries. Create the local ignored
 `opencode.jsonc` from `opencode.jsonc.example`, keep the `email_automation` MCP
-command pointed at `python scripts/mcp_server.py`, then run:
+command pointed at `python scripts/mcp_server.py`. After copying the source tree to
+an Apple Silicon Mac, the supported setup path is:
+
+```text
+node scripts/mac-setup.mjs --root "/path/to/Email Automation"
+cd desktop && npm run dev
+```
+
+For a copied folder placed beside a native `TACWork` folder, the convenience
+launcher `mac-debug.command` detects that sibling automatically. If Finder does
+not preserve its executable bit, run `chmod +x mac-debug.command mac-stop.command`
+once and double-click `mac-debug.command`. It creates only ignored development
+state under `~/Library/Application Support/TAC AISolution/Email Automation Dev`.
+The setup script generates a new local encryption key, creates the local `.env`
+there when absent, installs the backend/frontend/Electron dependencies, and never
+copies Windows credentials, databases, or logs. Fill in the generated local LLM
+settings before using generation tools.
+
+The lower-level start/stop commands remain available:
 
 ```text
 node scripts/mac-stack.mjs start --root "/path/to/Email Automation" --development

@@ -571,7 +571,10 @@ For the macOS source-validation phase, mutable data lives under
 `~/Library/Application Support/TAC AISolution/Email Automation` (or the explicit
 development directory), credentials use the current user's macOS Keychain, and
 Windows `credentials.dat` is never read or migrated. Start/stop through
-`scripts/mac-stack.mjs`; it requires native `aarch64-apple-darwin` or
+`scripts/mac-setup.mjs` plus `desktop/npm run dev`, or the copied-tree
+`mac-debug.command` convenience launcher. The setup creates only ignored
+development state and never copies Windows credentials, databases or logs.
+The lower-level `scripts/mac-stack.mjs` requires native `aarch64-apple-darwin` or
 `x86_64-apple-darwin` TACWork/OpenCode artifacts and an operator-created
 `opencode.jsonc` wired to `scripts/mcp_server.py`. This is source validation only;
 Mac installer, signing, notarization and auto-update remain a later packaging phase.

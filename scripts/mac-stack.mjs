@@ -74,6 +74,11 @@ const mcpConfig = path.join(root, "opencode.jsonc");
 for (const [name, target] of [["tacwork_server", tacworkServer], ["tacwork_engine", tacworkEngine], ["mcp_config", mcpConfig]]) {
   if (!fs.existsSync(target)) throw new Error(`${name}_missing:${target}`);
 }
+for (const [name, target] of [["tacwork_server", tacworkServer], ["tacwork_engine", tacworkEngine]]) {
+  try { fs.accessSync(target, fs.constants.X_OK); } catch { throw new Error(`${name}_not_executable:${target}`); }
+}
+
+const localPythonBin = path.join(root, "backend", ".venv", "bin");
 
 const commonEnv = {
   ...process.env,
@@ -89,7 +94,9 @@ const commonEnv = {
   TACWORK_WEB_URL: `http://127.0.0.1:${ports.tacworkWeb}`,
   NEXT_PUBLIC_API_URL: `http://127.0.0.1:${ports.backend}`,
   NEXT_PUBLIC_TACWORK_URL: `http://127.0.0.1:${ports.tacworkWeb}`,
-  PATH: `${path.join(root, "scripts")}:${process.env.PATH || ""}`,
+  // Keep the MCP command in opencode.jsonc portable: the child TACWork/OpenCode
+  // process resolves `python` to the copied workspace venv on macOS.
+  PATH: `${localPythonBin}:${path.join(root, "scripts")}:${process.env.PATH || ""}`,
 };
 
 const services = [];
@@ -154,4 +161,4 @@ if (!ready) {
   throw new Error("mac_stack_health_timeout");
 }
 
-console.log(JSON.stringify({ status: "ready", dataRoot, ports }));
+console.log(JSON.stringify({ status: "ready", architecture: process.arch, dataRoot, ports }));
