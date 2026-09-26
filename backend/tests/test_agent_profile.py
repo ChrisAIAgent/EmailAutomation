@@ -1,4 +1,8 @@
+import asyncio
+
 from app import models
+from app.main import app, lifespan
+from app.services import flags
 from app.services.agent_profile import apply_profile_to_reply, resolve_profile
 
 
@@ -30,6 +34,22 @@ def test_agent_profile_api_creates_and_updates_default(client, db):
     assert mode.status_code == 200
     assert mode.json()["approval_mode"] == "agent_review"
     assert db.query(models.AuditLog).filter_by(action="agent_approval_mode_updated").count() == 1
+
+
+def test_agent_review_survives_restart_when_takeover_is_disabled(db):
+    resolve_profile(db, 1)
+    profile = db.query(models.AgentProfile).filter_by(owner_id=1).one()
+    profile.approval_mode = "agent_review"
+    flags.set_flag(db, "agent_takeover_enabled", "false")
+    db.commit()
+
+    async def restart_once():
+        async with lifespan(app):
+            pass
+
+    asyncio.run(restart_once())
+    db.expire_all()
+    assert db.query(models.AgentProfile).filter_by(owner_id=1).one().approval_mode == "agent_review"
 
 
 def test_reply_postprocessor_removes_bad_signature_and_matches_chinese(db):

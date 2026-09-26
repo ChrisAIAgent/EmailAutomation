@@ -32,13 +32,16 @@
 
 ## Global Approval Mode
 
-Before starting or confirming an Automation Run, read `/api/agent-profile` and
+Before generating a Campaign first email, or starting or confirming an Automation Run, read `/api/agent-profile` and
 report `approval_mode`. `human_review` is the Workspace default and forces all
 future Agent Runs to `semi_auto`; the Agent may prepare a frozen plan but a
 person must confirm it or approve a pending item in the Web UI. `agent_review`
 permits the configured Run mode, including `full_auto`, only after all existing
 server safety checks pass. Campaign configuration cannot override this global
-limit.
+limit. For a newly generated Campaign first email, `agent_review` also permits
+the generation endpoint to dispatch that new Approval through the same
+server-side send-safety path. Existing pending Approvals are not retroactively
+sent when the mode changes; a blocked or unknown dispatch remains pending.
 
 Approval `rejected` means no send and the unsent Draft is cancelled. `expired`
 means the operator invalidated it or sync reconciled it as already sent; its
@@ -65,8 +68,10 @@ revision must never trigger Approval invalidation, Campaign-member removal, or a
 replacement Draft. Only a direct operator instruction that the item is obsolete
 or already sent may invalidate it; only a direct operator instruction may remove
 a Campaign member. After each successful revision, show the exact revised
-recipient, subject and body. The final approval or semi-auto confirmation is the
-only release point for sending.
+recipient, subject and body. For Human Review or a blocked Agent Review
+dispatch, the final approval or semi-auto confirmation is the release point for
+sending; an Agent Review dispatch that already succeeded has no pending Approval
+to revise or release again.
 
 本项目已经交付客户，当前 Workspace 是正式运营环境。开发、维护、检查和业务操作均按正式环境标准执行；除非用户明确指定 `test` / `demo`，不得默认使用 Demo、测试或非正式运营框架描述任务。
 
@@ -127,15 +132,18 @@ GET  /api/contacts
 POST /api/contacts
 POST /api/contacts/import
 PUT  /api/contacts/{contact_id}
+POST /api/contacts/{contact_id}/transition
 ```
 
-人工新建或文件导入 Contact 至少需要合法邮箱，以及姓名或公司之一。Inbox 自动接管不得仅凭“是真人”创建 Contact；还必须确认其属于业务客户候选。Agent 自动创建时必须从当前发件人的正文或签名明确取得姓名或公司，不得只用邮箱占位，不得猜测身份。
+文件导入和显式的线索录入至少需要合法邮箱，以及 `first_name` 或 `last_name` 之一。新线索必须使用 `system_category=prospect`；导入后默认 `intent_level=unknown`、`lifecycle_stage=new_customer`、`next_action=review`、`status=new`。旧版没有分类列的 CSV 只能走兼容模式，默认 Prospect 并返回兼容警告。Inbox 自动接管不得仅凭“是真人”创建 Contact；还必须确认其属于业务客户候选。Agent 自动创建时必须从当前发件人的正文或签名明确取得姓名或公司，不得只用邮箱占位，不得猜测身份。
 
 `PUT` 是部分更新，只提交要修改的字段。未提交字段保持不变；显式传入 `null` 才会清除允许为空的字段。更新后重新读取联系人，核对身份、分类与标签。
 
 `manual_lock=true` 表示人工 CRM 判断优先，AI 不覆盖普通分类和销售字段；退订、拒绝、投诉、退信等安全停止信号仍必须执行。
 
-Contact 表示“已确认的真人业务客户候选”，不是所有真人来信的通讯录。求职、测试、转发身份和明确非客户默认不进入 Contacts。标签描述当前沟通内容，例如 `pricing`、`demo_request`、`partnership`、`support_request`、`complaint`；新消息可以移除旧意图标签并增加新标签。
+Contact 是统一客户池中的一条记录，可表示从 Prospect 到 Qualified、Customer 或 Invalid 的生命周期；它不是通过 Lead 表复制出来的第二份联系人。文件导入的 Prospect 是用户明确提供的线索，不等同于 Inbox 未知发件人的自动准入。求职、测试、转发身份和明确非客户的 Inbox 邮件仍不得绕过 Contact-admission gate 进入 Contacts。
+
+字段职责必须保持独立：System Category (`category`) 是 `prospect`、`qualified`、`customer`、`partner`、`won`、`invalid` 等运营分类；Intent (`intent_level`) 是 `unknown`、`low`、`medium`、`high` 的意向强度；Segments 是用户管理的可多选客户分群，例如 `IT`、`Finance`；Tags 是可自由输入的多值备注/检索词，例如 `demo_request`、`met-event`、`priority-client`。Segments 和 Tags 都支持逗号或分号输入并去重，但不合并；Notes 只是长文本备注，不参与自动资格判断。
 
 自动创建和动态状态更新分别写入 AuditLog：
 
@@ -146,11 +154,31 @@ contact_state_updated_from_conversation
 
 第二种记录包含 `before`、`after`、`thread_id` 和本次 intent。Agent 不得把自己的自动修正称为人工复核。
 
+### Contact lifecycle transitions
+
+分类转换必须统一调用 `POST /api/contacts/{contact_id}/transition` 或
+`ea_transition_contact`，不能由 Inbox、Campaign 和 UI 各自实现副作用：
+
+| Action | Result |
+| --- | --- |
+| `qualify` | Sales-related reply (`interested`, `asking_question`, `objection` or the existing sales rule) changes the Contact to Qualified, maps Intent to high/medium, closes only the source Campaign membership as `converted`, and cancels that Campaign's unexecuted Draft/Approval/follow-up work. |
+| `customer` | Explicit user or authorized Agent transition to Customer; it may close one explicitly selected source Campaign, but never creates another Campaign automatically. |
+| `invalid` | Stops the Contact, closes all active Campaign memberships and cancels future work. Confirmed opt-out remains subject to the existing human review gate. |
+
+All transitions preserve Contact, Gmail thread, sent mail, Approval, DeliveryAttempt and AuditLog history. A Contact in multiple Campaigns cannot be qualified against an inferred source; the Agent must identify the source Campaign first. A Contact with no active Campaign cannot be qualified by an Inbox-only reply. A Contact with no qualifying reply remains Prospect and stays eligible for the current Campaign cadence.
+
 ## 3. Campaign 获客
 
 空 Campaign 列表表示当前尚未创建活动，是正常状态；它不是“Campaign 配置文件”缺失。用户给出完整名称、活动说明、目标客户、语言/语气等信息并明确授权后，直接按 typed MCP 顺序创建、加成员、核验成员、启动和生成，不要在源码或磁盘中查找配置文件。
 
-Campaign 生成调用如遇超时，结果必须视为未知。先读取 generation status、pending Approvals 和成员状态：`running` 时等待并对账；`failed`/`partial` 时停止并报告真实原因。不得自动重试或以旧状态代替新的工具调用结果。只有取得新的明确用户授权，并重新确认成员为 active + queued、没有对应 pending Approval 后，才可再调用一次生成工具；生成后立即重新读取结果。
+Campaign 生成调用如遇超时，结果必须视为未知。先读取 generation status、
+`send_status`、`sent`、`send_failed`、`send_failures`、pending Approvals、
+成员状态和 Gmail 结果：`running` 时等待并对账；`failed`/`partial` 时停止并
+报告真实原因。`agent_review` 下生成和发送是两个需要分别对账的阶段，
+`generated` 不等于 `sent`；`completed` 也必须结合 Gmail 结果确认实际发送。
+不得自动重试或以旧状态代替新的工具调用结果。只有取得新的明确用户授权，
+并重新确认成员为 active + queued、没有对应 pending Approval 后，才可再调用
+一次生成工具；生成后立即重新读取结果。
 
 标准流程：
 
@@ -158,18 +186,29 @@ Campaign 生成调用如遇超时，结果必须视为未知。先读取 generat
 2. `POST /api/campaigns` 创建 Campaign。
 3. `POST /api/campaigns/{id}/contacts` 添加成员。
 4. `POST /api/campaigns/{id}/start` 激活。
-5. `POST /api/campaigns/{id}/generate` 生成 Draft 和 Approval。
-6. `GET /api/approvals?status=pending` 复核。
-7. 用户授权后调用 `POST /api/approvals/{id}/decision`。
+5. `POST /api/campaigns/{id}/generate` 生成首封邮件。`human_review` 保留
+   pending Draft/Approval；`agent_review` 对本次新生成的 Approval 继续走
+   同一服务端发送安全链路。
+6. 读取 generation status、发送统计和 `GET /api/approvals?status=pending`；
+   阻断或结果未知的邮件仍需人工复核，不能报告为已发送。
+7. 对仍为 pending 且明确需要人工放行的 Approval，用户授权后调用
+   `POST /api/approvals/{id}/decision`。
 8. 查询 Approval 和 Gmail 结果，必要时由收件邮箱确认送达。
 
 嵌入式 TACWork Agent 执行上述日常链路时，必须依次使用已注册的 typed MCP 工具：
+`ea_find_contacts`、`ea_update_contact`、`ea_transition_contact`、
 `ea_list_contacts`、`ea_create_campaign`、`ea_add_campaign_contacts`、
 `ea_start_campaign`、`ea_generate_campaign_outreach`，以及需要时的
 `ea_generate_automation_plan`、`ea_create_automation`、`ea_enable_automation` 和
 `ea_schedule_automation`。加入成员前后用 `ea_list_campaign_members` 核验结果。
 不得为了查找普通业务接口而派生 Explore/源码检索任务；若工具缺失或服务拒绝，
 如实报告该操作不可用或失败，并停在现有安全边界。
+
+典型的线索筛选链路是：先用 `ea_import_contacts` 预览并验证所有新行的
+`system_category=prospect`，再用 `ea_find_contacts(category=prospect,
+segments_any=[IT])` 获取确定的联系人 ID，得到用户授权后加入 Campaign。收到当前
+Campaign Thread 的明确销售回复后，调用 `ea_transition_contact(qualify,
+campaign_id=...)`；该操作只关闭来源 Campaign，不自动创建下一轮 Campaign。
 
 Approval 至少检查收件人、联系人身份、Campaign 匹配、主题、正文、重复发送、事实准确性、suppression、发送窗口和每日上限。
 

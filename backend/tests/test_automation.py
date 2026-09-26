@@ -58,15 +58,27 @@ def test_create_enable_pause(client):
     c = client.post("/api/automation", json={"prompt": "p", "campaign_id": cid, "plan": plan})
     assert c.status_code == 200, c.text
     aid = c.json()["id"]
-    assert c.json()["status"] == "disabled"
+    assert c.json()["status"] == "enabled"
+    assert c.json()["next_run_at"] is not None
+
+    p = client.post(f"/api/automation/{aid}/pause")
+    assert p.status_code == 200 and p.json()["status"] == "paused"
+    assert p.json()["next_run_at"] is None
 
     e = client.post(f"/api/automation/{aid}/enable")
     assert e.status_code == 200 and e.json()["status"] == "enabled"
     assert e.json()["next_run_at"] is not None
 
-    p = client.post(f"/api/automation/{aid}/pause")
-    assert p.status_code == 200 and p.json()["status"] == "paused"
-    assert p.json()["next_run_at"] is None
+
+def test_create_disabled_plan_stays_disabled(client):
+    cid = _make_campaign(client)
+    created = client.post("/api/automation", json={
+        "prompt": "p", "campaign_id": cid,
+        "plan": {"enabled": False, "tick_interval_minutes": 60},
+    })
+    assert created.status_code == 200, created.text
+    assert created.json()["status"] == "disabled"
+    assert created.json()["next_run_at"] is None
 
 
 def test_web_scheduler_status_does_not_require_electron(client):

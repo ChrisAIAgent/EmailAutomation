@@ -24,6 +24,7 @@ class AgentTakeoverUpdate(BaseModel):
     enabled: bool
     interval_minutes: StrictInt = Field(default=60, ge=takeover_svc.MIN_INTERVAL_MINUTES, le=takeover_svc.MAX_INTERVAL_MINUTES, description="Agent Takeover cadence in whole minutes (1-1440).")
     display_timezone: str | None = None
+    scope: str | None = Field(default=None, pattern="^(inbox|campaign|all)$")
 
 
 class WorkspaceDisplayTimezoneUpdate(BaseModel):
@@ -33,10 +34,12 @@ class WorkspaceDisplayTimezoneUpdate(BaseModel):
 class AgentTakeoverAuthorize(BaseModel):
     token: str
     operation: str
+    requested_scope: str | None = Field(default=None, pattern="^(campaign|global)$")
     automation_id: int | None = None
     campaign_id: int | None = None
     thread_id: int | None = None
     approval_id: int | None = None
+    contact_id: int | None = None
 
 
 class AgentTakeoverTelemetry(BaseModel):
@@ -88,6 +91,7 @@ def get_agent_takeover(db: Session = Depends(get_db)):
 @router.post("")
 def update_agent_takeover(body: AgentTakeoverUpdate, db: Session = Depends(get_db)):
     owner_id = ensure_owner(db)
+    effective_scope = body.scope or takeover_svc.scope_value(db)
     profile = get_or_create_profile(db, owner_id)
     automation = _global_automation(db, owner_id)
     if automation is None:
@@ -120,7 +124,7 @@ def update_agent_takeover(body: AgentTakeoverUpdate, db: Session = Depends(get_d
     try:
         takeover_svc.configure(
             db, enabled=body.enabled, interval_minutes=body.interval_minutes,
-            display_timezone=body.display_timezone,
+            display_timezone=body.display_timezone, scope=effective_scope,
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -131,6 +135,7 @@ def update_agent_takeover(body: AgentTakeoverUpdate, db: Session = Depends(get_d
             "interval_minutes": body.interval_minutes,
             "approval_mode": profile.approval_mode,
             "execution_mode": automation.execution_mode,
+            "scope": effective_scope,
         }),
     ))
     db.commit()
@@ -162,27 +167,43 @@ def authorize_agent_takeover(body: AgentTakeoverAuthorize, db: Session = Depends
     """Validate one scheduled-session capability without expanding its scope."""
     owner_id = ensure_owner(db)
     campaign_operations = {
-        "add_campaign_contacts", "update_campaign", "generate_campaign_outreach",
+        "create_campaign", "add_campaign_contacts", "update_campaign", "generate_campaign_outreach",
         "start_campaign", "pause_campaign", "stop_campaign", "remove_campaign_contact",
     }
+    contact_operations = {"update_contact", "transition_contact"}
     automation_operations = {
         "enable_automation", "pause_automation", "schedule_automation", "start_agent_run",
     }
+    automation_plan_operations = {"generate_automation_plan", "create_automation"}
     allowed = {
         "sync_gmail", "sort_inbox", "start_daily_triage", "control_daily_triage",
         "create_campaign", "generate_automation_plan", "create_automation",
         "generate_inbox_reply", "revise_approval",
-        *campaign_operations, *automation_operations,
+        *campaign_operations, *automation_operations, *contact_operations,
     }
     if body.operation not in allowed or not takeover_svc.token_is_valid(db, body.token):
         raise HTTPException(status_code=403, detail="invalid_or_expired_agent_takeover_grant")
-    if body.operation in campaign_operations:
+    active_scope = takeover_svc.scope_value(db)
+    if body.operation in campaign_operations or body.operation in contact_operations:
+        if active_scope not in {"campaign", "all"}:
+            raise HTTPException(status_code=403, detail="agent_takeover_scope_does_not_allow_campaign_operations")
+    if body.operation in campaign_operations and body.operation != "create_campaign":
         if body.campaign_id is None:
             raise HTTPException(status_code=422, detail="agent_takeover_campaign_required")
+    if body.operation in automation_plan_operations:
+        is_campaign_automation = body.requested_scope == "campaign" or body.campaign_id is not None
+        if is_campaign_automation and active_scope not in {"campaign", "all"}:
+            raise HTTPException(status_code=403, detail="agent_takeover_scope_does_not_allow_campaign_operations")
     if body.campaign_id is not None:
         campaign = db.get(models.Campaign, body.campaign_id)
         if not campaign or campaign.owner_id != owner_id:
             raise HTTPException(status_code=403, detail="agent_takeover_campaign_not_owned")
+    if body.operation in contact_operations:
+        if body.contact_id is None:
+            raise HTTPException(status_code=422, detail="agent_takeover_contact_required")
+        contact = db.get(models.Contact, body.contact_id)
+        if not contact or contact.owner_id != owner_id:
+            raise HTTPException(status_code=403, detail="agent_takeover_contact_not_owned")
     if body.operation == "generate_inbox_reply":
         if body.thread_id is None:
             raise HTTPException(status_code=422, detail="agent_takeover_thread_required")
@@ -203,6 +224,8 @@ def authorize_agent_takeover(body: AgentTakeoverAuthorize, db: Session = Depends
         automation = db.get(models.Automation, body.automation_id)
         if not automation or automation.owner_id != owner_id:
             raise HTTPException(status_code=403, detail="agent_takeover_automation_not_owned")
+        if automation.scope == "campaign" and active_scope not in {"campaign", "all"}:
+            raise HTTPException(status_code=403, detail="agent_takeover_scope_does_not_allow_campaign_operations")
     if body.operation == "start_agent_run":
         if automation.execution_mode != "full_auto" or automation.status != "enabled":
             raise HTTPException(status_code=409, detail="automation_not_ready_for_takeover")

@@ -119,7 +119,7 @@ GET /api/approvals?status=pending   # 当前待审批项
 
 - 读状态类问题（如“现在有几个 Contact / 收件箱还有几个未分拣 / 有没有 Campaign”）**直接查工具后回答，不要反过来问用户去确认本该由你查询的事实**。
 - 空 Campaign 列表是正常业务状态，不是缺少“Campaign 配置文件”。在用户已提供完整活动信息并明确授权时，直接调用 `ea_create_campaign`，不得搜索或等待配置文件。
-- `ea_generate_campaign_outreach` 超时属于结果未知。必须先读取 generation status、pending Approvals 和成员状态；`running` 时只等待/对账，终态 `failed`/`partial` 时停止。不得自动重试或复用旧状态作为新的调用结果；只有新的明确授权且成员仍为 active + queued、无对应 pending Approval 时才可再次调用生成工具。
+- `ea_generate_campaign_outreach` 超时属于结果未知。必须先读取 generation status、pending Approvals 和成员状态；`running` 时只等待/对账，终态 `failed`/`partial` 时停止。在 `agent_review` 下还必须读取 `send_status`、`sent`、`send_failed` 和 `send_failures`；pending、blocked 或 unknown 都不能报告为已发送。不得自动重试或复用旧状态作为新的调用结果；只有新的明确授权且成员仍为 active + queued、无对应 pending Approval 时才可再次调用生成工具。
 - 收件箱已分拣过时，`unsorted` 计数为 0，必须如实报告“收件箱已分拣，无可分拣项”，而不是凭旧印象说“分拣 N 个 unsorted thread”。任何规划都必须基于这次重新读取到的分类计数。
 - 对 Inbox 运营动作，`/api/inbox/stats.unprocessed` 是唯一的真实“尚未经过 AI 分拣”计数。历史 `triage_review` 记录虽然兼容展示为 `unsorted`，但已完成分析；不得把它们称为新同步邮件、不得据此建议再次分拣。
 - Gmail History 同步如遇短暂 TLS 或本机代理连接中断，系统会有限重试；若仍失败，History 游标保持不变。报告“同步暂时失败、可稍后重试”，不得凭旧队列数字声称同步出了新邮件。
@@ -144,7 +144,7 @@ GET /api/approvals?status=pending   # 当前待审批项
 
 ### 获客
 
-Contacts 新建、导入或筛选联系人 -> 创建 Campaign -> 从 Contacts 圈选成员 -> AI 生成首封邮件 -> 全自动执行或半自动冻结计划并确认 -> 真实发送 -> 汇报结果。
+Contacts 新建或导入线索（新导入必须 `system_category=prospect`） -> 按 System Category、Intent、Segments、Tags 服务端筛选 -> 创建 Campaign/加入成员 -> AI 生成首封邮件 -> `human_review` 留待人工审批，`agent_review` 直接经过安全门自动发送 -> 回复满足销售条件时由统一生命周期服务转为 Qualified 并关闭来源 Campaign -> 汇报真实结果。
 
 ### 收件箱
 
@@ -299,6 +299,16 @@ Extract first name, last name, and company only from an explicit current-sender 
 
 An unsubscribe, rejection or bounce creates/updates Suppression only when the sender is an existing Contact, a verified human, or a Campaign recipient. Unknown or filtered mail containing an unsubscribe footer is not a Suppression event and must not create a Contact.
 
+Contact fields have separate responsibilities. `category` is the System Category
+(`prospect`, `qualified`, `customer`, `partner`, `won`, `invalid`); `intent_level`
+is the independent Intent (`unknown`, `low`, `medium`, `high`); `segments` are
+user-managed multi-value customer groups; `tags` are free-form multi-value notes or
+search terms; `notes` is long-form text. Segments and Tags accept comma/semicolon
+input, are deduplicated, and must not be merged. Changing one field never overwrites
+the others. Use the shared Contact transition service for `qualify`, `customer`, and
+`invalid`; it records before/after audit data and performs the required Campaign and
+unsent-work cleanup while preserving history.
+
 Contact tags have two ownership classes. Agent-managed inbox/intent/content tags describe the latest triaged conversation and must replace obsolete Agent-managed tags on re-triage; they must not grow indefinitely. Tags outside the managed vocabulary are user tags and must be preserved. Users may add, remove and edit tags in the Contact/Inbox UI.
 
 ## Production Deployment and Inbox Reply Contract
@@ -335,10 +345,11 @@ Campaign outreach message starts a new Gmail thread.
 Profile、已发布知识、客户语言、事实边界、联系人准入、Approval、suppression、发送窗口或限额。模型、
 线程上下文、质量或 Draft 更新失败时，必须如实报告并保留原内容，不得静默回退为忽略指令的模板。
 不得因修改失败、Draft 更新失败、超时或 `outreach_generated` 而调用 Approval invalidate、移除/重新加入
-Campaign 成员、重置成员状态或重新生成邮件。`outreach_generated` 表示首封 Draft 已生成，属于正常待审核
-状态。只有用户明确说明该邮件已过时或已发送时才能 invalidate；只有用户明确要求移除该成员时才能移除。
-每次修改成功后必须展示准确的收件人、主题和完整正文；用户确认该最终版本后才可走 Approval 或 frozen Run
-的正常发送确认。
+Campaign 成员、重置成员状态或重新生成邮件。Human Review，或 Agent Review 下被安全门阻断的首封邮件，
+其 `outreach_generated` 表示 Draft 已生成并仍待审核；Agent Review 下已成功发送的首封邮件不会再有可修改的
+pending Approval。只有用户明确说明该邮件已过时或已发送时才能 invalidate；只有用户明确要求移除该成员时才能移除。
+每次修改成功后必须展示准确的收件人、主题和完整正文；存在 pending Approval 时，用户确认该最终版本后才可走
+Approval 或 frozen Run 的正常发送确认。
 
 Customer queue rules:
 
@@ -405,6 +416,10 @@ send authority and cannot be overridden by a Campaign:
 - `agent_review` permits a future Run to use its configured `full_auto` or
   `semi_auto` mode. It does not bypass Contact admission, suppression, pause,
   send window, daily limit, idempotency, Gmail thread, or delivery checks.
+- For a newly generated Campaign first email, `agent_review` also permits the
+  generation endpoint to dispatch that new Approval through the same server
+  send-safety path. Existing pending Approvals are not retroactively changed;
+  blocked or unknown sends remain pending and must not be reported as sent.
 
 Approval states are exact: `pending` is actionable but unsent; `approved`
 means Gmail accepted the send; `rejected` means it will not send and its
@@ -458,13 +473,14 @@ It is an operator console for this Workspace, not a separate business system.
 ### Scheduled Agent Takeover
 
 The Web sidebar's **Agent Takeover** switch is the operator's standing,
-revocable authorization for routine Global Inbox operations. While enabled,
+revocable authorization for routine operations within its configured scope:
+`inbox` (default), `campaign`, or `all`. While enabled,
 the backend scheduler creates a fresh TACWork root session at each selected
 interval and never reuses a previous operating conversation. Each session gets
 a short-lived capability token bound to the active takeover grant in private
 system context, never in the visible session prompt, transcript, report, or MCP
-log. The MCP bridge revalidates it before Gmail sync, Inbox triage, Campaign
-configuration, or starting an owned enabled Run. Disabling takeover revokes the
+log. The MCP bridge revalidates it before Gmail sync, Inbox triage, Contact
+lifecycle, Campaign configuration, or starting an owned enabled Run. Disabling takeover revokes the
 token immediately, including for a session already in progress.
 
 Campaign 和 Automation 的日常操作必须调用已注册的 typed `ea_*` MCP 工具；不得为
@@ -475,11 +491,13 @@ typed 工具未注册，报告精确缺口并停止，不得猜测 REST 路径�
 状态、Dashboard、Inbox 和 daily-triage 读取同样携带私有 capability；读取失败也必须
 记为本周期 MCP-stage error，不能被空闲 Session 伪装成正常完成。
 
-Enabling takeover sets the owner Approval mode to `agent_review` and Global
-Inbox execution to `full_auto`; disabling restores `human_review` and
-`semi_auto`. This is standing authority for routine operations after a Contact
-has been admitted: sync, daily triage, replies, follow-up, Campaign and
-Automation decisions remain subject to the server policy gates. Contact
+The explicit Takeover switch still sets the owner Approval mode to `agent_review`
+and Global Inbox execution to `full_auto`; disabling that switch restores
+`human_review` and `semi_auto`. The Approval page may also set the owner-level
+mode independently for Campaign first-email review, and a service restart must
+preserve that explicit selection. This is standing authority for routine operations after a Contact
+has been admitted: sync, daily triage, replies, follow-up, Contact and Campaign
+decisions remain subject to the configured scope and server policy gates. Contact
 admission, ambiguous opt-out and content review stay human-only. The grant
 never bypasses pause, suppression, send windows, daily limits, idempotency,
 Gmail thread integrity, OAuth, or delivery reconciliation. Global pause always wins. The

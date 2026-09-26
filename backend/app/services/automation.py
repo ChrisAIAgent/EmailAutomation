@@ -73,7 +73,12 @@ def create_automation(db, owner_id: int, prompt: str, campaign_id: int | None,
         campaign_id=campaign_id,
         scope=scope,
         plan_json=json.dumps(parsed.model_dump()),
-        status="disabled",
+        # The operator-visible create form explicitly sets ``enabled`` when
+        # its action is labelled "Save and enable".  Persist that intent and
+        # schedule the first run immediately instead of requiring a second
+        # Resume action after creation.
+        status="enabled" if parsed.enabled else "disabled",
+        next_run_at=datetime.now(timezone.utc) if parsed.enabled else None,
         tick_interval_minutes=parsed.tick_interval_minutes,
         execution_mode=parsed.execution_mode,
     )

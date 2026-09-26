@@ -226,6 +226,18 @@ class ContactUpdate(BaseModel):
     custom_fields: Optional[dict] = None
     source: Optional[str] = None
     timezone: Optional[str] = None
+    # Request metadata used for the Contact AuditLog; these are not persisted
+    # as Contact columns and preserve the partial-update contract.
+    reason: Optional[str] = None
+    override_manual_lock: bool = False
+
+
+class ContactTransition(BaseModel):
+    action: str
+    campaign_id: Optional[int] = None
+    intent: Optional[str] = None
+    reason: Optional[str] = None
+    override_manual_lock: bool = False
 
 
 class ContactOut(ContactBase):

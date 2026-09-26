@@ -95,6 +95,7 @@ TOOLS = [
     _tool("ea_gmail_status", "Read Gmail connection/account state. Never exposes OAuth tokens."),
     _tool("ea_system_pause", "Read the global pause safety state."),
     _tool("ea_list_contacts", "List CRM contacts. Read-only.", {"query": {"type": "string", "description": "Optional URL query string without ?"}}),
+    _tool("ea_find_contacts", "READ: Find exact Contact IDs for a server-side filter. Use category=prospect and segments_any=IT for a Prospect + IT selection; OR matching is used within Segments/Tags.", {"category": {"type": "string"}, "intent_level": {"type": "string"}, "segments_any": {"type": "array", "items": {"type": "string"}}, "tags_any": {"type": "array", "items": {"type": "string"}}, "query": {"type": "string"}}),
     _tool("ea_list_campaigns", "List non-archived Campaigns. Read-only."),
     _tool("ea_list_approvals", "List Approvals for review. Read-only; pending is the default.", {"status": {"type": "string", "default": "pending"}, "kind": {"type": "string"}}),
     _tool("ea_revise_approval", "WRITE, NO SEND: Revise exactly one pending Approval and its existing Gmail Draft from an explicit user instruction. It never creates another Approval, never changes Inbox thread identity, and never confirms or sends mail.", {"approval_id": {"type": "integer", "minimum": 1}, "instruction": {"type": "string", "minLength": 1, "maxLength": 2000}, "editor_email": {"type": "string"}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["approval_id", "instruction", "user_authorized"]),
@@ -116,15 +117,17 @@ TOOLS = [
     _tool("ea_sync_gmail", "WRITE: After the first full import is complete, pull only Gmail History changes since the last successful cursor. Requires explicit user authorization or a valid scheduled Agent Takeover capability; never sends mail.", {"full_scan": {"type": "boolean", "default": False, "description": "Deprecated compatibility flag; use ea_start_gmail_import."}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["user_authorized"]),
     _tool("ea_sort_inbox", "Deprecated compatibility alias for ea_start_daily_triage. It creates a resumable snapshot Run; 50 is only the worker batch size. Requires explicit user authorization or a valid Agent Takeover capability; never sends mail.", {"user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["user_authorized"]),
     _tool("ea_create_contact", "WRITE: Create one confirmed-human Contact through the API. Never infer identity from forwarded/system mail.", {"contact": {"type": "object"}, "user_authorized": {"type": "boolean"}}, ["contact", "user_authorized"]),
-    _tool("ea_import_contacts", "WRITE: Preview or import a UTF-8 CSV/XLSX file located inside this Workspace. Confirm=false is preview-only.", {"path": {"type": "string"}, "confirm": {"type": "boolean", "default": False}, "user_authorized": {"type": "boolean"}}, ["path", "user_authorized"]),
+    _tool("ea_update_contact", "WRITE, NO SEND: Partially update one existing Contact using the same fields and manual-lock rules as the Human UI. Category and Intent are independent; Tags and Segments remain separate. Requires explicit authorization.", {"contact_id": {"type": "integer", "minimum": 1}, "changes": {"type": "object"}, "reason": {"type": "string"}, "override_manual_lock": {"type": "boolean", "default": False}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["contact_id", "changes", "user_authorized"]),
+    _tool("ea_transition_contact", "WRITE, NO SEND: Transition one Contact to Qualified, Customer or Invalid. Qualified closes only the source Campaign; Invalid closes all future Campaign work. A qualifying Contact in multiple Campaigns requires campaign_id.", {"contact_id": {"type": "integer", "minimum": 1}, "action": {"type": "string", "enum": ["qualify", "customer", "invalid"]}, "campaign_id": {"type": "integer", "minimum": 1}, "intent": {"type": "string"}, "reason": {"type": "string"}, "override_manual_lock": {"type": "boolean", "default": False}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["contact_id", "action", "user_authorized"]),
+    _tool("ea_import_contacts", "WRITE: Preview or import a UTF-8 CSV/XLSX file located inside this Workspace. The default lead mode requires system_category=prospect; confirm=false is preview-only. Use legacy only for an older file without a category column.", {"path": {"type": "string"}, "confirm": {"type": "boolean", "default": False}, "mode": {"type": "string", "enum": ["lead", "legacy"], "default": "lead"}, "user_authorized": {"type": "boolean"}}, ["path", "user_authorized"]),
     _tool("ea_create_campaign", "WRITE: Create a Campaign configuration; does not generate or send mail. An empty Campaign list is normal, not a missing configuration file: with complete user-provided details and authorization, call this tool directly. A valid Agent Takeover capability may create it as part of full operating authority.", {"campaign": {"type": "object"}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign", "user_authorized"]),
     _tool("ea_get_campaign", "READ: Get one Campaign by id, including its current configuration and lifecycle status.", {"campaign_id": {"type": "integer", "minimum": 1}}, ["campaign_id"]),
     _tool("ea_list_campaign_members", "READ: List active or historical members of one Campaign. Use before and after membership changes; never searches source code for this operation.", {"campaign_id": {"type": "integer", "minimum": 1}, "include_removed": {"type": "boolean", "default": False}}, ["campaign_id"]),
     _tool("ea_add_campaign_contacts", "WRITE, NO SEND: Add or re-add existing Contacts to one Campaign. The server preserves history, skips suppressed/ineligible Contacts, and returns exact added/skipped results.", {"campaign_id": {"type": "integer", "minimum": 1}, "contact_ids": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign_id", "contact_ids", "user_authorized"]),
     _tool("ea_remove_campaign_contact", "DESTRUCTIVE WRITE, NO SEND: Remove one Contact only after the operator explicitly asks to remove that Contact from this Campaign. It expires unsent pending Approvals and cancels Drafts/follow-ups. Never use it to recover a failed copy revision, reset outreach_generated, or regenerate an email.", {"campaign_id": {"type": "integer", "minimum": 1}, "contact_id": {"type": "integer", "minimum": 1}, "confirmed_removal": {"type": "boolean", "description": "Must be true only after a direct operator request to remove this Campaign member; never infer it from a revision or generation failure."}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign_id", "contact_id", "confirmed_removal", "user_authorized"]),
     _tool("ea_update_campaign", "WRITE, NO SEND: Replace one Campaign's configuration with a complete valid Campaign payload. Read it first so unchanged fields are preserved.", {"campaign_id": {"type": "integer", "minimum": 1}, "campaign": {"type": "object"}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign_id", "campaign", "user_authorized"]),
-    _tool("ea_generate_campaign_outreach", "WRITE, NO SEND: Generate first-email Drafts and pending Approvals for currently queued active Campaign members. Requires explicit authorization; it never proves a send. A timeout is result_unknown: reconcile using generation status, Approvals, and members; never retry automatically. A new call after terminal failed/partial needs new explicit user authorization.", {"campaign_id": {"type": "integer", "minimum": 1}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign_id", "user_authorized"]),
-    _tool("ea_get_campaign_generation", "READ: Get latest Campaign generation status, including partial successes and retryable contact failures. After timeout: running means wait/reconcile; terminal failed/partial may be retried only with new explicit user authorization after checking pending Approvals and queued active members.", {"campaign_id": {"type": "integer", "minimum": 1}}, ["campaign_id"]),
+    _tool("ea_generate_campaign_outreach", "WRITE: Generate first-email Drafts for currently queued active Campaign members. In human_review the result remains pending for human approval; in agent_review each generated first-email Approval is sent automatically only after every existing server safety check passes. Existing pending Approvals are not retroactively changed. Requires explicit authorization; a timeout is result_unknown: reconcile using generation status, Approvals, members, and sent results; never retry automatically. A new call after terminal failed/partial needs new explicit user authorization.", {"campaign_id": {"type": "integer", "minimum": 1}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign_id", "user_authorized"]),
+    _tool("ea_get_campaign_generation", "READ: Get latest Campaign generation status, including partial successes, retryable contact failures, and Agent-review dispatch fields (send_status, sent, send_failed, send_failures). After timeout: running means wait/reconcile; terminal failed/partial may be retried only with new explicit user authorization after checking pending Approvals and queued active members.", {"campaign_id": {"type": "integer", "minimum": 1}}, ["campaign_id"]),
     _tool("ea_start_campaign", "WRITE, NO SEND: Mark one Campaign active. Sending still requires the existing Approval, policy, and Gmail checks.", {"campaign_id": {"type": "integer", "minimum": 1}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign_id", "user_authorized"]),
     _tool("ea_pause_campaign", "WRITE, NO SEND: Pause one Campaign without deleting its history.", {"campaign_id": {"type": "integer", "minimum": 1}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign_id", "user_authorized"]),
     _tool("ea_stop_campaign", "WRITE, NO SEND: Stop one Campaign and cancel its scheduled follow-ups while preserving history.", {"campaign_id": {"type": "integer", "minimum": 1}, "user_authorized": {"type": "boolean"}, "authorization_source": {"type": "string", "enum": ["user", "agent_takeover"]}, "takeover_token": {"type": "string"}}, ["campaign_id", "user_authorized"]),
@@ -150,7 +153,7 @@ TOOLS = [
     # Agent Profile self-configuration (Agent Native): the Agent can read and first-time configure its own identity.
     _tool("ea_get_profile", "READ: Get the current Agent identity/behavior Profile without creating a default Profile when none exists."),
     _tool("ea_configure_profile", "WRITE: Set the Agent identity/behavior Profile from scratch (full payload). Changes the Agent's name, company, signature, tone, language policy, forbidden claims, unknown-answer policy, and optional approval mode. First read ea_get_profile to get current defaults.", {"agent_name": {"type": "string"}, "company_name": {"type": "string"}, "role": {"type": "string"}, "tone": {"type": "string"}, "language_policy": {"type": "string", "enum": ["match_customer", "chinese", "english"]}, "signature_text": {"type": "string"}, "forbidden_claims": {"type": "string"}, "unknown_answer_policy": {"type": "string"}, "allow_campaign_override": {"type": "boolean"}, "approval_mode": {"type": "string", "enum": ["human_review", "agent_review"]}, "is_active": {"type": "boolean"}, "user_authorized": {"type": "boolean"}}, ["agent_name", "company_name", "role", "tone", "language_policy", "signature_text", "unknown_answer_policy", "user_authorized"]),
-    _tool("ea_set_approval_mode", "WRITE, HIGH IMPACT: Set the Workspace-wide send authority. human_review forces future Agent runs to freeze for human confirmation; agent_review permits configured full_auto runs only after all server safety checks. Requires explicit user authorization.", {"approval_mode": {"type": "string", "enum": ["human_review", "agent_review"]}, "user_authorized": {"type": "boolean"}}, ["approval_mode", "user_authorized"]),
+    _tool("ea_set_approval_mode", "WRITE, HIGH IMPACT: Set the Workspace-wide send authority. human_review keeps newly generated Campaign first emails and future Agent runs pending for human confirmation; agent_review allows newly generated Campaign first emails to auto-send and permits configured full_auto runs, only after all server safety checks. Existing pending Approvals are unchanged. Requires explicit user authorization.", {"approval_mode": {"type": "string", "enum": ["human_review", "agent_review"]}, "user_authorized": {"type": "boolean"}}, ["approval_mode", "user_authorized"]),
     _tool("ea_agent_report", "Read a live, truthful operations report assembled from current API state. Does not run or send anything."),
 ]
 
@@ -199,7 +202,9 @@ def _authorized(args: dict[str, Any], operation: str | None = None) -> None:
             "token": args.get("takeover_token") or "",
             "operation": operation,
         }
-        for key in ("automation_id", "campaign_id", "thread_id", "approval_id"):
+        if args.get("scope") in {"campaign", "global"}:
+            takeover_request["requested_scope"] = str(args["scope"])
+        for key in ("automation_id", "campaign_id", "thread_id", "approval_id", "contact_id"):
             if args.get(key) is not None:
                 takeover_request[key] = int(args[key])
         _request("POST", "/api/agent-takeover/authorize", takeover_request)
@@ -388,7 +393,10 @@ def _upload_contacts(args: dict[str, Any]) -> Any:
     if not candidate.is_file() or candidate.suffix.lower() not in {".csv", ".xlsx"}:
         raise ValueError("contact import requires an existing Workspace .csv or .xlsx file")
     payload, boundary = _multipart_file(candidate)
-    query = urllib.parse.urlencode({"confirm": str(bool(args.get("confirm", False))).lower()})
+    query = urllib.parse.urlencode({
+        "confirm": str(bool(args.get("confirm", False))).lower(),
+        "mode": args.get("mode", "lead"),
+    })
     req = urllib.request.Request(
         f"{API_BASE}/api/contacts/import?{query}", data=payload, method="POST",
         headers={"Accept": "application/json", "Content-Type": f"multipart/form-data; boundary={boundary}"},
@@ -406,6 +414,18 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
     if name == "ea_gmail_status": return _request("GET", "/api/gmail/status")
     if name == "ea_system_pause": return _request("GET", "/api/system/pause")
     if name == "ea_list_contacts": return _request("GET", "/api/contacts" + (("?" + args["query"]) if args.get("query") else ""))
+    if name == "ea_find_contacts":
+        params: list[tuple[str, str]] = []
+        if args.get("category"):
+            params.append(("category", str(args["category"])))
+        if args.get("intent_level"):
+            params.append(("intent_level", str(args["intent_level"])))
+        params.extend(("segments_any", str(value)) for value in (args.get("segments_any") or []))
+        params.extend(("tags_any", str(value)) for value in (args.get("tags_any") or []))
+        if args.get("query"):
+            params.append(("q", str(args["query"])))
+        query = urllib.parse.urlencode(params)
+        return _request("GET", "/api/contacts" + (("?" + query) if query else ""))
     if name == "ea_list_campaigns": return _request("GET", "/api/campaigns")
     if name == "ea_list_approvals":
         query = urllib.parse.urlencode({k: v for k, v in {"status": args.get("status", "pending"), "kind": args.get("kind")}.items() if v})
@@ -469,6 +489,32 @@ def call_tool(name: str, args: dict[str, Any]) -> Any:
         return _takeover_operation(args, "start_daily_triage", "start_daily_triage", lambda: _request("POST", "/api/inbox/daily-triage"))
     if name == "ea_create_contact": _authorized(args); return _request("POST", "/api/contacts", args["contact"])
     if name == "ea_import_contacts": return _upload_contacts(args)
+    if name == "ea_update_contact":
+        body = dict(args.get("changes") or {})
+        if args.get("reason") is not None:
+            body["reason"] = args["reason"]
+        if args.get("override_manual_lock"):
+            body["override_manual_lock"] = True
+        action = lambda: _request(
+            "PUT", f"/api/contacts/{int(args['contact_id'])}?actor=agent", body,
+        )
+        if args.get("authorization_source") == "agent_takeover":
+            return _takeover_operation(args, "update_contact", "update_contact", action)
+        _authorized(args)
+        return action()
+    if name == "ea_transition_contact":
+        body = {
+            key: args[key]
+            for key in ("action", "campaign_id", "intent", "reason", "override_manual_lock")
+            if key in args
+        }
+        action = lambda: _request(
+            "POST", f"/api/contacts/{int(args['contact_id'])}/transition?actor=agent", body,
+        )
+        if args.get("authorization_source") == "agent_takeover":
+            return _takeover_operation(args, "transition_contact", "transition_contact", action)
+        _authorized(args)
+        return action()
     if name == "ea_create_campaign":
         return _takeover_operation(args, "create_campaign", "create_campaign", lambda: _request("POST", "/api/campaigns", args["campaign"]))
     if name == "ea_get_campaign":

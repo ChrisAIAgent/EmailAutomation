@@ -1,6 +1,7 @@
-"""Phase 6 acceptance: lead-gen email generation (DRAFT-ONLY).
+"""Phase 6 acceptance: lead-gen email generation.
 
-Verifies: per-contact independent content, truthful (no fabrication),
+Human-review coverage remains draft-only. Agent-review coverage is added below
+for first-email auto-dispatch. The suite verifies: per-contact independent content, truthful (no fabrication),
 correct sender signature, run metadata recorded (model/latency/prompt_version),
 status pending, and no Gmail send during generation.
 """
@@ -118,6 +119,59 @@ def test_status_pending_and_no_send(client):
     m = client.get("/api/dashboard/metrics").json()
     assert m["sent_today"] == 0
     assert m["draft_only"] is True
+
+
+def test_agent_review_auto_dispatches_new_first_email(client, monkeypatch):
+    from app.tools.email_tools import UnifiedEmailToolLayer
+
+    cid = _make_campaign(client)
+    _import(client, cid, "email,first_name\nauto@test.com,Auto\n")
+    mode = client.put("/api/agent-profile/approval-mode", json={"approval_mode": "agent_review"})
+    assert mode.status_code == 200, mode.text
+
+    sent = []
+
+    def fake_send(self, **kwargs):
+        sent.append(kwargs)
+        return {"ok": True, "message_id": "agent-review-message"}
+
+    monkeypatch.setattr(UnifiedEmailToolLayer, "send_approved_draft", fake_send)
+    generated = client.post(f"/api/campaigns/{cid}/generate")
+    assert generated.status_code == 200, generated.text
+    body = generated.json()
+    assert body["generated"] == 1
+    assert body["sent"] == 1
+    assert body["send_failed"] == 0
+    assert body["send_status"] == "completed"
+    assert len(sent) == 1
+    assert client.get("/api/approvals", params={"status": "pending"}).json() == []
+    approved = client.get("/api/approvals", params={"status": "approved"}).json()
+    assert len(approved) == 1
+    assert approved[0]["kind"] == "first_send"
+
+
+def test_agent_review_does_not_retroactively_send_existing_pending(client, monkeypatch):
+    from app.tools.email_tools import UnifiedEmailToolLayer
+
+    cid = _make_campaign(client)
+    _import(client, cid, "email,first_name\nexisting@test.com,Existing\n")
+    first = client.post(f"/api/campaigns/{cid}/generate")
+    assert first.status_code == 200, first.text
+    pending_before = client.get("/api/approvals", params={"status": "pending"}).json()
+    assert len(pending_before) == 1
+
+    sent = []
+
+    def fake_send(self, **kwargs):
+        sent.append(kwargs)
+        return {"ok": True, "message_id": "should-not-send"}
+
+    monkeypatch.setattr(UnifiedEmailToolLayer, "send_approved_draft", fake_send)
+    mode = client.put("/api/agent-profile/approval-mode", json={"approval_mode": "agent_review"})
+    assert mode.status_code == 200, mode.text
+    pending_after = client.get("/api/approvals", params={"status": "pending"}).json()
+    assert [item["id"] for item in pending_after] == [pending_before[0]["id"]]
+    assert sent == []
 
 
 def test_generation_keeps_success_when_one_contact_fails(client, monkeypatch):

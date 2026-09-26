@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Bot, Check, Edit, Pause, Play, Plus, Search, Send, Trash2, UserPlus } from "lucide-react";
 import { api } from "@/lib/api";
 import { useLang } from "@/lib/i18n";
+import CampaignAutomationPanel from "./CampaignAutomation";
 
 type Tab = "overview" | "inbox" | "contacts" | "campaigns" | "approvals" | "activity";
 const EMPTY = { name: "", objective: "", product_description: "", target_audience: "", sender_name: "", sender_company: "" };
@@ -113,7 +114,11 @@ export default function CampaignsView({ onChanged, onNavigate }: { onChanged: ()
       <div className="space-y-3">{campaigns.map(c=><div className="card space-y-3" key={c.id}>
         <div className="flex items-start justify-between gap-3"><div><h3 className="font-medium">{c.name}</h3><p className="text-xs text-muted">{c.objective||c.product_description||"-"}</p></div><span className={`text-xs px-2 py-0.5 rounded ${c.status==="active"?"bg-ok/10 text-ok":c.status==="paused"?"bg-warn/10 text-warn":"bg-panel2 text-muted"}`}>{c.status}</span></div>
         <div className="grid grid-cols-3 gap-2 text-sm"><div className="bg-panel2 rounded p-2"><b>{counts[c.id]||0}</b><div className="text-xs text-muted">{zh?"当前参与联系人":"Active contacts"}</div></div><div className="bg-panel2 rounded p-2" title={zh?"本 Campaign 每天首封和跟进邮件的合计上限":"Daily total of first sends and follow-ups for this Campaign"}><b>{c.daily_send_limit}</b><div className="text-xs text-muted">{zh?"每日发送上限":"Daily send limit"}</div><div className="text-[11px] text-muted">{zh?"首封 + 跟进合计":"First sends + follow-ups"}</div></div><div className="bg-panel2 rounded p-2" title={zh?"每位联系人在首封后最多追加的跟进次数":"Maximum follow-ups per contact after the first email"}><b>{c.max_follow_ups}</b><div className="text-xs text-muted">{zh?"每位联系人最大跟进次数":"Max follow-ups per contact"}</div><div className="text-[11px] text-muted">{zh?"不包含首封":"Excludes first email"}</div></div></div>
-        {generation[c.id]?.status && generation[c.id].status !== "idle" && <div className={`text-xs rounded px-2 py-1 ${generation[c.id].status === "failed" ? "bg-danger/10 text-danger" : generation[c.id].status === "partial" ? "bg-warn/10 text-warn" : "bg-panel2 text-muted"}`}>{zh ? "邮件生成" : "Email generation"}: {generation[c.id].status} · {zh ? "成功" : "generated"} {generation[c.id].generated || 0} · {zh ? "失败" : "failed"} {generation[c.id].failed || 0}{generation[c.id].run_id ? ` · Run ${generation[c.id].run_id}` : ""}</div>}
+         {generation[c.id]?.status && generation[c.id].status !== "idle" && <div className={`text-xs rounded px-2 py-1 ${generation[c.id].status === "failed" ? "bg-danger/10 text-danger" : generation[c.id].status === "partial" ? "bg-warn/10 text-warn" : "bg-panel2 text-muted"}`}>
+           {zh ? "邮件生成" : "Email generation"}: {generation[c.id].status} · {zh ? "成功" : "generated"} {generation[c.id].generated || 0} · {zh ? "失败" : "failed"} {generation[c.id].failed || 0}
+           {generation[c.id].send_status && generation[c.id].send_status !== "not_requested" && ` · ${zh ? "Agent发送" : "Agent send"}: ${generation[c.id].send_status} · ${zh ? "已发送" : "sent"} ${generation[c.id].sent || 0} · ${zh ? "发送失败" : "send failed"} ${generation[c.id].send_failed || 0}`}
+           {generation[c.id].run_id ? ` · Run ${generation[c.id].run_id}` : ""}
+         </div>}
         <div className="flex gap-2 flex-wrap">
           <button className="btn flex items-center gap-1" onClick={()=>openPicker(c)}><UserPlus size={13}/>{zh?"管理联系人":"Manage Contacts"}</button>
           <button className="btn flex items-center gap-1" disabled={!counts[c.id]||busy||c.status!=="active"} onClick={()=>action(c,"generate")}><Bot size={13}/>{zh?"AI 生成邮件":"Generate Emails"}</button>
@@ -123,6 +128,8 @@ export default function CampaignsView({ onChanged, onNavigate }: { onChanged: ()
           <button className="btn p-1.5 text-danger" title={zh?"删除":"Delete"} onClick={async()=>{if(confirm(zh?"归档此营销活动？":"Archive this campaign?")){await api.deleteCampaign(c.id);await load();}}}><Trash2 size={13}/></button>
         </div>
       </div>)}</div>}
+
+    <CampaignAutomationPanel onChanged={onChanged} onNavigate={() => onNavigate("campaigns")} />
 
     {form&&<div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4"><div className="card max-w-xl w-full space-y-3"><h3 className="font-semibold">{form.id?(zh?"编辑营销活动":"Edit Campaign"):(zh?"创建营销活动":"Create Campaign")}</h3>
       <label className="text-xs text-muted">{zh?"活动名称 *":"Campaign name *"}<input className="input w-full mt-1" value={form.name||""} onChange={e=>setForm({...form,name:e.target.value})}/></label>

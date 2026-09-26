@@ -57,8 +57,13 @@
 
 ```text
 Contacts → 创建 Campaign → 圈选联系人 → AI 生成首封邮件
-→ 检查执行策略 → full_auto 真实发送 / semi_auto 等待一次确认后真实发送
+→ Human Review 保留 pending Approval / Agent Review 通过安全门后自动发送
 ```
+
+Campaign 首封邮件的 Agent Review 仅影响本次新生成的首封 Approval：发送前仍
+执行现有 suppression、暂停、发送窗口、每日限额、幂等和 Gmail 检查；切换模式
+不会追溯发送已有 pending Approval。生成或发送结果不明确时，必须先对账
+generation status、发送统计、Approvals、成员状态和 Gmail 结果。
 
 ### 自动跟进
 
@@ -136,10 +141,26 @@ and stopped items. All mandatory policy gates remain active in both modes.
 
 ## Automation scope
 
-Select **Global Inbox** to run the top-level Agent without first creating a Campaign.
-It processes triaged, Contact-admitted business threads with a followable next action.
-Select **Campaign** only for a specific outreach plan. Both scopes support full-auto
-and semi-auto execution independently.
+There are two independent choices:
+
+1. **Agent Takeover operation scope** controls which typed operations the scheduled
+   Agent may use. It is `inbox` by default. Select `campaign` to authorize the
+   Prospect/Contact filtering, Campaign membership and Campaign cadence chain, or
+   `all` to authorize both Inbox and Campaign operations. Enabling a scope does not
+   bypass Contact admission, `manual_lock`, Approval, suppression, pause, limits,
+   idempotency or Gmail checks, and it never imports an unapproved file or creates a
+   Campaign by itself.
+2. **Automation scope** selects the business module being run. Select **Global
+   Inbox** to process triaged, Contact-admitted business threads with a followable
+   next action. Select **Campaign** only for a specific outreach plan. The modules
+   remain independently enabled and scheduled; Campaign work does not become Global
+   Inbox work merely because the Agent has `all` Takeover scope.
+
+The Contact chain uses one record: imported leads start as Prospect, a confirmed
+sales reply may qualify that record and close only its source Campaign, and an
+explicit user/authorized Agent action may promote it to Customer or stop it as
+Invalid. Use Segments for user-managed customer pools and Tags for free-form
+conversation labels; Intent is a separate signal from System Category.
 
 Before enabling Global Inbox, select exactly one takeover scope: last X days,
 all historical business mail, or future-only. This choice is mandatory and
