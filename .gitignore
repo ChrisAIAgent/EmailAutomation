@@ -21,6 +21,7 @@ node_modules.broken-e-drive/
 .next/
 .next-dev/
 .next-prod/
+frontend/.next-mainline-check*/
 out/
 coverage/
 *.tsbuildinfo

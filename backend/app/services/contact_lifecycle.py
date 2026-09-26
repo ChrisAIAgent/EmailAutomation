@@ -233,3 +233,46 @@ def transition_contact(
 def cancel_campaign_member_work(db, member: models.CampaignContact, *, reason: str, actor: str) -> int:
     """Cancel unsent work for a member without changing membership history."""
     return _cancel_campaign_work(db, member, reason=reason, actor=actor)
+
+
+def stop_contact_delivery(db, contact, *, owner_id: int, intent: str, actor: str) -> str:
+    """Apply a confirmed stop signal even when human CRM classifications are locked.
+
+    Callers retain the existing admission/opt-out confirmation gates. This is a
+    local, transactional stop: no Gmail calls and no deletion of historical rows.
+    """
+    if contact.owner_id != owner_id:
+        raise ContactTransitionError("contact_not_owned", status_code=403)
+    if intent not in {"bounce", "not_interested", "unsubscribe", "opt_out"}:
+        raise ContactTransitionError("invalid_stop_intent", status_code=422)
+    before = _snapshot(contact)
+    email = contact.email.strip().lower()
+    suppression = db.query(models.Suppression).filter_by(owner_id=owner_id, email=email).first()
+    if suppression is None:
+        db.add(models.Suppression(owner_id=owner_id, email=email, reason=intent, source=actor))
+    # Preserve human-owned CRM fields; outbound safety state is independent.
+    if not contact.manual_lock:
+        contact.category = "invalid"
+        contact.intent_level = "low"
+    contact.status = "bounced" if intent == "bounce" else (
+        "unsubscribed" if intent in {"unsubscribe", "opt_out"} else "not_interested"
+    )
+    contact.lifecycle_stage = "stopped"
+    contact.next_action = "none"
+    contact.next_follow_up_at = None
+    closed = []
+    cancelled = 0
+    for member in _active_members(db, contact.id):
+        cancelled += _close_member(db, member, status="stopped", reason=f"reply_intent:{intent}", actor=actor)
+        closed.append(member.campaign_id)
+    after = _snapshot(contact)
+    if before != after or closed or suppression is None:
+        db.add(models.AuditLog(
+            actor=actor, action="contact_delivery_stopped", entity="contact", entity_id=str(contact.id),
+            detail=json.dumps({"intent": intent, "before": before, "after": after,
+                               "closed_campaign_ids": closed, "cancelled_pending_items": cancelled,
+                               "manual_lock_preserved": bool(contact.manual_lock)}, ensure_ascii=False),
+            success=True,
+        ))
+    db.flush()
+    return "bounced" if intent == "bounce" else "stopped"

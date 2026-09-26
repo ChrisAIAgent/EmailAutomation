@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { CheckCircle, Clock, Loader2, MessageCircle, Pause, Play, Plus, Trash2, Users } from "lucide-react";
 import { api } from "@/lib/api";
 import { useLang } from "@/lib/i18n";
+import CampaignRun from "./CampaignRun";
 
 export default function CampaignAutomationPanel({
   onChanged,
@@ -29,26 +30,46 @@ export default function CampaignAutomationPanel({
   const [stopOnReject, setStopOnReject] = useState(true);
   const [executionMode, setExecutionMode] = useState<"full_auto" | "semi_auto">("full_auto");
   const [selectedId, setSelectedId] = useState<number | null>(null);
-  const [preparedRun, setPreparedRun] = useState<any | null>(null);
+  const [runIds, setRunIds] = useState<Record<number, number>>({});
+  const [runModes, setRunModes] = useState<Record<number, "full_auto" | "semi_auto">>({});
+  const [pendingEnableId, setPendingEnableId] = useState<number | null>(null);
+  const [busyIds, setBusyIds] = useState<Record<number, boolean>>({});
+  const actionLocks = useRef(new Set<number>());
+  const saveLock = useRef(false);
+  const loadGeneration = useRef(0);
 
   const displayTime = (item: any, key: "next_run_at" | "last_run_at") =>
     item?.display_time?.[key]?.local || formatDate(item?.[key]);
 
   const load = useCallback(async () => {
+    const generation = ++loadGeneration.current;
     setLoading(true);
     try {
       const [aData, cData] = await Promise.all([api.automations(), api.campaigns()]);
+      if (generation !== loadGeneration.current) return;
       const items = aData?.items || aData || [];
-      setAutomations(Array.isArray(items) ? items.filter((item: any) => item.scope !== "global") : []);
+      const campaignItems = Array.isArray(items) ? items.filter((item: any) => item.scope !== "global") : [];
+      setAutomations(campaignItems);
       setCampaigns(Array.isArray(cData) ? cData.filter((c: any) => c.status !== "archived") : []);
+      const details = await Promise.allSettled(campaignItems.map((item: any) => api.automationDetail(item.id)));
+      if (generation !== loadGeneration.current) return;
+      const recovered: Record<number, number> = {};
+      details.forEach((result, index) => {
+        if (result.status !== "fulfilled") return;
+        const current = result.value.runs?.find((run: any) => ["queued", "running", "confirmed", "awaiting_confirmation", "recovery_pending"].includes(run.status));
+        if (current) recovered[campaignItems[index].id] = current.id;
+      });
+      setRunIds(previous => ({ ...previous, ...recovered }));
+      if (details.some(result => result.status === "rejected")) setError(lang === "zh" ? "部分 Run 状态读取失败，请刷新状态。" : "Some Run statuses could not be recovered. Refresh status.");
     } catch (e: any) {
-      setError(e?.message || t("err_loading_automation"));
+      if (generation === loadGeneration.current) setError(e?.message || t("err_loading_automation"));
     } finally {
-      setLoading(false);
+      if (generation === loadGeneration.current) setLoading(false);
     }
-  }, [t]);
+  }, [t, lang]);
 
   useEffect(() => { load(); }, [load]);
+  useEffect(() => () => { loadGeneration.current += 1; }, []);
 
   const resetForm = () => {
     const activeCamp = campaigns.find((c: any) => c.status === "active");
@@ -68,15 +89,18 @@ export default function CampaignAutomationPanel({
   };
 
   const handleSave = async () => {
+    if (saveLock.current) return;
     if (!selCampaign) {
       setError(lang === "zh" ? "请先选择营销任务" : "Please select a campaign");
       return;
     }
+    saveLock.current = true;
     setSaving(true);
     setError("");
+    let createdId: number | null = null;
     try {
       const plan = {
-        enabled: true,
+        enabled: false,
         tick_interval_minutes: 60,
         first_email_approval_required: true,
         follow_up_after_days: followupDays,
@@ -95,32 +119,42 @@ export default function CampaignAutomationPanel({
         lang === "zh" ? "Campaign 自动跟进" : "Campaign Automation",
         "campaign",
       );
+      createdId = res?.id || res?.automation_id;
+      if (!createdId) throw new Error("Automation ID missing");
+      setPendingEnableId(createdId);
       setShowCreate(false);
-      await load();
-      const newId = res?.id || res?.automation_id;
-      if (newId) setSelectedId(newId);
+      setSelectedId(createdId);
+      await api.enableAutomation(createdId);
+      setPendingEnableId(null);
       setSuccess(lang === "zh" ? "保存成功，Campaign 自动化已启用" : "Saved - Campaign automation is enabled");
       setTimeout(() => setSuccess(""), 4000);
       onChanged();
     } catch (e: any) {
-      setError(e?.message || t("common_failed"));
+      setError(createdId ? `${lang === "zh" ? "已保存，启用未确认；请重试启用已有配置" : "Saved; enablement unconfirmed. Retry enabling the existing configuration"} #${createdId}: ${e?.message || ""}` : (e?.message || t("common_failed")));
     } finally {
+      if (createdId) await load();
+      saveLock.current = false;
       setSaving(false);
     }
   };
 
   const doAction = async (id: number, action: string) => {
+    if (actionLocks.current.has(id)) return;
+    actionLocks.current.add(id);
+    setBusyIds(previous => ({ ...previous, [id]: true }));
     setError("");
     try {
-      if (action === "enable") await api.enableAutomation(id);
+      if (action === "enable") {
+        await api.enableAutomation(id);
+        if (pendingEnableId === id) setPendingEnableId(null);
+      }
       else if (action === "pause") await api.pauseAutomation(id);
       else if (action === "run-now") {
-        const run = await api.agentRun(id, executionMode);
-        if (executionMode === "semi_auto") {
+        const configuredMode = automations.find(item => item.id === id)?.execution_mode || "full_auto";
+        const run = await api.agentRun(id, runModes[id] || configuredMode);
+        setRunIds(previous => ({ ...previous, [id]: run.run_id }));
+        if (run.mode === "semi_auto") {
           setSuccess(lang === "zh" ? `已开始准备发送计划（Run #${run.run_id}）` : `Preparing send plan (Run #${run.run_id})`);
-          setTimeout(async () => {
-            try { setPreparedRun(await api.agentRunDetail(run.run_id)); } catch { /* status will refresh */ }
-          }, 1000);
         } else {
           setSuccess(lang === "zh" ? `全自动执行已启动（Run #${run.run_id}）` : `Full-auto run started (Run #${run.run_id})`);
         }
@@ -129,6 +163,9 @@ export default function CampaignAutomationPanel({
       onChanged();
     } catch (e: any) {
       setError(e?.message || t("common_failed"));
+    } finally {
+      actionLocks.current.delete(id);
+      setBusyIds(previous => ({ ...previous, [id]: false }));
     }
   };
 
@@ -185,7 +222,8 @@ export default function CampaignAutomationPanel({
         )}
       </div>
 
-      {error && <div className="text-sm text-danger bg-danger/10 rounded p-2">{error}</div>}
+      {error && <div role="alert" className="text-sm text-danger bg-danger/10 rounded p-2">{error}<button className="btn ml-2" onClick={() => { setError(""); void load(); }}>{lang === "zh" ? "刷新状态" : "Refresh status"}</button></div>}
+      {pendingEnableId !== null && <button className="btn" disabled={busyIds[pendingEnableId]} onClick={() => doAction(pendingEnableId, "enable")}>{lang === "zh" ? "重试启用已有配置" : "Retry enabling saved automation"} #{pendingEnableId}</button>}
       {success && <div className="flex items-center gap-2 text-sm text-ok bg-ok/10 rounded p-2"><CheckCircle size={14} />{success}</div>}
 
       {campaigns.length === 0 && !showCreate ? (
@@ -245,7 +283,7 @@ export default function CampaignAutomationPanel({
                     <h4 className="font-medium text-sm">{campaignName(a.campaign_id)}</h4>
                     <p className="text-xs text-muted">{a.name || `Automation #${a.id}`} · {t("auto_followup_after_days", { days: plan.follow_up_after_days || followupDays })} · {t("auto_max_followups_count", { count: plan.max_follow_ups || maxFollowups })}</p>
                   </div>
-                  <span className={`text-xs px-2 py-0.5 rounded ${a.status === "enabled" ? "bg-ok/10 text-ok" : "bg-warn/10 text-warn"}`}>{a.status === "enabled" ? t("auto_enabled_label") : t("auto_paused_label")}</span>
+                  <span className={`text-xs px-2 py-0.5 rounded ${a.status === "enabled" ? "bg-ok/10 text-ok" : "bg-warn/10 text-warn"}`}>{a.status === "enabled" ? t("auto_enabled_label") : a.status === "disabled" ? (lang === "zh" ? "已禁用" : "Disabled") : t("auto_paused_label")}</span>
                 </div>
                 <div className="flex items-center gap-4 text-xs text-muted flex-wrap">
                   <span className="flex items-center gap-1"><Users size={12} /> {t("auto_customer_count")}: {a.contact_count ?? "-"}</span>
@@ -261,11 +299,11 @@ export default function CampaignAutomationPanel({
                     <option value={720}>{lang === "zh" ? "每 12 小时" : "Every 12 hours"}</option>
                     <option value={1440}>{lang === "zh" ? "每天" : "Daily"}</option>
                   </select>
-                  <select className="input text-xs py-1 w-32" value={executionMode} onChange={e => setExecutionMode(e.target.value as "full_auto" | "semi_auto")} aria-label="Execution mode">
+                  <select className="input text-xs py-1 w-32" value={runModes[a.id] || a.execution_mode || "full_auto"} onChange={e => setRunModes(previous => ({ ...previous, [a.id]: e.target.value as "full_auto" | "semi_auto" }))} aria-label={lang === "zh" ? "本次执行模式" : "Mode for this run"}>
                     <option value="full_auto">{lang === "zh" ? "全自动" : "Full auto"}</option>
                     <option value="semi_auto">{lang === "zh" ? "半自动" : "Semi auto"}</option>
                   </select>
-                  <button className="btn text-xs flex items-center gap-1" onClick={() => doAction(a.id, "run-now")}><Play size={12} /> {t("auto_run_now")}</button>
+                  <button className="btn text-xs flex items-center gap-1" disabled={busyIds[a.id]} onClick={() => doAction(a.id, "run-now")}><Play size={12} /> {t("auto_run_now")}</button>
                   {a.status === "enabled" ? <button className="btn text-xs flex items-center gap-1" onClick={() => doAction(a.id, "pause")}><Pause size={12} /> {t("auto_pause")}</button> : <button className="btn text-xs flex items-center gap-1" onClick={() => doAction(a.id, "enable")}><Play size={12} /> {t("auto_resume")}</button>}
                   <button className="btn text-xs flex items-center gap-1 text-danger" onClick={() => setConfirmDeleteId(a.id)} title={lang === "zh" ? "删除这个自动跟进" : "Delete this automation"}><Trash2 size={12} /> {t("common_delete")}</button>
                   <button className="btn text-xs ml-auto" onClick={() => setSelectedId(selectedId === a.id ? null : a.id)}>{isSelected ? (lang === "zh" ? "取消选中" : "Deselect") : (lang === "zh" ? "查看详情" : "Details")}</button>
@@ -277,14 +315,7 @@ export default function CampaignAutomationPanel({
         </>
       )}
 
-      {preparedRun?.status === "awaiting_confirmation" && (
-        <div className="border-t border-border pt-3 space-y-3">
-          <h4 className="font-semibold">{lang === "zh" ? "发送计划待确认" : "Send plan awaiting confirmation"}</h4>
-          <p className="text-sm text-muted">{lang === "zh" ? `本轮将发送 ${preparedRun.send_plan?.length || 0} 封邮件；确认后不会重新生成内容。` : `${preparedRun.send_plan?.length || 0} emails are frozen for this run; confirmation will not regenerate them.`}</p>
-          <div className="max-h-36 overflow-auto text-xs space-y-1">{(preparedRun.send_plan || []).map((item: any) => <div key={item.approval_id}>{item.to_email} · {item.subject}</div>)}</div>
-          <div className="flex gap-2"><button className="btn-primary" onClick={async () => { await api.confirmAgentRun(preparedRun.id); setPreparedRun(null); await load(); onChanged(); }}>{lang === "zh" ? "确认并执行" : "Confirm & execute"}</button><button className="btn" onClick={async () => { await api.cancelAgentRun(preparedRun.id); setPreparedRun(null); await load(); onChanged(); }}>{lang === "zh" ? "取消本轮" : "Cancel run"}</button></div>
-        </div>
-      )}
+      {Object.entries(runIds).filter(([id]) => automations.some(item => item.id === Number(id))).map(([id, runId]) => <CampaignRun key={`${id}:${runId}`} runId={runId} onChanged={onChanged} />)}
 
       {confirmDeleteId !== null && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">

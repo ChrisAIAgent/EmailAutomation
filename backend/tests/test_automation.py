@@ -9,6 +9,7 @@ missing `approvals.agent_run_id` column in the dev DB).
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from app import models
 
@@ -58,8 +59,9 @@ def test_create_enable_pause(client):
     c = client.post("/api/automation", json={"prompt": "p", "campaign_id": cid, "plan": plan})
     assert c.status_code == 200, c.text
     aid = c.json()["id"]
-    assert c.json()["status"] == "enabled"
-    assert c.json()["next_run_at"] is not None
+    assert c.json()["status"] == "disabled"
+    assert c.json()["plan"]["enabled"] is False
+    assert c.json()["next_run_at"] is None
 
     p = client.post(f"/api/automation/{aid}/pause")
     assert p.status_code == 200 and p.json()["status"] == "paused"
@@ -67,18 +69,23 @@ def test_create_enable_pause(client):
 
     e = client.post(f"/api/automation/{aid}/enable")
     assert e.status_code == 200 and e.json()["status"] == "enabled"
+    assert e.json()["plan"]["enabled"] is True
     assert e.json()["next_run_at"] is not None
 
 
-def test_create_disabled_plan_stays_disabled(client):
+def test_create_disabled_plan_stays_disabled(client, db):
     cid = _make_campaign(client)
     created = client.post("/api/automation", json={
         "prompt": "p", "campaign_id": cid,
-        "plan": {"enabled": False, "tick_interval_minutes": 60},
+        "plan": {"enabled": True, "tick_interval_minutes": 60},
     })
     assert created.status_code == 200, created.text
     assert created.json()["status"] == "disabled"
+    assert created.json()["plan"]["enabled"] is False
     assert created.json()["next_run_at"] is None
+    assert created.json()["id"]
+    assert client.get("/api/automation/scheduler/status").json()["enabled_automations"] == 0
+    assert db.query(models.AutomationRun).filter_by(automation_id=created.json()["id"]).count() == 0
 
 
 def test_web_scheduler_status_does_not_require_electron(client):
@@ -258,6 +265,71 @@ def test_run_now_unsubscribe_routes_to_human_review(client, db):
     # review of the unsubscribe request.
     assert contact.status not in ("unsubscribed", "not_interested", "bounced")
     assert contact.lifecycle_stage != "stopped"
+
+
+def test_stop_failure_is_not_counted_as_success_in_either_automation_scope(db, monkeypatch):
+    from app.schemas import AutomationPlan
+    from app.services import automation as automation_svc
+
+    account = models.GmailAccount(user_id=1, email="sender@example.com", is_connected=True)
+    campaign = models.Campaign(owner_id=1, name="stop-count", status="draft")
+    contact = models.Contact(
+        owner_id=1, email="stop-count@example.com", lifecycle_stage="needs_reply",
+        next_action="reply", status="replied",
+    )
+    db.add_all([account, campaign, contact])
+    db.flush()
+    thread = models.EmailThread(
+        gmail_account_id=account.id, gmail_thread_id="stop-count-thread",
+        campaign_id=campaign.id, contact_email=contact.email,
+        has_human_reply=True, subject="Re: hello",
+    )
+    db.add(thread)
+    db.flush()
+    db.add(models.EmailMessage(
+        thread_id=thread.id, is_incoming=True, from_email=contact.email,
+        subject="Re: hello", body_text="Please stop", received_at=datetime.now(timezone.utc),
+    ))
+    member = models.CampaignContact(
+        campaign_id=campaign.id, contact_id=contact.id, status="contacted",
+        membership_active=True,
+    )
+    db.add(member)
+    db.flush()
+
+    def fake_orchestrator(_db):
+        return SimpleNamespace(analyze=lambda _input: SimpleNamespace(langgraph=SimpleNamespace(
+            intent="bounce", recommended_action="none", draft=None,
+        )))
+
+    monkeypatch.setattr(automation_svc, "Orchestrator", fake_orchestrator)
+    monkeypatch.setattr(automation_svc.approvals_svc, "apply_intent_actions", lambda *args, **kwargs: "manual_lock")
+    monkeypatch.setattr(automation_svc.followup_svc, "process_due_follow_ups", lambda *_args: [])
+    plan = AutomationPlan(stop_on_intents=["bounce"])
+
+    for scope in ("global", "campaign"):
+        automation = models.Automation(
+            owner_id=1, name=f"{scope}-stop-count", prompt="stop",
+            campaign_id=campaign.id if scope == "campaign" else None,
+            scope=scope, plan_json=plan.model_dump_json(), status="disabled",
+        )
+        db.add(automation)
+        db.flush()
+        run = models.AutomationRun(
+            automation_id=automation.id, trigger="manual", source="test", status="running",
+        )
+        db.add(run)
+        db.flush()
+
+        result = (
+            automation_svc._prepare_global(db, automation, run, plan, datetime.now(timezone.utc))
+            if scope == "global"
+            else automation_svc._prepare_campaign(db, automation, run, plan)
+        )
+        stopped = result[2]
+        assert stopped == 0
+        assert any("stop_not_applied" in error for error in result[1])
+        assert any(item["action"] == "stop_not_applied" for item in result[0])
 
 
 def test_global_tick_runs_enabled_automation(client, db):
@@ -475,16 +547,22 @@ def test_owner_scoped_access(client, db):
 def test_huey_queue_persists_across_restart():
     """The SQLite queue is file-backed, so queued tasks survive a restart.
 
-    Enqueuing writes the task to backend/data/huey.db. The same file is what a
-    restarted consumer reads, so a task enqueued before a restart is still
+    Enqueuing writes to the configured file-backed queue. A consumer initialized
+    with the same queue path can read the task, so work enqueued before restart
     picked up afterwards (verified end-to-end in the live acceptance run).
     """
-    from app.tasks import huey, execute_automation_run
+    from app.tasks import _HUEY_DB, execute_automation_run, huey
+    from huey import SqliteHuey
 
     # Enqueue a task (writes to the file-backed queue).
     execute_automation_run(999999, "cron", "backend")
-    # It is persisted and re-readable -- i.e. not lost in memory only.
+    # A fresh Huey instance, as after a Consumer process restart, reads the
+    # serialized job from the same persistent queue file.
     assert len(huey.pending()) >= 1
+    reopened = SqliteHuey("email_automation", filename=_HUEY_DB)
+    for task_class in huey._registry._registry.values():
+        reopened._registry.register(task_class)
+    assert len(reopened.pending()) >= 1
 
 
 def test_run_now_returns_existing_when_inflight(client, db):

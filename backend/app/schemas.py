@@ -376,7 +376,7 @@ class AutomationPlan(BaseModel):
     data. Conservative defaults are applied for any field the prompt does not set.
     """
 
-    enabled: bool = True
+    enabled: bool = False
     tick_interval_minutes: int = 5
     first_email_approval_required: bool = True
     follow_up_after_days: int = 3

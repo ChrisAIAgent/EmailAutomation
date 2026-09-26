@@ -181,9 +181,13 @@ Latin-1/UTF-8 声明的可逆修复。重同步若修复历史乱码，会写入
 
 ### 自动跟进
 
-创建并启用 Automation -> Huey Consumer 扫描到期任务 -> 生成跟进或回复 Approval -> 全自动执行或半自动冻结计划并确认 -> 客户回复、拒绝、退订或退信后停止 -> 汇报 Run。
+创建 Automation 只保存禁用配置：即使 Plan 提交 `enabled=true`，结果仍为 `status=disabled`、`next_run_at=null`。必须另行启用才会进入 Huey 调度。Web“保存并启用”先创建后启用；若启用失败，保留已创建的 Automation ID，重试只启用该记录，不重复创建。
+
+启用后，Huey Consumer 扫描到期任务 -> 生成跟进或回复 Approval -> 全自动执行或半自动冻结计划并确认 -> 客户回复、拒绝、退订或退信后停止 -> 汇报 Run。
 
 同一 Automation 同时最多一个 `queued/running` Run。历史来信已产生 reply Approval 时，后续 Run 记录 `already_processed` 并跳过；只有同一 thread 出现更新的入站消息后才能再次生成回复。
+
+确认退信、拒绝和人工确认退订是发送安全动作，不受 Contact `manual_lock` 阻止。停止时保留锁定的分类、意向、标签、分群及锁定设置，同时设置终止状态、清除下一步跟进、关闭相关 Campaign 成员、取消未发送工作并建立 Suppression。仅实际停止成功后才计入停止数；失败必须记录为错误。重复信号不得重复创建 Suppression 或破坏历史。
 
 ### Approval 发送对账
 
@@ -439,6 +443,8 @@ In `semi_auto`, the Agent owns all preparation but must stop at exactly one pre-
 - skipped or blocked items with their exact reasons, plus the plan expiry time.
 
 The Agent must not send while the Run is `awaiting_confirmation`. A user confirmation resumes the same frozen plan; it must not regenerate recipients or content. After confirmation, report separately: Gmail message ID and actual sent count, blocked count, stopped count, failures, final Run status and whether the original thread was verified. `queued`, `running`, HTTP 200, Draft creation, or Approval creation are never proof of sending. If confirmation is absent, expired, or cancelled, report that no email was sent.
+
+The Automation page follows the server's effective Run mode, polls queued/running Runs to a stable state, and recovers recent Run IDs from Automation details when reopened. For `awaiting_confirmation`, show every frozen recipient, subject, and complete body before enabling confirmation. After a status-read failure, keep confirmation and cancellation disabled until a successful reread. Do not submit a second confirm/cancel request while the first is in flight.
 
 ## Agent Profile, language, and corrected-draft contract
 
