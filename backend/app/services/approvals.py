@@ -741,6 +741,11 @@ def decide_approval(db, approval_id, decision: str, *, editor_email=None, edited
 
 def apply_intent_actions(db, cc, intent: str, contact_email: str, owner_id: int, *, actor: str = "agent"):
     """When a reply is analyzed, apply stop/suppression/out-of-office side effects."""
+    if intent in {"unsubscribe", "opt_out", "not_interested", "bounce"}:
+        contact = db.query(models.Contact).filter_by(owner_id=owner_id, email=contact_email.lower()).first()
+        if contact:
+            from .contact_lifecycle import stop_contact_delivery
+            return stop_contact_delivery(db, contact, owner_id=owner_id, intent=intent, actor=actor)
     if intent in ("unsubscribe", "opt_out", "not_interested"):
         # add suppression + permanently stop
         existing = db.query(models.Suppression).filter_by(owner_id=owner_id, email=contact_email.lower()).first()
@@ -748,39 +753,13 @@ def apply_intent_actions(db, cc, intent: str, contact_email: str, owner_id: int,
             db.add(models.Suppression(owner_id=owner_id, email=contact_email.lower(),
                                       reason="unsubscribe" if intent == "unsubscribe" else "opt_out" if intent == "opt_out" else "not_interested",
                                       source="agent"))
-        contact = db.query(models.Contact).filter_by(owner_id=owner_id, email=contact_email.lower()).first()
-        if contact:
-            from .contact_lifecycle import ContactTransitionError, transition_contact
-            try:
-                transition_contact(
-                    db, contact, owner_id=owner_id, action="invalid",
-                    reason=f"reply_intent:{intent}", actor=actor,
-                    # An explicit human opt-out decision is allowed to close a
-                    # manually locked Contact; Agent classification is not.
-                    override_manual_lock=(actor == "user"),
-                )
-            except ContactTransitionError:
-                return "manual_lock"
-            if intent in {"unsubscribe", "opt_out"}:
-                contact.status = "unsubscribed"
-        elif cc:
+        if cc:
             cc.status = "stopped"
             from .contact_lifecycle import cancel_campaign_member_work
             cancel_campaign_member_work(db, cc, reason=f"reply_intent:{intent}", actor=actor)
         return "stopped"
     if intent == "bounce":
-        contact = db.query(models.Contact).filter_by(owner_id=owner_id, email=contact_email.lower()).first()
-        if contact:
-            from .contact_lifecycle import ContactTransitionError, transition_contact
-            try:
-                transition_contact(
-                    db, contact, owner_id=owner_id, action="invalid",
-                    reason="reply_intent:bounce", actor=actor,
-                )
-            except ContactTransitionError:
-                return "manual_lock"
-            contact.status = "bounced"
-        elif cc:
+        if cc:
             cc.status = "bounced"
             from .contact_lifecycle import cancel_campaign_member_work
             cancel_campaign_member_work(db, cc, reason="reply_intent:bounce", actor=actor)

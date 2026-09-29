@@ -346,6 +346,14 @@ window, daily limit, execution mode, or Approval rules. The computer and unified
 services must be running; offline wake/start scheduling is a separate Windows
 Task Scheduler concern for the portable installer.
 
+Campaign Automation creation stores a disabled configuration with no due time.
+An explicit enable operation sets `status=enabled` and its next due time; only then
+does the Huey periodic scan enqueue work. Automation configuration and Runs live in
+the application database, while pending worker jobs live in the file-backed SQLite
+Huey queue under the resolved application data directory. Restart the Consumer with
+the same data directory and queue file; do not move, replace, or delete the queue
+database during restart or recovery.
+
 When readiness reports stale `awaiting_confirmation` Runs, the monitor may
 recommend cancellation or continuation. It may call
 `POST /api/agent-runs/{run_id}/cancel` only when explicitly authorized for that

@@ -344,7 +344,7 @@ Filtered 邮件只出现在 Inbox 的 Filtered 视图；默认 Needs Action、Ne
 同一联系人可有多个 Gmail thread，应以联系人为工作单元查看全部会话和当前阶段。
 会话列表以每个 thread 最新一封实际邮件的时间倒序排列；打开 thread 后，邮件按实际时间正序显示。不得使用分拣或状态更新产生的 `updated_at` 代替邮件时间。
 
-每封新入站消息都会使旧线程判断失效并重新进入分拣。Agent 更新 Contact 标签或阶段时，系统写入 AuditLog 的 before/after 记录。人工锁定字段保持优先，但退订等强制停止信号仍执行。
+每封新入站消息都会使旧线程判断失效并重新进入分拣。Agent 更新 Contact 标签或阶段时，系统写入 AuditLog 的 before/after 记录。人工锁定字段保持优先，但确认退信、拒绝和人工确认退订等强制停止信号仍执行。停止会保留锁定的 CRM 分类、意向、标签、分群和锁定状态，同时阻止外发、清除后续跟进、关闭相关 Campaign 成员、取消未发送工作并建立 Suppression。Automation 只在停止处理返回 `stopped` 或 `bounced` 时增加停止计数；否则记录失败，不得汇报为成功。
 
 Dashboard 指标口径：
 
@@ -387,6 +387,11 @@ POST /api/automation/{id}/run-now
 ```
 
 `run-now` 返回 queued Run。轮询详情直到 `success`、`partial` 或 `failed`。`already_inflight=true` 时继续监控返回的原 Run，不要重复触发。
+
+创建 Automation 只保存配置，并始终返回 `status=disabled`、`next_run_at=null`；Plan 中的
+`enabled` 不会启动调度。必须在创建后另行调用 `ea_enable_automation`（Web 使用现有启用操作）
+才会进入 Huey 调度。Web“保存并启用”按“创建 → 启用”执行；若启用失败，记录已创建的
+Automation ID，重试只调用启用操作，不要再次创建。
 
 每个 Run 检查：`status`、`approvals_created`、`drafts_created`、`follow_ups_resolved`、`replies_stopped`、`summary`、`timeline` 和 `error`。
 
@@ -598,6 +603,12 @@ For every semi-auto Run, use two reports:
 2. **Post-confirmation report:** confirmed-by, confirmation time, unchanged frozen-plan ID, Gmail message ID(s), actual sent count, blocked/stopped/failed counts, final Run status and original-thread verification. Distinguish `no_send`, `blocked`, `failed` and `sent`.
 
 Confirmation continues the same prepared Run. It must not re-run planning or silently change content, recipients or thread. If confirmation is rejected, cancelled or expires, report zero actual sends.
+
+持久任务验收时分别核对 Huey 待执行队列与 Automation Run 记录。Consumer 重启后，队列任务应
+由同一个持久队列继续处理；应用整套重启后，Automation 详情应恢复同一个 queued/running/
+awaiting-confirmation Run。不得创建第二个 inflight Run 或重复 Approval。重新进入页面后，若 Run
+仍在 `awaiting_confirmation`，必须显示原 Run ID 和完整冻结收件人、主题、正文；状态读取失败时，
+先重试读取，不能确认或取消尚未重新核实的 Run。验收中可取消该 Run；确认真实发送需单独明确授权。
 
 ## Agent Profile and reply output enforcement
 

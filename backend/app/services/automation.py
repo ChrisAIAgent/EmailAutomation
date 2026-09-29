@@ -65,7 +65,8 @@ def create_automation(db, owner_id: int, prompt: str, campaign_id: int | None,
         raise ValueError("campaign automation requires campaign_id")
     if scope == "global":
         campaign_id = None
-    parsed = plan if isinstance(plan, AutomationPlan) else AutomationPlan(**plan)
+    parsed = (plan.model_copy() if isinstance(plan, AutomationPlan) else AutomationPlan(**plan))
+    parsed.enabled = False
     item = models.Automation(
         owner_id=owner_id,
         name=name or ("Global Inbox Automation" if scope == "global" else "Campaign Automation"),
@@ -73,12 +74,9 @@ def create_automation(db, owner_id: int, prompt: str, campaign_id: int | None,
         campaign_id=campaign_id,
         scope=scope,
         plan_json=json.dumps(parsed.model_dump()),
-        # The operator-visible create form explicitly sets ``enabled`` when
-        # its action is labelled "Save and enable".  Persist that intent and
-        # schedule the first run immediately instead of requiring a second
-        # Resume action after creation.
-        status="enabled" if parsed.enabled else "disabled",
-        next_run_at=datetime.now(timezone.utc) if parsed.enabled else None,
+        # Activation requires a separate, explicitly authorized enable action.
+        status="disabled",
+        next_run_at=None,
         tick_interval_minutes=parsed.tick_interval_minutes,
         execution_mode=parsed.execution_mode,
     )
@@ -100,6 +98,9 @@ def set_status(db, automation, status: str):
     if status not in {"enabled", "disabled", "paused"}:
         raise ValueError("invalid automation status")
     automation.status = status
+    plan = parse_plan(automation.plan_json)
+    plan.enabled = status == "enabled"
+    automation.plan_json = json.dumps(plan.model_dump())
     automation.next_run_at = (
         datetime.now(timezone.utc) if status == "enabled" else None
     )
@@ -342,11 +343,15 @@ def _prepare_global(db, automation, run, plan, now):
                         "intent": intent,
                     })
                 else:
-                    approvals_svc.apply_intent_actions(
+                    stop_result = approvals_svc.apply_intent_actions(
                         db, cc, intent, thread.contact_email or "", automation.owner_id
                     )
-                    stopped += 1
-                    timeline.append({"email": thread.contact_email, "action": "stopped", "intent": intent})
+                    if stop_result in {"stopped", "bounced"}:
+                        stopped += 1
+                        timeline.append({"email": thread.contact_email, "action": "stopped", "intent": intent})
+                    else:
+                        errors.append(f"stop_not_applied:{thread.id}:{stop_result}")
+                        timeline.append({"email": thread.contact_email, "action": "stop_not_applied", "intent": intent})
             elif decision and decision.draft:
                 approval = approvals_svc.create_reply_approval(
                     db, thread=thread, contact=contact, campaign=campaign, cc=cc,
@@ -433,10 +438,15 @@ def _prepare_campaign(db, automation, run, plan):
                         "intent": decision.intent,
                     })
                 else:
-                    approvals_svc.apply_intent_actions(
+                    stop_result = approvals_svc.apply_intent_actions(
                         db, cc, decision.intent, contact.email, automation.owner_id
                     )
-                    stopped += 1
+                    if stop_result in {"stopped", "bounced"}:
+                        stopped += 1
+                        timeline.append({"email": contact.email, "action": "stopped", "intent": decision.intent})
+                    else:
+                        errors.append(f"stop_not_applied:{thread.id}:{stop_result}")
+                        timeline.append({"email": contact.email, "action": "stop_not_applied", "intent": decision.intent})
             elif decision.draft:
                 approvals_svc.create_reply_approval(
                     db, thread=thread, contact=contact, campaign=campaign, cc=cc,
